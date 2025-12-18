@@ -1,92 +1,66 @@
-import os
-import hashlib
-from flask import Flask, request, jsonify
-import psycopg2
-import psycopg2.extras
-from datetime import datetime
+import feedparser
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ===================== CONFIG =====================
-DB_URL = os.getenv("DATABASE_URL")
+TOKEN = "8378612057:AAGtNexEe08mDXjpk9oiX4THny4F4Zeln8Q"
 
-# ===================== APP ========================
-app = Flask(__name__)
+# List of strong instances (fallback if one down)
+INSTANCES = [
+    "https://xcancel.com",
+    "https://nitter.space",
+    "https://nuku.trabun.org",
+    "https://nitter.net",
+    "https://lightbrd.com"
+]
 
-# ===================== DB HELPERS =================
-def get_db():
-    return psycopg2.connect(DB_URL)
-
-def setup_db():
-    db = get_db()
-    cur = db.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS social_posts (
-            id TEXT PRIMARY KEY,
-            platform TEXT NOT NULL,
-            account TEXT NOT NULL,
-            post_url TEXT NOT NULL UNIQUE,
-            content TEXT,
-            media_url TEXT,
-            fetched_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-    """)
-    db.commit()
-    cur.close()
-    db.close()
-
-def generate_id(platform, account, post_url):
-    """Generate deterministic hash ID for a post"""
-    hash_input = f"{platform}|{account}|{post_url}"
-    return hashlib.sha256(hash_input.encode()).hexdigest()
-
-def insert_or_replace_post(platform, account, post_url, content=None, media_url=None):
-    id = generate_id(platform, account, post_url)
-    db = get_db()
-    cur = db.cursor()
-    cur.execute("""
-        INSERT INTO social_posts (id, platform, account, post_url, content, media_url)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (id)
-        DO UPDATE SET
-            platform = EXCLUDED.platform,
-            account = EXCLUDED.account,
-            post_url = EXCLUDED.post_url,
-            content = EXCLUDED.content,
-            media_url = EXCLUDED.media_url,
-            fetched_at = NOW();
-    """, (id, platform, account, post_url, content, media_url))
-    db.commit()
-    cur.close()
-    db.close()
-
-def fetch_posts(account, limit=10):
-    db = get_db()
-    cur = db.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT * FROM social_posts WHERE account=%s ORDER BY fetched_at DESC LIMIT %s", (account, limit))
-    posts = cur.fetchall()
-    cur.close()
-    db.close()
-    return posts
-
-# ===================== ROUTES ====================
-@app.route("/add_post", methods=["POST"])
-def add_post():
-    data = request.json
-    insert_or_replace_post(
-        platform=data["platform"],
-        account=data["account"],
-        post_url=data["post_url"],
-        content=data.get("content"),
-        media_url=data.get("media_url")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hafa! Send me X username (e.g., @VDM__ or elonmusk) make I fetch recent posts sharp sharp! 🚀"
     )
-    return jsonify({"status": "success"}), 200
 
-@app.route("/get_posts/<account>", methods=["GET"])
-def get_posts(account):
-    limit = int(request.args.get("limit", 10))
-    posts = fetch_posts(account, limit)
-    return jsonify([dict(p) for p in posts])
+async def fetch_timeline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.message.text.strip().lstrip('@')
+    if not username:
+        await update.message.reply_text("Bros, send username na! 😭")
+        return
+    
+    posts_found = False
+    for instance in INSTANCES:
+        rss_url = f"{instance}/{username}/rss"
+        feed = feedparser.parse(rss_url)
+        
+        if feed.entries:
+            posts_found = True
+            await update.message.reply_text(f"Recent posts from @{username} (via {instance}):")
+            
+            for entry in feed.entries[:10]:  # Top 10 latest
+                text = entry.title
+                date = entry.published
+                link = entry.link  # Clean Nitter link
+                
+                msg = f"📢 {text}\n\n🕒 {date}\n🔗 {link}"
+                await update.message.reply_text(msg)
+                
+                # Send images if dey
+                if 'media_content' in entry:
+                    for media in entry.media_content:
+                        if 'url' in media:
+                            try:
+                                if media['medium'] == 'image':
+                                    await update.message.reply_photo(media['url'])
+                                elif 'video' in media['type']:
+                                    await update.message.reply_video(media['url'])
+                            except:
+                                pass  # Skip if no send
+            break  # Stop if success
+    
+    if not posts_found:
+        await update.message.reply_text("No posts found or account private. Try later or check username. 😕")
 
-# ===================== MAIN ======================
-if __name__ == "__main__":
-    setup_db()
-    app.run(debug=True)
+# Run bot
+application = Application.builder().token(TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fetch_timeline))
+
+print("Bot dey run... 🚀")
+application.run_polling()
