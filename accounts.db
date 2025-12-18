@@ -1,0 +1,19 @@
+BEGIN TRANSACTION;
+CREATE TABLE accounts
+             (id INTEGER PRIMARY KEY AUTOINCREMENT,
+              username TEXT UNIQUE,
+              email TEXT,
+              password TEXT,
+              cookies TEXT,
+              auth_token TEXT,
+              ct0 TEXT,
+              last_login INTEGER,
+              created_at INTEGER);
+INSERT INTO "accounts" VALUES(1,'@Charlot62465281','badwas596@usbc.b','Nizsuk-werkew-gefso',NULL,NULL,NULL,NULL,1766096871);
+CREATE TABLE search_history
+             (id INTEGER PRIMARY KEY AUTOINCREMENT,
+              query TEXT,
+              timestamp INTEGER);
+DELETE FROM "sqlite_sequence";
+INSERT INTO "sqlite_sequence" VALUES('accounts',1);
+COMMIT;
