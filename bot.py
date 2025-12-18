@@ -15,15 +15,18 @@ EMAIL = os.getenv("TWITTER_EMAIL")         # email for account
 PASSWORD = os.getenv("TWITTER_PASSWORD")   # password
 
 async def login_twikit():
-    # Try load saved cookies first (faster next time)
     if os.path.exists('cookies.json'):
         client.load_cookies('cookies.json')
-        print("Loaded cookies!")
+        print("Cookies loaded!")
     else:
-        await client.login(auth_info_1=USERNAME, auth_info_2=EMAIL, password=PASSWORD)
-        client.save_cookies('cookies.json')
-        print("Logged in & saved cookies!")
-
+        await client.login(
+            auth_info_1=USERNAME,
+            auth_info_2=EMAIL,
+            password=PASSWORD,
+            cookies_file='cookies.json',  # New argument for easy save
+            enable_ui_metrics=True  # THIS ONE NA KEY FOR 2025 BLOCKS
+        )
+        print("Logged in fresh!")
 # Run login once when bot start
 loop = asyncio.get_event_loop()
 loop.run_until_complete(login_twikit())
