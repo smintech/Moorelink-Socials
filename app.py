@@ -2,7 +2,7 @@ import feedparser
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-TOKEN = "8378612057:AAGtNexEe08mDXjpk9oiX4THny4F4Zeln8Q"
+TOKEN = os.getenv("BOTTOKEN")
 
 # List of strong instances (fallback if one down)
 INSTANCES = [
@@ -62,5 +62,15 @@ application = Application.builder().token(TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fetch_timeline))
 
-print("Bot dey run... 🚀")
-application.run_polling()
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))  # Render give PORT, default any
+    webhook_path = f"/{TOKEN}"
+    webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}{webhook_path}"
+    
+    # Set webhook
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=webhook_path,
+        webhook_url=webhook_url
+    )
