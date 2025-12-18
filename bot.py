@@ -7,11 +7,12 @@ TOKEN = os.getenv("BOTTOKEN")
 
 # List of strong instances (fallback if one down)
 INSTANCES = [
-    "https://xcancel.com",       # Top one now – super fast and working perfect
-    "https://nitter.net",        # Official back online
-    "https://nitter.poast.org",
-    "https://nitter.space",
-    "https://lightbrd.com"
+    "https://nitter.net",          # Official, 94% uptime
+    "https://nitter.space",        # 96%
+    "https://nuku.trabun.org",     # 95%
+    "https://nitter.poast.org",    # 85%
+    "https://lightbrd.com",        # 95%
+    "https://nitter.privacyredirect.com"  # 94%
 ]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -28,7 +29,7 @@ async def fetch_timeline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     posts_found = False
     for instance in INSTANCES:
         rss_url = f"{instance}/{username}/rss"
-        feed = feedparser.parse(rss_url)
+        feed = feedparser.parse(rss_url, request_headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'})
         
         if feed.entries:
             posts_found = True
