@@ -1,3 +1,2 @@
 python-telegram-bot[webhooks]
-twikit>=2.3.3
-lxml
+twscrape
