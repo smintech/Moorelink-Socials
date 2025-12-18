@@ -73,7 +73,7 @@ async def fetch_timeline(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await update.message.reply_video(video_url)
     
     except Exception as e:
-        await update.message.reply_text(f"Wahala: {str(e)}. Maybe rate limit—try again later! 😭")
+        await update.message.reply_text(f"Wahala: {str(e)}. Maybe rate limit try again later! 😭")
 
 # Webhook setup for Render
 if __name__ == "__main__":
