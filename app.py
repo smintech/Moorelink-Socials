@@ -6,10 +6,10 @@ TOKEN = "8378612057:AAGtNexEe08mDXjpk9oiX4THny4F4Zeln8Q"
 
 # List of strong instances (fallback if one down)
 INSTANCES = [
-    "https://xcancel.com",
+    "https://xcancel.com",       # Top one now – super fast and working perfect
+    "https://nitter.net",        # Official back online
+    "https://nitter.poast.org",
     "https://nitter.space",
-    "https://nuku.trabun.org",
-    "https://nitter.net",
     "https://lightbrd.com"
 ]
 
