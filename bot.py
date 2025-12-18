@@ -22,16 +22,14 @@ async def fetch_timeline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Fetching recent posts from @{username}... ⏳")
     
     try:
-        # First get the user ID (needed for tweets)
-        users = await gather(api.search_users(username, limit=1))
-        if not users or users[0].username.lower() != username.lower():
-            await update.message.reply_text("Account no dey or private. Check username well. 😕")
+        # Get user by username
+        user = await api.user_by_login(username)
+        if not user:
+            await update.message.reply_text("Account no dey or private/blocked. Check username well. 😕")
             return
         
-        user_id = users[0].id
-        
-        # Now fetch tweets by user ID (latest 10)
-        tweets = await gather(api.user_tweets(user_id, limit=10))
+        # Fetch recent tweets (up to 10)
+        tweets = await gather(api.user_tweets(user.id, limit=10))
         
         if not tweets:
             await update.message.reply_text("No recent posts found. Try later o. 😕")
@@ -40,25 +38,25 @@ async def fetch_timeline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Recent posts from @{username} ({len(tweets)} found):")
         
         for tweet in tweets:
-            text = tweet.rawContent or "(Media or quote only)"
+            text = tweet.rawContent or "(Media or quote post)"
             date = tweet.date.strftime("%b %d, %Y · %I:%M %p")
             link = f"https://x.com/{username}/status/{tweet.id}"
             
             msg = f"📢 {text}\n\n🕒 {date}\n🔗 {link}"
             await update.message.reply_text(msg, disable_web_page_preview=True)
             
-            # Send media
+            # Send media if dey
             if tweet.media:
                 for media in tweet.media:
                     if media.type == "photo":
                         await update.message.reply_photo(media.url)
                     elif media.type in ["video", "gif"]:
-                        video_url = next((v.url for v in media.videoVariants if v.bitrate), media.previewUrl)
-                        if video_url:
-                            await update.message.reply_video(video_url)
+                        # Best video URL
+                        video_url = max(media.videoVariants, key=lambda v: v.bitrate).url if media.videoVariants else media.url
+                        await update.message.reply_video(video_url)
     
     except Exception as e:
-        await update.message.reply_text(f"Wahala: {str(e)}. Try again later or check username! 😭")
+        await update.message.reply_text(f"Last wahala: {str(e)}. Try again later! 😭")
 
 # Webhook for Render
 if __name__ == "__main__":
