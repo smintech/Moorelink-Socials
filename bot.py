@@ -3,11 +3,10 @@ import os
 import hashlib
 from datetime import datetime, timedelta
 from typing import List, Dict
-
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from twikit import Client
-
+import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -84,32 +83,50 @@ def get_recent_posts(account: str, platform: str = None) -> list:
     return [dict(p) for p in posts]
 
 # ===================== REAL X FETCHER =====================
-def fetch_x_posts(account: str) -> list:
-    client = Client('en-US')
-    
-    # Optional: Login for better success (use your dummy account)
-    client.login(auth_info_1='@Charlot62465281', auth_info_2='badwas596@usbc.be', password='Nizsuk-werkew-gefso8')
-    client.save_cookies('cookies.json')  # Save for reuse
-
-    # Load saved cookies if exist
-    try:
-       client.load_cookies('cookies.json')
-    except:
-        pass
-
+async def fetch_x_posts(account: str) -> list:
+    """Async fetch real latest posts from X using twikit with login"""
+    account = account.lstrip('@')
     posts = []
+
     try:
-        user = client.get_user_by_screen_name(account)
-        if not user:
+        client = Client('en-US')
+
+        # Login (run once, then use cookies)
+        # Uncomment first time to login and save cookies
+        await client.login(
+             auth_info_1='@Charlot62465281',  # username
+             auth_info_2='badwas596@usbc.be', # email
+             password='Nizsuk-werkew-gefso8'
+         )
+         client.save_cookies('cookies.json')
+
+        # Load saved cookies for future runs
+        try:
+            client.load_cookies('cookies.json')
+        except:
+            print("Cookies not found - login required first time")
             return []
 
-        tweets = client.get_user_tweets(user.id, count=10)
+        # Get user
+        user = await client.get_user_by_screen_name(account)
+        if not user:
+            print(f"User @{account} not found")
+            return []
+
+        # Get tweets
+        tweets = await client.get_user_tweets(user.id, count=10)
 
         for tweet in tweets:
             if tweet.is_reply or tweet.is_retweet:
                 continue
 
-            media_urls = [m.media_url_https for m in tweet.media] if tweet.media else []
+            media_urls = []
+            if tweet.media:
+                for media in tweet.media:
+                    if media.type == 'photo':
+                        media_urls.append(media.url)
+                    elif media.type == 'video':
+                        media_urls.append(media.url)
 
             posts.append({
                 "url": f"https://x.com/{account}/status/{tweet.id}",
@@ -118,10 +135,12 @@ def fetch_x_posts(account: str) -> list:
                 "top_comments": []
             })
 
-        return posts
+        print(f"Fetched {len(posts)} posts from @{account}")
+
     except Exception as e:
-        print(f"Error: {e}")
-        return []
+        print(f"Twikit error for @{account}: {e}")
+
+    return posts
 
 # ===================== COMMAND HANDLERS =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
