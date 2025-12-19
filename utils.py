@@ -68,12 +68,8 @@ def fetch_x_urls(account: str) -> List[str]:
     urls = []
 
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        response = requests.get(f"https://x.com/{account}", headers=headers, timeout=10)
-        response.raise_for_status()
+        NITTER_BASE = "https://nitter.net"
+        response = requests.get(f"{NITTER_BASE}/{account}", headers=headers)
 
         soup = BeautifulSoup(response.text, "html.parser")
 
