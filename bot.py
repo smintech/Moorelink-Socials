@@ -1,20 +1,18 @@
-# bot.py - Standalone Telegram Bot
 import os
+import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from utils import fetch_latest_urls
-from utils import fetch_preview
 from telegram.constants import ChatAction
-from telegram import InputMediaPhoto
-import asyncio
+from utils import fetch_latest_urls
+
 TELEGRAM_TOKEN = os.getenv("BOTTOKEN")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to TweetLinkBot!\n\n"
         "Use: /latest <username>\n"
-        "Example: /latest vdm\n"
-        "Shows recent tweet links only (no text/media)."
+        "Example: /latest vdm or /latest elonmusk\n\n"
+        "Shows recent posts with full preview (text, images, videos, likes, etc.)"
     )
 
 async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -30,44 +28,22 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     urls = fetch_latest_urls(platform, account)
 
     if not urls:
-        await update.message.reply_text(f"No recent public tweets found for @{account} 😕\nTry later or check spelling.")
+        await update.message.reply_text(f"No recent public posts found for @{account} 😕\nTry later or check spelling.")
         return
 
-    await update.message.reply_text(f"🔥 Latest {len(urls)} public posts from @{account}:\n\nFetching previews... ⏳")
+    await update.message.reply_text(f"🔥 Latest {len(urls)} posts from @{account}:")
 
     for url in urls:
-        preview = await asyncio.get_event_loop().run_in_executor(None, fetch_preview, url)
+        # Convert to vxtwitter for perfect Telegram preview
+        fixed_url = url.replace("x.com", "vxtwitter.com").replace("twitter.com", "vxtwitter.com")
 
-        title = preview["title"].strip() or "X Post"
-        desc = preview["description"].strip()
-        image = preview["image"].strip()
+        # Send only the fixed link — Telegram go show rich embed automatic
+        await update.message.reply_text(
+            fixed_url,
+            disable_web_page_preview=False  # MUST be False to allow preview
+        )
 
-        link_line = f"\n🔗 <a href='{url}'>View on X</a>"
-
-        if image:
-            caption = f"<b>{title}</b>\n\n"
-            if desc:
-                if len(desc) > 200:
-                    desc = desc[:200] + "..."
-                caption += f"{desc}\n"
-            caption += link_line
-
-            try:
-                await update.message.reply_photo(
-                    photo=image,
-                    caption=caption,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
-            except Exception as e:
-                print(f"Photo send failed: {e}")
-                fallback_msg = f"<b>{title}</b>\n\n{desc}{link_line}"
-                await update.message.reply_text(fallback_msg, parse_mode="HTML", disable_web_page_preview=False)
-        else:
-            msg = f"<b>{title}</b>\n\n{desc}{link_line}"
-            await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=False)
-
-        await asyncio.sleep(1)  # Prevent flood
+        await asyncio.sleep(1.5)  # Prevent flood + give time for preview to load
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
