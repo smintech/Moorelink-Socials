@@ -4,6 +4,8 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from utils import fetch_latest_urls
 from telegram.constants import ChatAction
+from telegram import InputMediaPhoto
+import asyncio
 TELEGRAM_TOKEN = os.getenv("BOTTOKEN")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -27,14 +29,49 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     urls = fetch_latest_urls(platform, account)
 
     if not urls:
-        await update.message.reply_text(f"No recent public tweets found for @{account}.")
+        await update.message.reply_text(f"No recent public tweets found for @{account} 😕\nTry later or check spelling.")
         return
 
-    msg = f"Latest {len(urls)} public tweet links from @{account}:\n\n"
-    for i, url in enumerate(urls, 1):
-        msg += f"{i}. {url}\n"
+    await update.message.reply_text(f"🔥 Latest {len(urls)} public posts from @{account}:\n\nFetching previews... ⏳")
 
-    await update.message.reply_text(msg)
+    # Send each post as rich card
+    for url in urls:
+        preview = fetch_preview(url)  # From your utils.py
+
+        title = preview["title"].strip() or "X Post"
+        desc = preview["description"].strip()
+        image = preview["image"].strip()
+
+        link_line = f"\n🔗 <a href='{url}'>View on X</a>"
+
+        if image:
+            # Rich card with big image
+            caption = f"<b>{title}</b>\n\n"
+            if desc:
+                # Cut long description
+                if len(desc) > 200:
+                    desc = desc[:200] + "..."
+                caption += f"{desc}\n"
+            caption += link_line
+
+            try:
+                await update.message.reply_photo(
+                    photo=image,
+                    caption=caption,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                # Fallback if image no load
+                fallback_msg = f"<b>{title}</b>\n\n{desc}{link_line}"
+                await update.message.reply_text(fallback_msg, parse_mode="HTML", disable_web_page_preview=False)
+        else:
+            # Text card fallback
+            msg = f"<b>{title}</b>\n\n{desc}{link_line}"
+            await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=False)
+
+        # Small delay make no flood
+        await asyncio.sleep(1)
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
