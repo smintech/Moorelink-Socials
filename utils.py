@@ -1,113 +1,163 @@
 # utils.py
-from app import get_db
 import hashlib
 from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+from app import get_db  # Import your Flask app's get_db function
 
-# ====== DATABASE HELPERS ======
+# ===================== CONFIG =====================
+CACHE_DURATION = timedelta(minutes=30)  # How long to keep in-memory cache
+POST_FETCH_LIMIT = 5                   # Max posts to return per request
 
-def generate_id(account, post_url):
-    """Generate a unique hash ID for a post."""
-    data = f"{account}:{post_url}"
-    return hashlib.sha256(data.encode()).hexdigest()
+# ===================== IN-MEMORY CACHE =====================
+# Format: { "platform|account": { "last_fetch": datetime, "posts": List[dict], "hashes": set() } }
+_cache: Dict[str, Dict] = {}
 
-def save_post(account, post_url, top_comments=None):
-    """Save or update post in the database using hash ID."""
+def _cache_key(platform: str, account: str) -> str:
+    return f"{platform.lower()}|{account.lower()}"
+
+# ===================== HASH & ID HELPERS =====================
+def generate_post_hash(platform: str, account: str, post_url: str) -> str:
+    """Generate unique hash for deduplication."""
+    key = f"{platform.lower()}|{account.lower()}|{post_url}"
+    return hashlib.sha256(key.encode()).hexdigest()
+
+def generate_post_id(post_hash: str) -> str:
+    """Optional: shorter ID if needed (first 16 chars of hash)"""
+    return post_hash[:16]
+
+# ===================== DATABASE OPERATIONS =====================
+def save_post(platform: str, account: str, post_data: dict):
+    """
+    Save or update a post in the database.
+    post_data should contain: url, text (optional), media_urls (list), top_comments (list)
+    """
     db = get_db()
     cur = db.cursor()
-    
-    post_id = generate_id(account, post_url)
-    
+
+    post_hash = generate_post_hash(platform, account, post_data["url"])
+    post_id = generate_post_id(post_hash)
+
     cur.execute("""
-        INSERT INTO social_posts (id, account_name, post_url, top_comments)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO social_posts (
+            id, platform, account_name, post_url, content_text, 
+            media_urls, top_comments, fetched_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
         ON CONFLICT (id) DO UPDATE
-        SET post_url = EXCLUDED.post_url,
-            top_comments = EXCLUDED.top_comments,
-            fetched_at = NOW()
-    """, (post_id, account, post_url, top_comments))
-    
+        SET fetched_at = NOW(),
+            content_text = EXCLUDED.content_text,
+            media_urls = EXCLUDED.media_urls,
+            top_comments = EXCLUDED.top_comments
+    """, (
+        post_id,
+        platform.lower(),
+        account.lower(),
+        post_data["url"],
+        post_data.get("text", "")[:1000],
+        post_data.get("media_urls", []),
+        post_data.get("top_comments", [])[:5]  # limit comments
+    ))
+
     db.commit()
     cur.close()
     db.close()
 
-
-def fetch_posts_from_db(account, limit=5):
-    """Fetch latest posts from the database."""
+def get_recent_posts(platform: str, account: str, limit: int = POST_FETCH_LIMIT) -> List[dict]:
+    """Fetch recent posts from DB for a specific account and platform."""
     db = get_db()
     cur = db.cursor()
+
+    time_limit = datetime.utcnow() - timedelta(hours=24)  # only last 24 hours
+
     cur.execute("""
-        SELECT post_url FROM social_posts
-        WHERE account_name = %s
+        SELECT post_url, content_text, media_urls, top_comments, fetched_at
+        FROM social_posts
+        WHERE platform = %s 
+          AND account_name = %s 
+          AND fetched_at >= %s
         ORDER BY fetched_at DESC
         LIMIT %s
-    """, (account, limit))
+    """, (platform.lower(), account.lower(), time_limit, limit))
+
     rows = cur.fetchall()
     cur.close()
     db.close()
-    return [r[0] for r in rows]  # list of URLs
 
+    return [dict(row) for row in rows]
 
-# ====== IN-MEMORY CACHE ======
-# Structure: { "account": { "last_fetch": datetime, "urls": [...], "hashes": set() } }
-cache = {}
-CACHE_DURATION = timedelta(minutes=30)
+# ===================== CACHE OPERATIONS =====================
+def get_cached_posts(platform: str, account: str) -> Optional[List[dict]]:
+    """Return cached posts if still valid."""
+    key = _cache_key(platform, account)
+    if key in _cache:
+        entry = _cache[key]
+        if datetime.utcnow() - entry["last_fetch"] < CACHE_DURATION:
+            return entry["posts"]
+    return None
 
-# ====== HASH GENERATOR ======
-def generate_hash(platform: str, account: str, post_url: str) -> str:
-    """Generate SHA256 hash key for a post URL."""
-    key = f"{platform}|{account}|{post_url}"
-    return hashlib.sha256(key.encode()).hexdigest()
+def update_cache(platform: str, account: str, posts: List[dict]):
+    """Update in-memory cache with new posts."""
+    key = _cache_key(platform, account)
+    hashes = {generate_post_hash(platform, account, p["url"]) for p in posts}
 
-
-# ====== FETCH POSTS (DUMMY / SIMULATION) ======
-X_BASE_URL = "https://x.com"  # Replace with real API endpoint later
-
-def fetch_posts(account: str, hours: int = 24):
-    """
-    Fetch public post URLs for an account (last `hours`).
-    Uses in-memory cache to avoid redundant fetching.
-    """
-    now = datetime.utcnow()
-
-    # Check cache first
-    if account in cache:
-        last_fetch = cache[account]["last_fetch"]
-        if now - last_fetch < CACHE_DURATION:
-            return cache[account]["urls"]  # Return cached URLs
-
-    # ===== PLACEHOLDER FETCHING LOGIC =====
-    # Replace this with real API calls or scraping (safe)
-    simulated_posts = [
-        f"{X_BASE_URL}/{account}/status/{i}" for i in range(1, 6)
-    ]
-
-    # Filter new posts using hashes
-    new_posts = []
-    account_hashes = cache.get(account, {}).get("hashes", set())
-
-    for url in simulated_posts:
-        post_hash = generate_hash("x", account, url)
-        if post_hash not in account_hashes:
-            new_posts.append(url)
-            account_hashes.add(post_hash)
-            # Save post to DB
-            save_post(account, url)
-
-    # Update cache
-    cache[account] = {
-        "last_fetch": now,
-        "urls": new_posts,
-        "hashes": account_hashes,
+    _cache[key] = {
+        "last_fetch": datetime.utcnow(),
+        "posts": posts,
+        "hashes": hashes
     }
 
-    return new_posts
+# ===================== MAIN FETCH LOGIC =====================
+def fetch_latest_posts(platform: str, account: str) -> List[dict]:
+    """
+    Main function called by bot.
+    1. Check in-memory cache
+    2. Check DB for recent posts
+    3. If none → fetch from platform API (placeholder)
+    4. Save new posts + update cache
+    """
+    account = account.lstrip('@')
 
+    # 1. Try cache
+    cached = get_cached_posts(platform, account)
+    if cached:
+        return cached
 
-# ====== USAGE EXAMPLE ======
-if __name__ == "__main__":
-    account = "VDM"
-    posts = fetch_posts(account)
-    print("Fetched posts:", posts)
+    # 2. Try DB
+    db_posts = get_recent_posts(platform, account)
+    if db_posts:
+        update_cache(platform, account, db_posts)
+        return db_posts
 
-    db_posts = fetch_posts_from_db(account)
-    print("Posts in DB:", db_posts)
+    # 3. No cache/DB → fetch fresh (PLACEHOLDER — replace with real fetcher)
+    print(f"Fetching fresh posts from {platform} for @{account}...")
+    
+    # === DUMMY DATA FOR TESTING ===
+    dummy_posts = [
+        {
+            "url": f"https://x.com/{account}/status/1234567890{i}",
+            "text": f"Sample post {i} from @{account} #testing",
+            "media_urls": [],
+            "top_comments": [f"Comment {j} on post {i}" for j in range(1, 4)]
+        }
+        for i in range(1, 6)
+    ]
+    # =================================
+
+    # Save new posts to DB
+    for post in dummy_posts:
+        save_post(platform, account, post)
+
+    # Get fresh from DB and cache
+    fresh_posts = get_recent_posts(platform, account)
+    update_cache(platform, account, fresh_posts)
+
+    return fresh_posts
+
+# ===================== PLATFORM-SPECIFIC FETCHERS (TO ADD LATER) =====================
+# Example placeholder for real implementation
+# async def fetch_x_posts(account: str) -> List[dict]:
+#     # Use snscrape, tweepy, or X API
+#     pass
+
+# async def fetch_instagram_posts(account: str) -> List[dict]:
+#     # Use instaloader or unofficial API
+#     pass
