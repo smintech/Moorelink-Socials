@@ -129,7 +129,7 @@ def fetch_ig_urls(account: str) -> List[str]:
 
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "instagram-api-fast-&-reliable-data-scraper-api.p.rapidapi.com"
+        "X-RapidAPI-Host": "instagram-api-fast-reliable-data-scraper.p.rapidapi.com"
     }
 
     try:
