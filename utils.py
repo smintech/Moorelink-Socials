@@ -1,23 +1,29 @@
-# utils.py - On-demand public URL extraction for X (uses your existing table)
+# utils.py - Standalone version (no app.py dependency)
+import os
 import hashlib
 import requests
 from datetime import datetime, timedelta
 from typing import List
 from bs4 import BeautifulSoup
-from app import get_db
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # ===================== CONFIG =====================
+DB_URL = os.getenv("DATABASE_URL")
 CACHE_HOURS = 24
 POST_LIMIT = 5
 
-# ===================== HASH & ID =====================
+# ===================== DB CONNECTION =====================
+def get_db():
+    """Connect to Postgres"""
+    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+
+# ===================== HASH & SAVE =====================
 def generate_url_hash(account: str, url: str) -> str:
-    """Generate unique hash for URL deduplication"""
     key = f"{account.lower()}:{url}"
     return hashlib.sha256(key.encode()).hexdigest()
 
 def save_url(platform: str, account: str, url: str):
-    """Save URL to your existing social_posts table (upsert)"""
     conn = get_db()
     cur = conn.cursor()
 
@@ -35,7 +41,6 @@ def save_url(platform: str, account: str, url: str):
     conn.close()
 
 def get_recent_urls(platform: str, account: str) -> List[str]:
-    """Fetch recent URLs from your existing table"""
     conn = get_db()
     cur = conn.cursor()
 
@@ -57,9 +62,8 @@ def get_recent_urls(platform: str, account: str) -> List[str]:
 
     return [row[0] for row in rows]
 
-# ===================== PUBLIC URL FETCHER =====================
+# ===================== FETCHER =====================
 def fetch_x_urls(account: str) -> List[str]:
-    """Fetch public tweet URLs from X profile page (no login, no API)"""
     account = account.lstrip('@')
     urls = []
 
@@ -73,7 +77,6 @@ def fetch_x_urls(account: str) -> List[str]:
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Find tweet links (X uses data-testid="tweet" for tweets)
         for tweet in soup.find_all("article", {"data-testid": "tweet"}):
             link = tweet.find("a", href=True)
             if link and "/status/" in link["href"]:
@@ -85,28 +88,23 @@ def fetch_x_urls(account: str) -> List[str]:
     except Exception as e:
         print(f"URL fetch error for @{account}: {e}")
 
-    return urls[:POST_LIMIT]  # Limit to avoid overload
+    return urls[:POST_LIMIT]
 
-# ===================== MAIN FETCH LOGIC =====================
+# ===================== MAIN LOGIC =====================
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
-    """Main function: DB cache → fresh fetch"""
     account = account.lstrip('@')
 
-    # 1. Try DB cache
     cached_urls = get_recent_urls(platform, account)
     if cached_urls:
         return cached_urls
 
-    # 2. No cache → fetch fresh URLs
     new_urls = fetch_x_urls(account)
 
     if not new_urls:
         return []
 
-    # Save to your existing table
     for url in new_urls:
         save_url(platform, account, url)
 
-    # Get fresh from DB
     fresh_urls = get_recent_urls(platform, account)
     return fresh_urls
