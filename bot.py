@@ -35,7 +35,7 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔥 Latest {len(urls)} public posts from @{account}:\n\nFetching previews... ⏳")
 
     for url in urls:
-        preview = fetch_preview(url)
+        preview = await asyncio.get_event_loop().run_in_executor(None, fetch_preview, url)
 
         title = preview["title"].strip() or "X Post"
         desc = preview["description"].strip()
