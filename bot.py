@@ -98,7 +98,7 @@ async def fetch_x_posts(account: str) -> list:
              auth_info_2='badwas596@usbc.be', # email
              password='Nizsuk-werkew-gefso8'
          )
-         client.save_cookies('cookies.json')
+        client.save_cookies('cookies.json')
 
         # Load saved cookies for future runs
         try:
