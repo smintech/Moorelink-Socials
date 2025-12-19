@@ -77,11 +77,12 @@ def fetch_x_urls(account: str) -> List[str]:
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        for tweet in soup.find_all("article", {"data-testid": "tweet"}):
-            link = tweet.find("a", href=True)
-            if link and "/status/" in link["href"]:
-                full_url = f"https://x.com{link['href']}"
-                urls.append(full_url)
+        for link in soup.select('a[href*="/status/"]'):
+            href = link.get("href")
+            if href and href.count("/") >= 3:
+                full_url = f"https://x.com{href.split('?')[0]}"
+                if full_url not in urls:
+                    urls.append(full_url)
 
         print(f"Fetched {len(urls)} tweet URLs from @{account}")
 
@@ -92,19 +93,18 @@ def fetch_x_urls(account: str) -> List[str]:
 
 # ===================== MAIN LOGIC =====================
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
-    account = account.lstrip('@')
+    account = account.lstrip('@').lower()
 
-    cached_urls = get_recent_urls(platform, account)
-    if cached_urls:
-        return cached_urls
-
-    new_urls = fetch_x_urls(account)
+    # ALWAYS fetch when requested
+    if platform == "x":
+        new_urls = fetch_x_urls(account)
+    else:
+        return []
 
     if not new_urls:
-        return []
+        return get_recent_urls(platform, account)
 
     for url in new_urls:
         save_url(platform, account, url)
 
-    fresh_urls = get_recent_urls(platform, account)
-    return fresh_urls
+    return new_urls
