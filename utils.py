@@ -120,35 +120,36 @@ def fetch_x_urls(account: str):
     return []
 
 # ===================== INSTAGRAM FETCHER =====================
-def fetch_ig_urls(account: str) -> List[str]:
-    """Fetch public Instagram post URLs using instaloader (no login)"""
+def fetch_ig_urls(account: str) -> List[dict]:
     account = account.lstrip('@').lower()
-    urls = []
+    posts = []
 
     try:
         L = instaloader.Instaloader()
-        # Anonymous mode - no login
-        L.context._session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        })
-
         profile = instaloader.Profile.from_username(L.context, account)
 
-        # Fetch up to 10 public posts
         for i, post in enumerate(profile.get_posts()):
             if i >= POST_LIMIT:
                 break
-            urls.append(post.url)
 
-        print(f"Fetched {len(urls)} IG post URLs from @{account}")
+            media_urls = []
+            if post.is_video:
+                media_urls.append(post.video_url)
+            else:
+                media_urls.append(post.url)
 
-    except instaloader.exceptions.PrivateProfileNotFollowedException:
-        print(f"@{account} is private - cannot fetch without login")
+            posts.append({
+                "url": post.url,
+                "caption": post.caption or "",
+                "media_urls": media_urls
+            })
+
+        print(f"Fetched {len(posts)} IG posts from @{account}")
+
     except Exception as e:
-        print(f"IG fetch error for @{account}: {e}")
+        print(f"IG fetch error: {e}")
 
-    return urls
-
+    return posts
 # ===================== PREVIEW FETCHER =====================
 # ===================== MAIN LOGIC =====================
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
