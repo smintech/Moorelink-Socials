@@ -85,43 +85,43 @@ def get_recent_posts(account: str, platform: str = None) -> list:
 
 # ===================== REAL X FETCHER =====================
 def fetch_x_posts(account: str) -> list:
-    """Fetch real latest posts from X using twikit"""
-    account = account.lstrip('@')
-    posts = []
+    client = Client('en-US')
+    
+    # Optional: Login for better success (use your dummy account)
+    client.login(auth_info_1='@Charlot62465281', auth_info_2='badwas596@usbc.be', password='Nizsuk-werkew-gefso8')
+    client.save_cookies('cookies.json')  # Save for reuse
 
+    # Load saved cookies if exist
     try:
-        client = Client('en-US')
-        # No login needed for public tweets
+       client.load_cookies('cookies.json')
+    except:
+        pass
+
+    posts = []
+    try:
         user = client.get_user_by_screen_name(account)
         if not user:
-            print(f"User @{account} not found")
             return []
 
         tweets = client.get_user_tweets(user.id, count=10)
 
         for tweet in tweets:
-            # Skip replies/retweets
-            if tweet.in_reply_to or tweet.is_retweet:
+            if tweet.is_reply or tweet.is_retweet:
                 continue
 
-            media_urls = []
-            if tweet.media:
-                for media in tweet.media:
-                    media_urls.append(media.get('media_url_https', ''))
+            media_urls = [m.media_url_https for m in tweet.media] if tweet.media else []
 
             posts.append({
                 "url": f"https://x.com/{account}/status/{tweet.id}",
-                "text": tweet.text or "",
+                "text": tweet.text,
                 "media_urls": media_urls,
-                "top_comments": []  # twikit no get replies easy
+                "top_comments": []
             })
 
-        print(f"Fetched {len(posts)} posts from @{account}")
-
+        return posts
     except Exception as e:
-        print(f"Twikit error for @{account}: {e}")
-
-    return posts
+        print(f"Error: {e}")
+        return []
 
 # ===================== COMMAND HANDLERS =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
