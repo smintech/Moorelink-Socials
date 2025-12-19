@@ -1,3 +1,4 @@
+
 # utils.py - Standalone version (no app.py dependency)
 import os
 import hashlib
@@ -149,3 +150,33 @@ def fetch_ig_urls(account: str) -> List[str]:
     return urls
 
 # ===================== PREVIEW FETCHER =====================
+# ===================== MAIN LOGIC =====================
+def fetch_latest_urls(platform: str, account: str) -> List[str]:
+    """Main function: DB cache → fresh fetch"""
+    account = account.lstrip('@').lower()
+
+    # 1. Try DB cache
+    cached_urls = get_recent_urls(platform, account)
+    if cached_urls:
+        return cached_urls
+
+    # 2. No cache → fetch fresh
+    new_urls = []
+
+    if platform == "x":
+        new_urls = fetch_x_urls(account)
+    elif platform == "ig":
+        new_urls = fetch_ig_urls(account)
+    else:
+        return []
+
+    if not new_urls:
+        return []
+
+    # Save to DB
+    for url in new_urls:
+        save_url(platform, account, url)
+
+    # Get fresh from DB
+    fresh_urls = get_recent_urls(platform, account)
+    return fresh_urls
