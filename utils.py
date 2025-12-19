@@ -63,32 +63,47 @@ def get_recent_urls(platform: str, account: str) -> List[str]:
     return [row[0] for row in rows]
 
 # ===================== FETCHER =====================
-def fetch_x_urls(account: str) -> List[str]:
-    account = account.lstrip('@')
-    urls = []
+NITTER_INSTANCES = [
+    "https://nitter.net",
+    "https://nitter.privacydev.net",
+    "https://nitter.poast.org",
+    "https://nitter.fdn.fr"
+]
 
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
+def fetch_x_urls(account: str):
+    account = account.lstrip('@').lower()
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
-        response = requests.get(f"https://nitter.net/{account}", headers=headers, timeout=10)
-        response.raise_for_status()
+    for base in NITTER_INSTANCES:
+        try:
+            url = f"{base}/{account}"
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
 
-        soup = BeautifulSoup(response.text, "html.parser")
+            if len(response.text) < 5000:
+                continue  # blocked page
 
-        for link in soup.select('a[href*="/status/"]'):
-            href = link.get("href")
-            if href.startswith(f"/{account}/status/"):
-                full_url = f"https://x.com{href}"
-                if full_url not in urls:
-                    urls.append(full_url)
+            soup = BeautifulSoup(response.text, "html.parser")
+            urls = []
 
-    except Exception as e:
-        print(f"Nitter fetch error for @{account}: {e}")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if f"/{account}/status/" in href:
+                    clean = href.split("#")[0]
+                    full_url = f"https://x.com{clean}"
+                    if full_url not in urls:
+                        urls.append(full_url)
 
-    return urls[:POST_LIMIT]
+            if urls:
+                return urls[:POST_LIMIT]
+
+        except Exception as e:
+            print(f"Nitter fail {base}: {e}")
+
+    return []
 
 # ===================== MAIN LOGIC =====================
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
