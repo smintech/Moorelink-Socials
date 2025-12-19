@@ -11,13 +11,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to TweetLinkBot!\n\n"
         "Use: /latest <username>\n"
-        "Example: /latest vdm or /latest elonmusk\n\n"
+        "Example: /xlatest vdm or /xlatest elonmusk\n\n"
         "Shows recent posts with full preview (text, images, videos, likes, etc.)"
     )
 
-async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def xlatest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /latest <username>\nExample: /latest vdm")
+        await update.message.reply_text("Usage: /xlatest <username>\nExample: /xlatest vdm")
         return
 
     account = context.args[0].lstrip('@').lower()
@@ -109,9 +109,6 @@ async def iglatest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for msg_id in sent_message_ids:
         context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": msg_id})
 
-# Add to app handlers
-app.add_handler(CommandHandler("iglatest", iglatest))
-
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
         raise ValueError("BOTTOKEN environment variable not set!")
@@ -119,7 +116,7 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("latest", latest))
-
+    app.add_handler(CommandHandler("xlatest", xlatest))
+    app.add_handler(CommandHandler("iglatest", iglatest))
     print("🤖 Bot started! Waiting for commands...")
     app.run_polling(drop_pending_updates=True)
