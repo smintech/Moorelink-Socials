@@ -11,7 +11,7 @@ import time
 
 # ===================== CONFIG =====================
 DB_URL = os.getenv("DATABASE_URL")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+FLASHAPI_KEY = os.getenv("RAPIDAPI_KEY")
 CACHE_HOURS = 24
 POST_LIMIT = 5
 
@@ -123,33 +123,34 @@ def fetch_x_urls(account: str):
 def fetch_ig_urls(account: str) -> List[str]:
     account = account.lstrip('@').lower()
 
-    url = "https://instagram-scraper-stable-api.p.rapidapi.com/user_posts"  # Example endpoint – check exact in API docs
+    url = "https://flashapi.ru/api/v1/instagram/user/posts"
 
-    querystring = {"username": account, "limit": POST_LIMIT}
-
-    headers = {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "instagram-api-fast-reliable-data-scraper.p.rapidapi.com"
+    params = {
+        "username": account,
+        "limit": POST_LIMIT,
+        "api_key": FLASHAPI_KEY
     }
 
     try:
-        resp = requests.get(url, headers=headers, params=querystring, timeout=10)
+        resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
 
         urls = []
-        for post in data.get("posts", [])[:POST_LIMIT]:  # Adjust based on API response structure
-            shortcode = post.get("shortcode")
+        posts = data.get("data", []) or data.get("posts", []) or data.get("items", [])
+        for post in posts[:POST_LIMIT]:
+            shortcode = post.get("shortcode") or post.get("code")
             if shortcode:
-                post_url = f"https://www.instagram.com/p/{shortcode}/"
+                post_type = "reel" if post.get("is_video") or post.get("product_type") == "clips" else "p"
+                post_url = f"https://www.instagram.com/{post_type}/{shortcode}/"
                 urls.append(post_url)
 
-        print(f"Fetched {len(urls)} IG posts via RapidAPI @{account}")
+        print(f"Fetched {len(urls)} IG posts via FlashAPI @{account}")
         return urls
 
     except Exception as e:
-        print(f"RapidAPI IG fetch failed: {e}")
-        return []
+        print(f"FlashAPI failed for @{account}: {e}")
+        return get_recent_urls("ig", account)
 # ===================== MAIN LOGIC =====================
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
     account = account.lstrip('@').lower()
