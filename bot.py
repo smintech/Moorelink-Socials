@@ -3,6 +3,7 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from utils import fetch_latest_urls
+from utils import fetch_preview
 from telegram.constants import ChatAction
 from telegram import InputMediaPhoto
 import asyncio
