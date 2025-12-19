@@ -1,2 +1,2 @@
 python-telegram-bot[webhooks]
-twscrape
+psycopg2-binary
