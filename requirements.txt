@@ -1,3 +1,3 @@
 python-telegram-bot[webhooks]
 psycopg2-binary
-snscrape
+ntscrape
