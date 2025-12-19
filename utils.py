@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import time
+
 # ===================== CONFIG =====================
 DB_URL = os.getenv("DATABASE_URL")
 CACHE_HOURS = 24
@@ -57,7 +58,7 @@ def get_recent_urls(platform: str, account: str) -> list:
         """, (platform.lower(), account.lower(), time_limit, POST_LIMIT))
 
         rows = cur.fetchall()
-        return [row["post_url"] for row in rows]  # ✅ Use dict key
+        return [row["post_url"] for row in rows]
 
     finally:
         cur.close()
@@ -121,7 +122,6 @@ def fetch_x_urls(account: str):
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
     account = account.lstrip('@').lower()
 
-    # ALWAYS fetch when requested
     if platform == "x":
         new_urls = fetch_x_urls(account)
     else:
@@ -130,117 +130,10 @@ def fetch_latest_urls(platform: str, account: str) -> List[str]:
     if not new_urls:
         return get_recent_urls(platform, account)
 
+    # Save new ones
     for url in new_urls:
         save_url(platform, account, url)
 
     return new_urls
 
 # ===================== PREVIEW FETCHER =====================
-def fetch_preview(url: str) -> dict:
-    """
-    Fetch Open Graph / Twitter card info for an X post.
-    Returns: {"title": str, "description": str, "image": str}
-    """
-    try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        resp = requests.get(url, timeout=8, headers=headers)
-        resp.raise_for_status()
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Open Graph / Twitter Card tags
-        title_tag = (
-            soup.find("meta", property="og:title") or
-            soup.find("meta", property="twitter:title") or
-            soup.find("title")
-        )
-        desc_tag = (
-            soup.find("meta", property="og:description") or
-            soup.find("meta", property="twitter:description") or
-            soup.find("meta", name="description")
-        )
-        image_tag = (
-            soup.find("meta", property="og:image") or
-            soup.find("meta", property="twitter:image") or
-            soup.find("meta", property="twitter:image:src")
-        )
-
-        title = title_tag["content"].strip() if title_tag and title_tag.get("content") else "X Post"
-        description = desc_tag["content"].strip() if desc_tag and desc_tag.get("content") else ""
-        image = image_tag["content"].strip() if image_tag and image_tag.get("content") else ""
-
-        return {
-            "title": title,
-            "description": description,
-            "image": image
-        }
-
-    except Exception as e:
-        print(f"Preview fetch failed for {url}: {e}")
-        return {
-            "title": "X Post",
-            "description": "",
-            "image": ""
-        }
-
-# ===================== PREVIEW CACHE =====================
-PREVIEW_CACHE = {}  # Simple in-memory cache (RAM) - reset when bot restart
-PREVIEW_CACHE_HOURS = 10  # Cache preview for 6 hours
-
-def fetch_preview(url: str) -> dict:
-    """
-    Fetch Open Graph info with caching
-    """
-    global PREVIEW_CACHE
-
-    # Check cache first
-    if url in PREVIEW_CACHE:
-        cached_time, data = PREVIEW_CACHE[url]
-        if datetime.utcnow() - cached_time < timedelta(hours=PREVIEW_CACHE_HOURS):
-            print(f"Preview cache hit for {url}")
-            return data
-
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        resp = requests.get(url, timeout=8, headers=headers)
-        resp.raise_for_status()
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        title_tag = soup.find("meta", property="og:title") or soup.find("meta", property="twitter:title") or soup.find("title")
-        desc_tag = soup.find("meta", property="og:description") or soup.find("meta", property="twitter:description") or soup.find("meta", name="description")
-        image_tag = soup.find("meta", property="og:image") or soup.find("meta", property="twitter:image") or soup.find("meta", property="twitter:image:src")
-
-        title = title_tag["content"].strip() if title_tag and title_tag.get("content") else "X Post"
-        description = desc_tag["content"].strip() if desc_tag and desc_tag.get("content") else ""
-        image = image_tag["content"].strip() if image_tag and image_tag.get("content") else ""
-
-        result = {
-            "title": title,
-            "description": description,
-            "image": image
-        }
-
-        # Save to cache
-        PREVIEW_CACHE[url] = (datetime.utcnow(), result)
-        print(f"Preview fetched and cached for {url}")
-
-        return result
-
-    except Exception as e:
-        print(f"Preview fetch failed for {url}: {e}")
-        return {
-            "title": "X Post",
-            "description": "",
-            "image": ""
-        }
