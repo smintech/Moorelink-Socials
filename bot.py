@@ -3,7 +3,7 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from utils import fetch_latest_urls
-
+from telegram.constants import ChatAction
 TELEGRAM_TOKEN = os.getenv("BOTTOKEN")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -22,7 +22,7 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     account = context.args[0].lstrip('@').lower()
     platform = "x"
 
-    await update.message.reply_chat_action("typing")
+    await update.message.chat.send_action(ChatAction.TYPING)
 
     urls = fetch_latest_urls(platform, account)
 
