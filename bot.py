@@ -1,55 +1,57 @@
 import os
-from telegram import Update, Bot
-from telegram.ext import Updater, CommandHandler, CallbackContext
-from utils import fetch_posts
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from datetime import datetime, timedelta
 
-# ===== ENV VARIABLES =====
+# ===== CONFIG =====
+DB_URL = os.getenv("DATABASE_URL")  # Your Postgres URL
 TELEGRAM_TOKEN = os.getenv("BOTTOKEN")  # Bot token from BotFather
+POST_FETCH_LIMIT = 5  # How many posts to deliver per request
 
-# ===== COMMAND HANDLERS =====
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "Hello! I can fetch recent posts from your favorite accounts. "
-        "Use /posts <account> to get latest posts."
-    )
+# ===== DB HELPER =====
+def get_db():
+    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
 
+def fetch_recent_posts(account: str, hours: int = 24):
+    db = get_db()
+    cur = db.cursor()
+    time_limit = datetime.utcnow() - timedelta(hours=hours)
+    cur.execute("""
+        SELECT account_name, post_url, top_comments, fetched_at
+        FROM social_posts
+        WHERE account_name = %s AND fetched_at >= %s
+        ORDER BY fetched_at DESC
+        LIMIT %s
+    """, (account, time_limit, POST_FETCH_LIMIT))
+    posts = cur.fetchall()
+    cur.close()
+    db.close()
+    return posts
 
-def posts(update: Update, context: CallbackContext):
+# ===== TELEGRAM COMMAND =====
+async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) == 0:
-        update.message.reply_text("Please provide an account name. Example: /posts VDM")
+        await update.message.reply_text("Usage: /latest <account>")
         return
 
-    account = context.args[0].strip()
-    try:
-        urls = fetch_posts(account)
-        if not urls:
-            update.message.reply_text(f"No new posts for {account} at the moment.")
-            return
+    account = context.args[0]
+    posts = fetch_recent_posts(account)
 
-        # Send posts in a container-like format
-        reply_text = f"Recent posts from {account}:\n"
-        for i, url in enumerate(urls, 1):
-            reply_text += f"{i}. {url}\n"
-        update.message.reply_text(reply_text)
+    if not posts:
+        await update.message.reply_text(f"No recent posts found for {account}.")
+        return
 
-    except Exception as e:
-        update.message.reply_text(f"Failed to fetch posts: {e}")
+    for post in posts:
+        text = f"{post['post_url']}"
+        if post['top_comments']:
+            text += f"\nTop comments: {post['top_comments']}"
+        await update.message.reply_text(text)
 
-
-# ===== MAIN FUNCTION =====
-def main():
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    # Commands
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("posts", posts))
-
-    # Start bot
-    print("Bot is running...")
-    updater.start_polling()
-    updater.idle()
-
-
+# ===== START BOT =====
 if __name__ == "__main__":
-    main()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("latest", latest))
+    print("Bot started...")
+    app.run_polling()
