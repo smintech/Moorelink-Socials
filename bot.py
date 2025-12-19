@@ -4,7 +4,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ChatAction
 from utils import fetch_latest_urls
-
+from telegram.ext import JobQueue
 TELEGRAM_TOKEN = os.getenv("BOTTOKEN")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -28,22 +28,45 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     urls = fetch_latest_urls(platform, account)
 
     if not urls:
-        await update.message.reply_text(f"No recent public posts found for @{account} 😕\nTry later or check spelling.")
+        no_posts_msg = await update.message.reply_text(f"No recent public posts found for @{account} 😕\nTry later or check spelling.")
+        # Auto delete "no posts" message after 24 hours
+        context.job_queue.run_once(delete_message, 86400, data={"chat_id": no_posts_msg.chat.id, "message_id": no_posts_msg.message_id})
         return
 
-    await update.message.reply_text(f"🔥 Latest {len(urls)} posts from @{account}:")
+    # Send intro message
+    intro_msg = await update.message.reply_text(f"🔥 Latest {len(urls)} posts from @{account}:")
+
+    sent_message_ids = []  # Collect all sent message IDs
 
     for url in urls:
-        # Convert to vxtwitter for perfect Telegram preview
-        fixed_url = url.replace("x.com", "fixupx.com").replace("twitter.com", "fixupx.com")
+        fixed_url = url.replace("x.com", "fixupx.com").replace("twitter.com", "fixupx.com")  # or vxtwitter/fxtwitter
 
-        # Send only the fixed link — Telegram go show rich embed automatic
-        await update.message.reply_text(
+        sent_msg = await update.message.reply_text(
             fixed_url,
-            disable_web_page_preview=False  # MUST be False to allow preview
+            disable_web_page_preview=False
         )
 
-        await asyncio.sleep(5)  # Prevent flood + give time for preview to load
+        sent_message_ids.append(sent_msg.message_id)
+
+        await asyncio.sleep(5)
+
+    # Auto-delete the intro message after 24 hours
+    context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro_msg.chat.id, "message_id": intro_msg.message_id})
+
+    # Auto-delete each post link after 24 hours
+    for msg_id in sent_message_ids:
+        context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": msg_id})
+
+# Helper function to delete message
+async def delete_message(context: ContextTypes.DEFAULT_TYPE):
+    job_data = context.job.data
+    chat_id = job_data["chat_id"]
+    message_id = job_data["message_id"]
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        print(f"Auto-deleted message {message_id} in chat {chat_id}")
+    except Exception as e:
+        print(f"Failed to delete message {message_id}: {e}")  # Prevent flood + give time for preview to load
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
