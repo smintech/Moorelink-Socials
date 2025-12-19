@@ -91,7 +91,8 @@ async def iglatest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_message_ids = []
 
     for url in urls:
-        fixed_url = url.replace("www.instagram.com", "dumpor.com")
+        shortcode = url.split("/")[-2] if url.endswith("/") else url.split("/")[-1].rstrip("/")
+        fixed_url = f"https://imginn.com/p/{shortcode}/"
 
         sent_msg = await update.message.reply_text(
             fixed_url,
