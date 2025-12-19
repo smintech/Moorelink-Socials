@@ -2,3 +2,4 @@ python-telegram-bot[webhooks,job-queue]
 psycopg2-binary
 requests
 beautifulsoup4
+instaloader
