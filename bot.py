@@ -34,9 +34,8 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"🔥 Latest {len(urls)} public posts from @{account}:\n\nFetching previews... ⏳")
 
-    # Send each post as rich card
     for url in urls:
-        preview = fetch_preview(url)  # From your utils.py
+        preview = fetch_preview(url)
 
         title = preview["title"].strip() or "X Post"
         desc = preview["description"].strip()
@@ -45,10 +44,8 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         link_line = f"\n🔗 <a href='{url}'>View on X</a>"
 
         if image:
-            # Rich card with big image
             caption = f"<b>{title}</b>\n\n"
             if desc:
-                # Cut long description
                 if len(desc) > 200:
                     desc = desc[:200] + "..."
                 caption += f"{desc}\n"
@@ -61,17 +58,15 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                     disable_web_page_preview=True
                 )
-            except Exception:
-                # Fallback if image no load
+            except Exception as e:
+                print(f"Photo send failed: {e}")
                 fallback_msg = f"<b>{title}</b>\n\n{desc}{link_line}"
                 await update.message.reply_text(fallback_msg, parse_mode="HTML", disable_web_page_preview=False)
         else:
-            # Text card fallback
             msg = f"<b>{title}</b>\n\n{desc}{link_line}"
             await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=False)
 
-        # Small delay make no flood
-        await asyncio.sleep(1)
+        await asyncio.sleep(1)  # Prevent flood
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
