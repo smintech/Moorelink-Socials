@@ -118,12 +118,60 @@ def fetch_x_urls(account: str):
     print(f"No Nitter mirrors available for @{account}")
     return []
 
+IG_MIRRORS = [
+    "https://dumpor.com",           # Strong for embeds in Telegram
+    "https://fixupx.com",           # Alternative if dumpor slow
+    "https://storiesig.info"        # Good for stories too
+]
+
+def fetch_ig_urls(account: str):
+    account = account.lstrip('@').lower()
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    for base in IG_MIRRORS:
+        try:
+            profile_url = f"{base}/{account}"
+            resp = requests.get(profile_url, headers=headers, timeout=10)
+            resp.raise_for_status()
+
+            if len(resp.text) < 5000:
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            urls = []
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "/p/" in href or "/reel/" in href:
+                    # Clean to original IG URL
+                    shortcode = href.split("/")[-2] if href.endswith("/") else href.split("/")[-1]
+                    original_url = f"https://www.instagram.com/p/{shortcode}/"
+                    if original_url not in urls:
+                        urls.append(original_url)
+
+            if urls:
+                print(f"Fetched {len(urls)} IG posts from {base} @{account}")
+                return urls[:POST_LIMIT]
+
+        except requests.RequestException as e:
+            print(f"IG mirror fail {base}: {e}")
+            time.sleep(2)
+            continue
+
+    print(f"No IG mirrors available for @{account}")
+    return []
+
 # ===================== MAIN LOGIC =====================
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
     account = account.lstrip('@').lower()
 
     if platform == "x":
         new_urls = fetch_x_urls(account)
+    elif platform == "ig":
+        new_urls = fetch_ig_urls(account)
     else:
         return []
 
