@@ -35,7 +35,7 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for url in urls:
         # Convert to vxtwitter for perfect Telegram preview
-        fixed_url = url.replace("x.com", "vxtwitter.com").replace("twitter.com", "vxtwitter.com")
+        fixed_url = url.replace("x.com", "fxtwitter.com").replace("twitter.com", "fxtwitter.com")
 
         # Send only the fixed link — Telegram go show rich embed automatic
         await update.message.reply_text(
