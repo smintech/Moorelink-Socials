@@ -120,7 +120,7 @@ def fetch_x_urls(account: str):
     return []
 
 # ===================== INSTAGRAM FETCHER =====================
-def fetch_ig_urls(account: str) -> List[dict]:
+def fetch_ig_urls(account: str) -> list:
     account = account.lstrip('@').lower()
     posts = []
 
@@ -132,16 +132,13 @@ def fetch_ig_urls(account: str) -> List[dict]:
             if i >= POST_LIMIT:
                 break
 
-            media_urls = []
-            if post.is_video:
-                media_urls.append(post.video_url)
-            else:
-                media_urls.append(post.url)
+            media_url = post.video_url if post.is_video else post.url
 
             posts.append({
-                "url": post.url,
+                "url": f"https://www.instagram.com/p/{post.shortcode}/",
                 "caption": post.caption or "",
-                "media_urls": media_urls
+                "media_url": media_url,
+                "is_video": post.is_video
             })
 
         print(f"Fetched {len(posts)} IG posts from @{account}")
