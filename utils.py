@@ -68,22 +68,25 @@ def fetch_x_urls(account: str) -> List[str]:
     urls = []
 
     try:
-        NITTER_BASE = "https://nitter.net"
-        response = requests.get(f"{NITTER_BASE}/{account}", headers=headers)
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        response = requests.get(f"https://nitter.net/{account}", headers=headers, timeout=10)
+        response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
 
         for link in soup.select('a[href*="/status/"]'):
             href = link.get("href")
-            if href and href.count("/") >= 3:
-                full_url = f"https://x.com{href.split('?')[0]}"
+            if href.startswith(f"/{account}/status/"):
+                full_url = f"https://x.com{href}"
                 if full_url not in urls:
                     urls.append(full_url)
 
-        print(f"Fetched {len(urls)} tweet URLs from @{account}")
-
     except Exception as e:
-        print(f"URL fetch error for @{account}: {e}")
+        print(f"Nitter fetch error for @{account}: {e}")
 
     return urls[:POST_LIMIT]
 
