@@ -6,7 +6,7 @@ from typing import List, Dict
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import snscrape.modules.twitter as sntwitter
+from twikit import Client
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -85,43 +85,41 @@ def get_recent_posts(account: str, platform: str = None) -> list:
 
 # ===================== REAL X FETCHER =====================
 def fetch_x_posts(account: str) -> list:
-    """Fetch real latest posts from X (Twitter) using snscrape"""
+    """Fetch real latest posts from X using twikit"""
     account = account.lstrip('@')
     posts = []
 
     try:
-        # Fetch up to 10 recent tweets
-        for i, tweet in enumerate(sntwitter.TwitterUserScraper(account).get_items()):
-            if i >= 10:
-                break
+        client = Client('en-US')
+        # No login needed for public tweets
+        user = client.get_user_by_screen_name(account)
+        if not user:
+            print(f"User @{account} not found")
+            return []
 
-            # Skip replies and retweets (optional)
-            if tweet.inReplyToTweetId or tweet.retweetedTweet:
+        tweets = client.get_user_tweets(user.id, count=10)
+
+        for tweet in tweets:
+            # Skip replies/retweets
+            if tweet.in_reply_to or tweet.is_retweet:
                 continue
 
-            # Extract media URLs
             media_urls = []
             if tweet.media:
                 for media in tweet.media:
-                    if hasattr(media, 'fullUrl'):
-                        media_urls.append(media.fullUrl)
-                    elif hasattr(media, 'previewUrl'):
-                        media_urls.append(media.previewUrl)
-
-            # Top comments - snscrape doesn't fetch replies easily, leave empty
-            top_comments = []
+                    media_urls.append(media.get('media_url_https', ''))
 
             posts.append({
-                "url": tweet.url,
-                "text": tweet.rawContent or "",
+                "url": f"https://x.com/{account}/status/{tweet.id}",
+                "text": tweet.text or "",
                 "media_urls": media_urls,
-                "top_comments": top_comments
+                "top_comments": []  # twikit no get replies easy
             })
 
         print(f"Fetched {len(posts)} posts from @{account}")
 
     except Exception as e:
-        print(f"Error fetching @{account}: {e}")
+        print(f"Twikit error for @{account}: {e}")
 
     return posts
 
