@@ -70,57 +70,80 @@ async def delete_message(context: ContextTypes.DEFAULT_TYPE):
 
 async def iglatest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(
-            "Usage: /iglatest <username>\nExample: /iglatest chiomaavril"
-        )
+        await update.message.reply_text("Usage: /iglatest <username>\nExample: /iglatest chiomaavril")
         return
 
     account = context.args[0].lstrip('@').lower()
+    platform = "ig"
 
-    # Show typing indicator
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    # Fetch real IG public post URLs using instaloader
-    urls = fetch_ig_urls(account)
+    # Fetch real IG data with instaloader
+    posts = fetch_ig_urls(account)  # This now returns full post data (url, text, media_urls)
 
-    if not urls:
-        await update.message.reply_text(
-            f"No recent public posts found for @{account} on Instagram 😕\n"
-            "Account might be private, no posts, or temporarily unavailable."
-        )
+    if not posts:
+        await update.message.reply_text(f"No recent public posts found for @{account} on Instagram 😕")
         return
 
-    # Send intro message
-    intro_msg = await update.message.reply_text(
-        f"🔥 Latest {len(urls)} public IG posts from @{account}:"
-    )
+    intro_msg = await update.message.reply_text(f"🔥 Latest {len(posts)} public IG posts from @{account}:")
 
     sent_message_ids = []
 
-    # Send each URL with 5-second delay
-    for url in urls:
-        sent_msg = await update.message.reply_text(
-            url,
-            disable_web_page_preview=False
-        )
+    for post in posts:
+        caption = post.get('caption', '').strip()
+        if len(caption) > 1000:
+            caption = caption[:997] + "..."
+
+        first_media = post.get('media_urls', [None])[0]  # First media
+
+        try:
+            if first_media:
+                if any(first_media.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+                    sent_msg = await update.message.reply_photo(
+                        photo=first_media,
+                        caption=f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>",
+                        parse_mode="HTML"
+                    )
+                elif any(first_media.lower().endswith(ext) for ext in ['.mp4', '.mov']):
+                    sent_msg = await update.message.reply_video(
+                        video=first_media,
+                        caption=f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>",
+                        parse_mode="HTML"
+                    )
+                else:
+                    sent_msg = await update.message.reply_text(
+                        f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>",
+                        parse_mode="HTML"
+                    )
+            else:
+                sent_msg = await update.message.reply_text(
+                    f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>",
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            print(f"IG media send error: {e}")
+            sent_msg = await update.message.reply_text(
+                f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>",
+                parse_mode="HTML"
+            )
+
         sent_message_ids.append(sent_msg.message_id)
-        await asyncio.sleep(5)  # Avoid Telegram flood
+        await asyncio.sleep(5)
 
-    # Schedule auto-delete after 24 hours (86400 seconds)
-    context.job_queue.run_once(
-        delete_message,
-        86400,
-        data={"chat_id": intro_msg.chat_id, "message_id": intro_msg.message_id}
-    )
-
+    # Auto-delete intro and messages after 24 hours
+    context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro_msg.chat.id, "message_id": intro_msg.message_id})
     for msg_id in sent_message_ids:
-        context.job_queue.run_once(
-            delete_message,
-            86400,
-            data={"chat_id": update.message.chat_id, "message_id": msg_id}
-        )
+        context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": msg_id})
 
     await update.message.reply_text("Posts sent! They will auto-delete in 24 hours.")
+
+async def delete_message(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    data = job.data
+    try:
+        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
+    except Exception as e:
+        print(f"Delete failed: {e}")
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
