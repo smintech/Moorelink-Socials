@@ -72,8 +72,13 @@ NITTER_INSTANCES = [
 
 def fetch_x_urls(account: str):
     account = account.lstrip('@').lower()
+
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
         "Accept-Language": "en-US,en;q=0.9",
     }
 
@@ -83,21 +88,31 @@ def fetch_x_urls(account: str):
             response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
 
-            if len(response.text) < 5000:
-                continue  # blocked page
+            html = response.text
+            if len(html) < 5000:
+                continue  # blocked / empty page
 
-            soup = BeautifulSoup(response.text, "html.parser")
+            soup = BeautifulSoup(html, "html.parser")
             urls = []
 
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if f"/{account}/status/" in href:
-                    clean = href.split("#")[0]
-                    full_url = f"https://x.com{clean}"
-                    if full_url not in urls:
-                        urls.append(full_url)
+            # ✅ TARGET TWEET BLOCKS
+            for item in soup.select("div.timeline-item"):
+                link = item.select_one("a.tweet-link")
+                if not link:
+                    continue
+
+                href = link.get("href", "")
+                if "/status/" not in href:
+                    continue
+
+                clean = href.split("#")[0]
+                full_url = f"https://x.com{clean}"
+
+                if full_url not in urls:
+                    urls.append(full_url)
 
             if urls:
+                print(f"Fetched {len(urls)} tweets from {base} @{account}")
                 return urls[:POST_LIMIT]
 
         except Exception as e:
