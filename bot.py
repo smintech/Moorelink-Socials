@@ -35,7 +35,7 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for url in urls:
         # Convert to vxtwitter for perfect Telegram preview
-        fixed_url = url.replace("x.com", "fxtwitter.com").replace("twitter.com", "fxtwitter.com")
+        fixed_url = url.replace("x.com", "fixupx.com").replace("twitter.com", "fixupx.com")
 
         # Send only the fixed link — Telegram go show rich embed automatic
         await update.message.reply_text(
@@ -43,7 +43,7 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=False  # MUST be False to allow preview
         )
 
-        await asyncio.sleep(1.5)  # Prevent flood + give time for preview to load
+        await asyncio.sleep(5)  # Prevent flood + give time for preview to load
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
