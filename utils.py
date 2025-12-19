@@ -7,7 +7,7 @@ from typing import List
 from bs4 import BeautifulSoup
 import psycopg2
 from psycopg2.extras import RealDictCursor
-
+import time
 # ===================== CONFIG =====================
 DB_URL = os.getenv("DATABASE_URL")
 CACHE_HOURS = 24
@@ -65,10 +65,13 @@ def get_recent_urls(platform: str, account: str) -> list:
 
 # ===================== FETCHER =====================
 NITTER_INSTANCES = [
-    "https://nitter.net",
-    "https://nitter.privacydev.net",
+    "https://xcancel.com",          # Top one right now, high uptime
+    "https://nitter.net",           # Official, back strong
     "https://nitter.poast.org",
-    "https://nitter.fdn.fr"
+    "https://nitter.space",
+    "https://nuku.trabun.org",
+    "https://lightbrd.com",
+    "https://nitter.privacyredirect.com"
 ]
 
 def fetch_x_urls(account: str):
@@ -108,6 +111,7 @@ def fetch_x_urls(account: str):
 
         except requests.RequestException as e:
             print(f"Nitter fail {base}: {e}")
+            time.sleep(2)
             continue  # try next mirror
 
     print(f"No Nitter mirrors available for @{account}")
