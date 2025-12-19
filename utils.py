@@ -3,7 +3,7 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from app import get_db  # Import your Flask app's get_db function
-from ntscrape import TwitterScraper
+from twikit import Client
 
 # ===================== CONFIG =====================
 CACHE_DURATION = timedelta(minutes=30)  # How long to keep in-memory cache
@@ -108,37 +108,40 @@ def update_cache(platform: str, account: str, posts: List[dict]):
 
 # ===================== MAIN FETCH LOGIC =====================
 def fetch_x_posts(account: str) -> list:
-    """Fetch real latest posts from X using ntscrape"""
+    """Fetch real latest posts from X using twikit"""
     account = account.lstrip('@')
     posts = []
 
     try:
-        scraper = TwitterScraper()
-        tweets = scraper.get_user_tweets(account, count=10)
+        client = Client('en-US')
+        # No login needed for public tweets
+        user = client.get_user_by_screen_name(account)
+        if not user:
+            print(f"User @{account} not found")
+            return []
+
+        tweets = client.get_user_tweets(user.id, count=10)
 
         for tweet in tweets:
             # Skip replies/retweets
-            if tweet.is_reply or tweet.is_retweet:
+            if tweet.in_reply_to or tweet.is_retweet:
                 continue
 
             media_urls = []
             if tweet.media:
-                for m in tweet.media:
-                    if m.type == 'photo':
-                        media_urls.append(m.url)
-                    elif m.type == 'video':
-                        media_urls.append(m.url)
+                for media in tweet.media:
+                    media_urls.append(media.get('media_url_https', ''))
 
             posts.append({
-                "url": tweet.url,
+                "url": f"https://x.com/{account}/status/{tweet.id}",
                 "text": tweet.text or "",
                 "media_urls": media_urls,
-                "top_comments": []  # ntscrape no get replies easy
+                "top_comments": []  # twikit no get replies easy
             })
 
         print(f"Fetched {len(posts)} posts from @{account}")
 
     except Exception as e:
-        print(f"ntscrape error for @{account}: {e}")
+        print(f"Twikit error for @{account}: {e}")
 
     return posts
