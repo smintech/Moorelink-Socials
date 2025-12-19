@@ -1,8 +1,8 @@
-# bot.py - Updated to use your existing social_posts table
+# bot.py - Standalone Telegram Bot
 import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from utils import fetch_latest_urls  # From your utils.py
+from utils import fetch_latest_urls
 
 TELEGRAM_TOKEN = os.getenv("BOTTOKEN")
 
@@ -11,7 +11,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Welcome to TweetLinkBot!\n\n"
         "Use: /latest <username>\n"
         "Example: /latest vdm\n"
-        "Shows recent public tweet links only (no text/media)."
+        "Shows recent tweet links only (no text/media)."
     )
 
 async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -20,11 +20,10 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     account = context.args[0].lstrip('@').lower()
-    platform = "x"  # Fixed to X for now
+    platform = "x"
 
     await update.message.reply_chat_action("typing")
 
-    # Fetch from utils (DB cache → fresh public fetch)
     urls = fetch_latest_urls(platform, account)
 
     if not urls:
@@ -46,5 +45,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("latest", latest))
 
-    print("🤖 TweetLinkBot started! Waiting for commands...")
+    print("🤖 Bot started! Waiting for commands...")
     app.run_polling(drop_pending_updates=True)
