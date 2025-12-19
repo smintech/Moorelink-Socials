@@ -68,6 +68,50 @@ async def delete_message(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"Failed to delete message {message_id}: {e}")  # Prevent flood + give time for preview to load
 
+async def iglatest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /iglatest <username>\nExample: /iglatest chiomaavril")
+        return
+
+    account = context.args[0].lstrip('@').lower()
+    platform = "ig"
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    urls = fetch_latest_urls(platform, account)
+
+    if not urls:
+        no_posts_msg = await update.message.reply_text(f"No recent public posts found for @{account} on Instagram 😕\nAccount private or no posts.")
+        # Auto-delete after 24 hours (like X)
+        context.job_queue.run_once(delete_message, 86400, data={"chat_id": no_posts_msg.chat.id, "message_id": no_posts_msg.message_id})
+        return
+
+    intro_msg = await update.message.reply_text(f"🔥 Latest {len(urls)} IG posts from @{account}:")
+
+    sent_message_ids = []
+
+    for url in urls:
+        fixed_url = url.replace("www.instagram.com", "dumpor.com")
+
+        sent_msg = await update.message.reply_text(
+            fixed_url,
+            disable_web_page_preview=False
+        )
+
+        sent_message_ids.append(sent_msg.message_id)
+
+        await asyncio.sleep(1.5)
+
+    # Auto-delete intro
+    context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro_msg.chat.id, "message_id": intro_msg.message_id})
+
+    # Auto-delete each post
+    for msg_id in sent_message_ids:
+        context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": msg_id})
+
+# Add to app handlers
+app.add_handler(CommandHandler("iglatest", iglatest))
+
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
         raise ValueError("BOTTOKEN environment variable not set!")
