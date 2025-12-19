@@ -157,7 +157,7 @@ def fetch_latest_urls(platform: str, account: str) -> List[str]:
     if platform == "x":
         new_urls = fetch_x_urls(account)
     elif platform == "ig":
-        new_urls = fetch_ig_urls(account)
+        return fetch_ig_urls(account)
     else:
         return []
 
