@@ -40,27 +40,28 @@ def save_url(platform: str, account: str, url: str):
     cur.close()
     conn.close()
 
-def get_recent_urls(platform: str, account: str) -> List[str]:
+def get_recent_urls(platform: str, account: str) -> list:
     conn = get_db()
     cur = conn.cursor()
-
     time_limit = datetime.utcnow() - timedelta(hours=CACHE_HOURS)
 
-    cur.execute("""
-        SELECT post_url
-        FROM social_posts
-        WHERE platform = %s 
-          AND account_name = %s 
-          AND fetched_at >= %s
-        ORDER BY fetched_at DESC
-        LIMIT %s
-    """, (platform.lower(), account.lower(), time_limit, POST_LIMIT))
+    try:
+        cur.execute("""
+            SELECT post_url
+            FROM social_posts
+            WHERE platform = %s
+              AND account_name = %s
+              AND fetched_at >= %s
+            ORDER BY fetched_at DESC
+            LIMIT %s
+        """, (platform.lower(), account.lower(), time_limit, POST_LIMIT))
 
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+        rows = cur.fetchall()
+        return [row["post_url"] for row in rows]  # ✅ Use dict key
 
-    return [row[0] for row in rows]
+    finally:
+        cur.close()
+        conn.close()
 
 # ===================== FETCHER =====================
 NITTER_INSTANCES = [
@@ -85,39 +86,31 @@ def fetch_x_urls(account: str):
     for base in NITTER_INSTANCES:
         try:
             url = f"{base}/{account}"
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
 
-            html = response.text
-            if len(html) < 5000:
-                continue  # blocked / empty page
+            if len(resp.text) < 5000:
+                continue
 
-            soup = BeautifulSoup(html, "html.parser")
+            soup = BeautifulSoup(resp.text, "html.parser")
             urls = []
-
-            # ✅ TARGET TWEET BLOCKS
             for item in soup.select("div.timeline-item"):
                 link = item.select_one("a.tweet-link")
-                if not link:
-                    continue
-
-                href = link.get("href", "")
-                if "/status/" not in href:
-                    continue
-
-                clean = href.split("#")[0]
-                full_url = f"https://x.com{clean}"
-
-                if full_url not in urls:
-                    urls.append(full_url)
+                if link and "/status/" in link["href"]:
+                    clean = link["href"].split("#")[0]
+                    full_url = f"https://x.com{clean}"
+                    if full_url not in urls:
+                        urls.append(full_url)
 
             if urls:
                 print(f"Fetched {len(urls)} tweets from {base} @{account}")
                 return urls[:POST_LIMIT]
 
-        except Exception as e:
+        except requests.RequestException as e:
             print(f"Nitter fail {base}: {e}")
+            continue  # try next mirror
 
+    print(f"No Nitter mirrors available for @{account}")
     return []
 
 # ===================== MAIN LOGIC =====================
