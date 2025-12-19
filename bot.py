@@ -76,37 +76,51 @@ async def iglatest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     account = context.args[0].lstrip('@').lower()
+
+    # Show typing indicator
     await update.message.chat.send_action(ChatAction.TYPING)
 
+    # Fetch real IG public post URLs using instaloader
     urls = fetch_ig_urls(account)
 
     if not urls:
         await update.message.reply_text(
             f"No recent public posts found for @{account} on Instagram 😕\n"
-            "Account private or no posts."
+            "Account might be private, no posts, or temporarily unavailable."
         )
         return
 
+    # Send intro message
     intro_msg = await update.message.reply_text(
-        f"🔥 Latest {len(urls)} IG posts from @{account}:"
+        f"🔥 Latest {len(urls)} public IG posts from @{account}:"
     )
 
     sent_message_ids = []
 
+    # Send each URL with 5-second delay
     for url in urls:
         sent_msg = await update.message.reply_text(
             url,
             disable_web_page_preview=False
         )
         sent_message_ids.append(sent_msg.message_id)
-        await asyncio.sleep(5)
+        await asyncio.sleep(5)  # Avoid Telegram flood
 
-    # Auto-delete intro
-    context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro_msg.chat.id, "message_id": intro_msg.message_id})
+    # Schedule auto-delete after 24 hours (86400 seconds)
+    context.job_queue.run_once(
+        delete_message,
+        86400,
+        data={"chat_id": intro_msg.chat_id, "message_id": intro_msg.message_id}
+    )
 
-    # Auto-delete each post
     for msg_id in sent_message_ids:
-        context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": msg_id})
+        context.job_queue.run_once(
+            delete_message,
+            86400,
+            data={"chat_id": update.message.chat_id, "message_id": msg_id}
+        )
+
+    await update.message.reply_text("Posts sent! They will auto-delete in 24 hours.")
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
