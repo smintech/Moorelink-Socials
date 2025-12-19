@@ -70,38 +70,36 @@ async def delete_message(context: ContextTypes.DEFAULT_TYPE):
 
 async def iglatest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /iglatest <username>\nExample: /iglatest chiomaavril")
+        await update.message.reply_text(
+            "Usage: /iglatest <username>\nExample: /iglatest chiomaavril"
+        )
         return
 
     account = context.args[0].lstrip('@').lower()
-    platform = "ig"
-
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    urls = fetch_latest_urls(platform, account)
+    urls = fetch_ig_urls(account)
 
     if not urls:
-        no_posts_msg = await update.message.reply_text(f"No recent public posts found for @{account} on Instagram 😕\nAccount private or no posts.")
-        # Auto-delete after 24 hours (like X)
-        context.job_queue.run_once(delete_message, 86400, data={"chat_id": no_posts_msg.chat.id, "message_id": no_posts_msg.message_id})
+        await update.message.reply_text(
+            f"No recent public posts found for @{account} on Instagram 😕\n"
+            "Account private or no posts."
+        )
         return
 
-    intro_msg = await update.message.reply_text(f"🔥 Latest {len(urls)} IG posts from @{account}:")
+    intro_msg = await update.message.reply_text(
+        f"🔥 Latest {len(urls)} IG posts from @{account}:"
+    )
 
     sent_message_ids = []
 
     for url in urls:
-        shortcode = url.split("/")[-2] if url.endswith("/") else url.split("/")[-1].rstrip("/")
-        fixed_url = f"https://imginn.com/p/{shortcode}/"
-
         sent_msg = await update.message.reply_text(
-            fixed_url,
+            url,
             disable_web_page_preview=False
         )
-
         sent_message_ids.append(sent_msg.message_id)
-
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(5)
 
     # Auto-delete intro
     context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro_msg.chat.id, "message_id": intro_msg.message_id})
