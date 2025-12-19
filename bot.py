@@ -70,70 +70,74 @@ async def delete_message(context: ContextTypes.DEFAULT_TYPE):
 
 async def iglatest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /iglatest <username>\nExample: /iglatest chiomaavril")
+        await update.message.reply_text(
+            "Usage: /iglatest <username>\nExample: /iglatest chiomaavril"
+        )
         return
 
     account = context.args[0].lstrip('@').lower()
-    platform = "ig"
 
+    # Show typing indicator
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    # Fetch real IG data with instaloader
-    posts = fetch_ig_urls(account)  # This now returns full post data (url, text, media_urls)
+    # Fetch real IG public post data using instaloader
+    posts = fetch_ig_urls(account)
 
     if not posts:
-        await update.message.reply_text(f"No recent public posts found for @{account} on Instagram 😕")
+        await update.message.reply_text(
+            f"No recent public posts found for @{account} on Instagram 😕\n"
+            "Account might be private, no posts, or temporarily unavailable."
+        )
         return
 
-    intro_msg = await update.message.reply_text(f"🔥 Latest {len(posts)} public IG posts from @{account}:")
+    # Send intro message
+    intro_msg = await update.message.reply_text(
+        f"🔥 Latest {len(posts)} public IG posts from @{account}:"
+    )
 
     sent_message_ids = []
 
+    # Send each post with 5-second delay
     for post in posts:
-        caption = post.get('caption', '').strip()
-        if len(caption) > 1000:
-            caption = caption[:997] + "..."
-
-        first_media = post.get('media_urls', [None])[0]  # First media
+        caption_text = post['caption'].strip()[:1024]  # Telegram caption limit
+        msg_caption = f"<a href='{post['url']}'>View on IG</a>\n\n{caption_text}" if caption_text else f"<a href='{post['url']}'>View on IG</a>"
 
         try:
-            if first_media:
-                if any(first_media.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
-                    sent_msg = await update.message.reply_photo(
-                        photo=first_media,
-                        caption=f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>",
-                        parse_mode="HTML"
-                    )
-                elif any(first_media.lower().endswith(ext) for ext in ['.mp4', '.mov']):
-                    sent_msg = await update.message.reply_video(
-                        video=first_media,
-                        caption=f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>",
-                        parse_mode="HTML"
-                    )
-                else:
-                    sent_msg = await update.message.reply_text(
-                        f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>",
-                        parse_mode="HTML"
-                    )
+            if post['is_video']:
+                sent_msg = await update.message.reply_video(
+                    video=post['media_url'],
+                    caption=msg_caption,
+                    parse_mode="HTML"
+                )
             else:
-                sent_msg = await update.message.reply_text(
-                    f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>",
+                sent_msg = await update.message.reply_photo(
+                    photo=post['media_url'],
+                    caption=msg_caption,
                     parse_mode="HTML"
                 )
         except Exception as e:
-            print(f"IG media send error: {e}")
+            print(f"Send error: {e}")
             sent_msg = await update.message.reply_text(
-                f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>",
+                msg_caption,
                 parse_mode="HTML"
             )
 
         sent_message_ids.append(sent_msg.message_id)
-        await asyncio.sleep(5)
+        await asyncio.sleep(5)  # Avoid flood
 
-    # Auto-delete intro and messages after 24 hours
-    context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro_msg.chat.id, "message_id": intro_msg.message_id})
+    # Schedule auto-delete after 24 hours (86400 seconds)
+    context.job_queue.run_once(
+        delete_message,
+        86400,
+        data={"chat_id": intro_msg.chat_id, "message_id": intro_msg.message_id}
+    )
+
     for msg_id in sent_message_ids:
-        context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": msg_id})
+        context.job_queue.run_once(
+            delete_message,
+            86400,
+            data={"chat_id": update.message.chat_id, "message_id": msg_id}
+        )
 
     await update.message.reply_text("Posts sent! They will auto-delete in 24 hours.")
 
