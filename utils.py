@@ -118,51 +118,64 @@ def fetch_x_urls(account: str):
     print(f"No Nitter mirrors available for @{account}")
     return []
 
+# ===================== INSTAGRAM FETCHER =====================
 IG_MIRRORS = [
-    "https://dumpor.com",          # Best overall
-    "https://imginn.com",          # Good fallback
-    "https://insta-stories-viewer.com"  # Weak but usable
+    "https://imginn.com",               # Most reliable right now
+    "https://pixnoy.com",               # Strong, new pixwox
+    "https://greatfon.com",             # Good fallback
+    "https://insta-stories-viewer.com"  # Last resort
 ]
 
-def fetch_ig_urls(account: str):
+def fetch_ig_urls(account: str) -> List[str]:
     account = account.lstrip('@').lower()
 
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
 
     for base in IG_MIRRORS:
         try:
             profile_url = f"{base}/{account}"
-            resp = requests.get(profile_url, headers=headers, timeout=10)
+            resp = requests.get(profile_url, headers=headers, timeout=12)
             resp.raise_for_status()
 
-            if len(resp.text) < 5000:
+            if len(resp.text) < 8000:  # Too small = blocked or empty
+                print(f"Page too small from {base} @{account}")
                 continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
             urls = []
 
+            # Different mirrors use different structures
             for a in soup.find_all("a", href=True):
-                href = a["href"]
+                href = a["href"].strip()
 
-                if any(x in href for x in ("/p/", "/reel/", "/tv/")):
-                    parts = href.strip("/").split("/")
-                    shortcode = parts[-1] if parts[-1] not in ("p", "reel", "tv") else parts[-2]
-
-                    # Detect reel vs post
-                    if "/reel/" in href:
-                        original_url = f"https://www.instagram.com/reel/{shortcode}/"
+                if any(keyword in href for keyword in ("/p/", "/reel/", "/tv/")):
+                    # Extract shortcode
+                    parts = [p for p in href.split("/") if p]
+                    if "p" in parts:
+                        idx = parts.index("p") + 1
+                    elif "reel" in parts:
+                        idx = parts.index("reel") + 1
+                    elif "tv" in parts:
+                        idx = parts.index("tv") + 1
                     else:
-                        original_url = f"https://www.instagram.com/p/{shortcode}/"
+                        continue
 
-                    if original_url not in urls:
-                        urls.append(original_url)
+                    if idx < len(parts):
+                        shortcode = parts[idx]
+                        if "/reel/" in href:
+                            original_url = f"https://www.instagram.com/reel/{shortcode}/"
+                        else:
+                            original_url = f"https://www.instagram.com/p/{shortcode}/"
+
+                        if original_url not in urls:
+                            urls.append(original_url)
 
             if urls:
                 print(f"Fetched {len(urls)} IG posts from {base} @{account}")
@@ -173,7 +186,7 @@ def fetch_ig_urls(account: str):
             time.sleep(5)
             continue
 
-    print(f"No IG mirrors available for @{account}")
+    print(f"No working IG mirror for @{account}")
     return []
 
 # ===================== MAIN LOGIC =====================
