@@ -3,6 +3,7 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from app import get_db  # Import your Flask app's get_db function
+import snscrape.modules.twitter as sntwitter
 
 # ===================== CONFIG =====================
 CACHE_DURATION = timedelta(minutes=30)  # How long to keep in-memory cache
@@ -127,23 +128,49 @@ def fetch_latest_posts(platform: str, account: str) -> List[dict]:
         update_cache(platform, account, db_posts)
         return db_posts
 
-    # 3. No cache/DB → fetch fresh (PLACEHOLDER — replace with real fetcher)
-    print(f"Fetching fresh posts from {platform} for @{account}...")
-    
-    # === DUMMY DATA FOR TESTING ===
-    dummy_posts = [
-        {
-            "url": f"https://x.com/{account}/status/1234567890{i}",
-            "text": f"Sample post {i} from @{account} #testing",
-            "media_urls": [],
-            "top_comments": [f"Comment {j} on post {i}" for j in range(1, 4)]
-        }
-        for i in range(1, 6)
-    ]
-    # =================================
+    # 3. No cache/DB → fetch fresh from X using snscrape
+    print(f"Fetching fresh posts from X for @{account}...")
+    posts = []
+
+    try:
+        # Fetch up to 10 recent tweets
+        for i, tweet in enumerate(sntwitter.TwitterUserScraper(account).get_items()):
+            if i >= 10:
+                break
+
+            # Skip replies and retweets (optional - remove if you want them)
+            if tweet.inReplyToTweetId or tweet.retweetedTweet:
+                continue
+
+            # Extract media URLs
+            media_urls = []
+            if tweet.media:
+                for media in tweet.media:
+                    if hasattr(media, 'fullUrl'):
+                        media_urls.append(media.fullUrl)
+                    elif hasattr(media, 'previewUrl'):
+                        media_urls.append(media.previewUrl)
+
+            # Top comments - snscrape doesn't fetch replies easily, so leave empty for now
+            top_comments = []
+
+            posts.append({
+                "url": tweet.url,
+                "text": tweet.rawContent or "",
+                "media_urls": media_urls,
+                "top_comments": top_comments
+            })
+
+        if not posts:
+            print(f"No posts found for @{account}")
+            return []
+
+    except Exception as e:
+        print(f"Snscrape error for @{account}: {e}")
+        return []
 
     # Save new posts to DB
-    for post in dummy_posts:
+    for post in posts:
         save_post(platform, account, post)
 
     # Get fresh from DB and cache
@@ -151,13 +178,3 @@ def fetch_latest_posts(platform: str, account: str) -> List[dict]:
     update_cache(platform, account, fresh_posts)
 
     return fresh_posts
-
-# ===================== PLATFORM-SPECIFIC FETCHERS (TO ADD LATER) =====================
-# Example placeholder for real implementation
-# async def fetch_x_posts(account: str) -> List[dict]:
-#     # Use snscrape, tweepy, or X API
-#     pass
-
-# async def fetch_instagram_posts(account: str) -> List[dict]:
-#     # Use instaloader or unofficial API
-#     pass
