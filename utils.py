@@ -8,8 +8,7 @@ from bs4 import BeautifulSoup
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import time
-import http.client, json
-from typing import List
+import instaloader
 # ===================== CONFIG =====================
 DB_URL = os.getenv("DATABASE_URL")
 CACHE_HOURS = 24
@@ -120,40 +119,33 @@ def fetch_x_urls(account: str):
     return []
 
 # ===================== INSTAGRAM FETCHER =====================
-def fetch_ig_urls(account: str) -> list:
-    BEARER_TOKEN = os.getenv("RAPIDAPI_KEY")
-    conn = http.client.HTTPSConnection("flashapi.ru")
-    headers = {'Authorization': f"Bearer {BEARER_TOKEN}"}
-    endpoint = f"/api/posts_username?user={account}&end_cursor="
-    
-    try:
-        conn.request("GET", endpoint, headers=headers)
-        res = conn.getresponse()
-        data = res.read()
-        result = json.loads(data.decode("utf-8"))
-        urls = [post['url'] for post in result.get("posts", [])]
-        return urls[:POST_LIMIT]
-    except Exception as e:
-        print(f"Flash API fetch failed: {e}")
-        return []
-# ===================== MAIN LOGIC =====================
-def fetch_latest_urls(platform: str, account: str) -> List[str]:
+def fetch_ig_urls(account: str) -> List[str]:
+    """Fetch public Instagram post URLs using instaloader (no login)"""
     account = account.lstrip('@').lower()
+    urls = []
 
-    if platform == "x":
-        new_urls = fetch_x_urls(account)
-    elif platform == "ig":
-        return fetch_ig_urls(account)
-    else:
-        return []
+    try:
+        L = instaloader.Instaloader()
+        # Anonymous mode - no login
+        L.context._session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
 
-    if not new_urls:
-        return get_recent_urls(platform, account)
+        profile = instaloader.Profile.from_username(L.context, account)
 
-    # Save new ones
-    for url in new_urls:
-        save_url(platform, account, url)
+        # Fetch up to 10 public posts
+        for i, post in enumerate(profile.get_posts()):
+            if i >= POST_LIMIT:
+                break
+            urls.append(post.url)
 
-    return new_urls
+        print(f"Fetched {len(urls)} IG post URLs from @{account}")
+
+    except instaloader.exceptions.PrivateProfileNotFollowedException:
+        print(f"@{account} is private - cannot fetch without login")
+    except Exception as e:
+        print(f"IG fetch error for @{account}: {e}")
+
+    return urls
 
 # ===================== PREVIEW FETCHER =====================
