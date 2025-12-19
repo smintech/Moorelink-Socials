@@ -1,3 +1,4 @@
 python-telegram-bot[webhooks]
 psycopg2-binary
-twikit
+requests
+beautifulsoup4
