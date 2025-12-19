@@ -128,7 +128,8 @@ IG_MIRRORS = [
 
 def fetch_ig_urls(account: str) -> List[str]:
     account = account.lstrip('@').lower()
-
+    profile_fallback = f"https://www.instagram.com/{account}/"
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -154,28 +155,25 @@ def fetch_ig_urls(account: str) -> List[str]:
             # Different mirrors use different structures
             for a in soup.find_all("a", href=True):
                 href = a["href"].strip()
-
-                if any(keyword in href for keyword in ("/p/", "/reel/", "/tv/")):
-                    # Extract shortcode
+                
+                if href.startswith("/"):
+                    href = base + href
+                    
+                if any(k in href for k in ("/p/", "/reel/", "/tv/")):
                     parts = [p for p in href.split("/") if p]
-                    if "p" in parts:
-                        idx = parts.index("p") + 1
-                    elif "reel" in parts:
-                        idx = parts.index("reel") + 1
-                    elif "tv" in parts:
-                        idx = parts.index("tv") + 1
-                    else:
-                        continue
-
-                    if idx < len(parts):
-                        shortcode = parts[idx]
-                        if "/reel/" in href:
-                            original_url = f"https://www.instagram.com/reel/{shortcode}/"
-                        else:
-                            original_url = f"https://www.instagram.com/p/{shortcode}/"
-
-                        if original_url not in urls:
-                            urls.append(original_url)
+                    
+                    for key in ("p", "reel", "tv"):
+                        if key in parts:
+                            idx = parts.index(key) + 1
+                            if idx < len(parts):
+                                shortcode = parts[idx]
+                                if key == "reel":
+                                    original_url = f"https://www.instagram.com/reel/{shortcode}/"
+                                else:
+                                    original_url = f"https://www.instagram.com/p/{shortcode}/"
+                                    
+                                if original_url not in urls:
+                                    urls.append(original_url)
 
             if urls:
                 print(f"Fetched {len(urls)} IG posts from {base} @{account}")
@@ -187,7 +185,7 @@ def fetch_ig_urls(account: str) -> List[str]:
             continue
 
     print(f"No working IG mirror for @{account}")
-    return []
+    return [profile_fallback]
 
 # ===================== MAIN LOGIC =====================
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
