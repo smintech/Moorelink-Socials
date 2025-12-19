@@ -3,7 +3,7 @@ import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ChatAction
-from utils import fetch_latest_urls
+from utils import fetch_latest_urls, fetch_ig_urls
 from telegram.ext import JobQueue
 TELEGRAM_TOKEN = os.getenv("BOTTOKEN")
 
