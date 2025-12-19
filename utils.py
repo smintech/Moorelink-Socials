@@ -134,3 +134,59 @@ def fetch_latest_urls(platform: str, account: str) -> List[str]:
         save_url(platform, account, url)
 
     return new_urls
+
+# ===================== PREVIEW FETCHER =====================
+def fetch_preview(url: str) -> dict:
+    """
+    Fetch Open Graph / Twitter card info for an X post.
+    Returns: {"title": str, "description": str, "image": str}
+    """
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        resp = requests.get(url, timeout=8, headers=headers)
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Open Graph / Twitter Card tags
+        title_tag = (
+            soup.find("meta", property="og:title") or
+            soup.find("meta", property="twitter:title") or
+            soup.find("title")
+        )
+        desc_tag = (
+            soup.find("meta", property="og:description") or
+            soup.find("meta", property="twitter:description") or
+            soup.find("meta", name="description")
+        )
+        image_tag = (
+            soup.find("meta", property="og:image") or
+            soup.find("meta", property="twitter:image") or
+            soup.find("meta", property="twitter:image:src")
+        )
+
+        title = title_tag["content"].strip() if title_tag and title_tag.get("content") else "X Post"
+        description = desc_tag["content"].strip() if desc_tag and desc_tag.get("content") else ""
+        image = image_tag["content"].strip() if image_tag and image_tag.get("content") else ""
+
+        return {
+            "title": title,
+            "description": description,
+            "image": image
+        }
+
+    except Exception as e:
+        print(f"Preview fetch failed for {url}: {e}")
+        return {
+            "title": "X Post",
+            "description": "",
+            "image": ""
+        }
+    
