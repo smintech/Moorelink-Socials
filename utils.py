@@ -3,7 +3,7 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from app import get_db  # Import your Flask app's get_db function
-import snscrape.modules.twitter as sntwitter
+from ntscrape import TwitterScraper
 
 # ===================== CONFIG =====================
 CACHE_DURATION = timedelta(minutes=30)  # How long to keep in-memory cache
@@ -107,74 +107,38 @@ def update_cache(platform: str, account: str, posts: List[dict]):
     }
 
 # ===================== MAIN FETCH LOGIC =====================
-def fetch_latest_posts(platform: str, account: str) -> List[dict]:
-    """
-    Main function called by bot.
-    1. Check in-memory cache
-    2. Check DB for recent posts
-    3. If none → fetch from platform API (placeholder)
-    4. Save new posts + update cache
-    """
+def fetch_x_posts(account: str) -> list:
+    """Fetch real latest posts from X using ntscrape"""
     account = account.lstrip('@')
-
-    # 1. Try cache
-    cached = get_cached_posts(platform, account)
-    if cached:
-        return cached
-
-    # 2. Try DB
-    db_posts = get_recent_posts(platform, account)
-    if db_posts:
-        update_cache(platform, account, db_posts)
-        return db_posts
-
-    # 3. No cache/DB → fetch fresh from X using snscrape
-    print(f"Fetching fresh posts from X for @{account}...")
     posts = []
 
     try:
-        # Fetch up to 10 recent tweets
-        for i, tweet in enumerate(sntwitter.TwitterUserScraper(account).get_items()):
-            if i >= 10:
-                break
+        scraper = TwitterScraper()
+        tweets = scraper.get_user_tweets(account, count=10)
 
-            # Skip replies and retweets (optional - remove if you want them)
-            if tweet.inReplyToTweetId or tweet.retweetedTweet:
+        for tweet in tweets:
+            # Skip replies/retweets
+            if tweet.is_reply or tweet.is_retweet:
                 continue
 
-            # Extract media URLs
             media_urls = []
             if tweet.media:
-                for media in tweet.media:
-                    if hasattr(media, 'fullUrl'):
-                        media_urls.append(media.fullUrl)
-                    elif hasattr(media, 'previewUrl'):
-                        media_urls.append(media.previewUrl)
-
-            # Top comments - snscrape doesn't fetch replies easily, so leave empty for now
-            top_comments = []
+                for m in tweet.media:
+                    if m.type == 'photo':
+                        media_urls.append(m.url)
+                    elif m.type == 'video':
+                        media_urls.append(m.url)
 
             posts.append({
                 "url": tweet.url,
-                "text": tweet.rawContent or "",
+                "text": tweet.text or "",
                 "media_urls": media_urls,
-                "top_comments": top_comments
+                "top_comments": []  # ntscrape no get replies easy
             })
 
-        if not posts:
-            print(f"No posts found for @{account}")
-            return []
+        print(f"Fetched {len(posts)} posts from @{account}")
 
     except Exception as e:
-        print(f"Snscrape error for @{account}: {e}")
-        return []
+        print(f"ntscrape error for @{account}: {e}")
 
-    # Save new posts to DB
-    for post in posts:
-        save_post(platform, account, post)
-
-    # Get fresh from DB and cache
-    fresh_posts = get_recent_posts(platform, account)
-    update_cache(platform, account, fresh_posts)
-
-    return fresh_posts
+    return posts
