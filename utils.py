@@ -119,16 +119,20 @@ def fetch_x_urls(account: str):
     return []
 
 IG_MIRRORS = [
-    "https://dumpor.com",           # Strong for embeds in Telegram
-    "https://fixupx.com",           # Alternative if dumpor slow
-    "https://storiesig.info"        # Good for stories too
+    "https://dumpor.com",          # Best overall
+    "https://imginn.com",          # Good fallback
+    "https://insta-stories-viewer.com"  # Weak but usable
 ]
 
 def fetch_ig_urls(account: str):
     account = account.lstrip('@').lower()
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
         "Accept-Language": "en-US,en;q=0.9",
     }
 
@@ -143,12 +147,20 @@ def fetch_ig_urls(account: str):
 
             soup = BeautifulSoup(resp.text, "html.parser")
             urls = []
+
             for a in soup.find_all("a", href=True):
                 href = a["href"]
-                if "/p/" in href or "/reel/" in href:
-                    # Clean to original IG URL
-                    shortcode = href.split("/")[-2] if href.endswith("/") else href.split("/")[-1]
-                    original_url = f"https://www.instagram.com/p/{shortcode}/"
+
+                if any(x in href for x in ("/p/", "/reel/", "/tv/")):
+                    parts = href.strip("/").split("/")
+                    shortcode = parts[-1] if parts[-1] not in ("p", "reel", "tv") else parts[-2]
+
+                    # Detect reel vs post
+                    if "/reel/" in href:
+                        original_url = f"https://www.instagram.com/reel/{shortcode}/"
+                    else:
+                        original_url = f"https://www.instagram.com/p/{shortcode}/"
+
                     if original_url not in urls:
                         urls.append(original_url)
 
@@ -158,7 +170,7 @@ def fetch_ig_urls(account: str):
 
         except requests.RequestException as e:
             print(f"IG mirror fail {base}: {e}")
-            time.sleep(2)
+            time.sleep(5)
             continue
 
     print(f"No IG mirrors available for @{account}")
