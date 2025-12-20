@@ -1,4 +1,3 @@
-# utils.py
 import os
 import hashlib
 import requests
@@ -40,7 +39,9 @@ def init_tg_db():
         is_banned INTEGER DEFAULT 0,
         request_count INTEGER DEFAULT 0,
         last_request_at TIMESTAMP,
-        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        invite_count INTEGER DEFAULT 0,
+        is_admin INTEGER DEFAULT 0
     );
     """)
     cur.execute("""
@@ -52,6 +53,17 @@ def init_tg_db():
         label TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(owner_telegram_id, platform, account_name)
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS tg_rate_limits (
+        telegram_id BIGINT PRIMARY KEY,
+        minute_count INTEGER DEFAULT 0,
+        hour_count INTEGER DEFAULT 0,
+        day_count INTEGER DEFAULT 0,
+        minute_reset TIMESTAMP,
+        hour_reset TIMESTAMP,
+        day_reset TIMESTAMP
     );
     """)
     conn.commit()
@@ -382,6 +394,182 @@ def update_saved_account_label(owner_telegram_id: int, saved_id: int, new_label:
     cur.close()
     conn.close()
     return ok > 0
+
+# ================ BADGE AND INVITE HELPERS ================
+
+BADGE_LEVELS = [
+    {"name": "Basic", "emoji": "🪪", "invites_needed": 0, "save_slots": 5, "limits": {"min": 2, "hour": 15, "day": 40}},
+    {"name": "Bronze", "emoji": "🥉", "invites_needed": 5, "save_slots": 7, "limits": {"min": 3, "hour": 30, "day": 80}},
+    {"name": "Silver", "emoji": "🥈", "invites_needed": 15, "save_slots": 10, "limits": {"min": 5, "hour": 60, "day": 150}},
+    {"name": "Gold", "emoji": "🥇", "invites_needed": 40, "save_slots": 15, "limits": {"min": 8, "hour": 120, "day": 300}},
+    {"name": "Diamond", "emoji": "💎", "invites_needed": 100, "save_slots": float('inf'), "limits": {"min": float('inf'), "hour": float('inf'), "day": float('inf')}},
+    {"name": "Admin", "emoji": "👑", "invites_needed": None, "save_slots": float('inf'), "limits": {"min": float('inf'), "hour": float('inf'), "day": float('inf')}},
+]
+
+def get_user_badge(telegram_id: int) -> Dict[str, Any]:
+    user = get_tg_user(telegram_id)
+    if not user:
+        return BADGE_LEVELS[0]
+    if user['is_admin']:
+        return BADGE_LEVELS[-1]
+    invites = user.get('invite_count', 0)
+    for level in reversed(BADGE_LEVELS[:-1]):
+        if invites >= level['invites_needed']:
+            return level
+    return BADGE_LEVELS[0]
+
+def increment_invite_count(telegram_id: int, amount: int = 1) -> int:
+    conn = get_tg_db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tg_users
+        SET invite_count = COALESCE(invite_count, 0) + %s
+        WHERE telegram_id = %s
+        RETURNING invite_count
+    """, (amount, telegram_id))
+    new_count = cur.fetchone()['invite_count']
+    conn.commit()
+    cur.close()
+    conn.close()
+    return new_count
+
+def set_admin(telegram_id: int, is_admin: bool) -> None:
+    val = 1 if is_admin else 0
+    conn = get_tg_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE tg_users SET is_admin = %s WHERE telegram_id = %s", (val, telegram_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# ================ COOLDOWN HELPERS ================
+
+def get_rate_limits(telegram_id: int) -> Dict[str, Any]:
+    conn = get_tg_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tg_rate_limits WHERE telegram_id = %s", (telegram_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return dict(row) if row else {
+        'telegram_id': telegram_id,
+        'minute_count': 0,
+        'hour_count': 0,
+        'day_count': 0,
+        'minute_reset': None,
+        'hour_reset': None,
+        'day_reset': None
+    }
+
+def update_rate_limits(telegram_id: int, data: Dict[str, Any]) -> None:
+    conn = get_tg_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tg_rate_limits (telegram_id, minute_count, hour_count, day_count, minute_reset, hour_reset, day_reset)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (telegram_id) DO UPDATE SET
+            minute_count = EXCLUDED.minute_count,
+            hour_count = EXCLUDED.hour_count,
+            day_count = EXCLUDED.day_count,
+            minute_reset = EXCLUDED.minute_reset,
+            hour_reset = EXCLUDED.hour_reset,
+            day_reset = EXCLUDED.day_reset
+    """, (telegram_id, data['minute_count'], data['hour_count'], data['day_count'],
+          data['minute_reset'], data['hour_reset'], data['day_reset']))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def reset_cooldown(telegram_id: int) -> None:
+    conn = get_tg_db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tg_rate_limits SET
+            minute_count = 0, hour_count = 0, day_count = 0,
+            minute_reset = NULL, hour_reset = NULL, day_reset = NULL
+        WHERE telegram_id = %s
+    """, (telegram_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def check_and_increment_cooldown(telegram_id: int) -> Optional[str]:
+    """
+    Returns None if allowed, else a block message string.
+    """
+    user = get_tg_user(telegram_id)
+    if not user or user['is_banned']:
+        return "You are banned."
+    badge = get_user_badge(telegram_id)
+    if badge['name'] == 'Admin':
+        increment_tg_request_count(telegram_id)
+        return None
+    
+    limits = badge['limits']
+    now = datetime.utcnow()
+    rl = get_rate_limits(telegram_id)
+    
+    # Initialize resets if None
+    if rl['minute_reset'] is None:
+        rl['minute_reset'] = now + timedelta(minutes=1)
+    if rl['hour_reset'] is None:
+        rl['hour_reset'] = now + timedelta(hours=1)
+    if rl['day_reset'] is None:
+        rl['day_reset'] = now + timedelta(days=1)
+    
+    # Reset counters if expired
+    if now >= rl['minute_reset']:
+        rl['minute_count'] = 0
+        rl['minute_reset'] = now + timedelta(minutes=1)
+    if now >= rl['hour_reset']:
+        rl['hour_count'] = 0
+        rl['hour_reset'] = now + timedelta(hours=1)
+    if now >= rl['day_reset']:
+        rl['day_count'] = 0
+        rl['day_reset'] = now + timedelta(days=1)
+    
+    # Check limits
+    if rl['minute_count'] >= limits['min']:
+        seconds_left = (rl['minute_reset'] - now).total_seconds()
+        return f"⏳ Slow down a bit\n\n🏅 Badge: {badge['emoji']} {badge['name']}\n📨 Limit: {limits['min']} / minute\n⏱ Try again in {int(seconds_left)} seconds\n\nInvite friends to unlock higher badges 🚀"
+    if rl['hour_count'] >= limits['hour']:
+        minutes_left = (rl['hour_reset'] - now).total_seconds() / 60
+        return f"⏳ Slow down a bit\n\n🏅 Badge: {badge['emoji']} {badge['name']}\n📨 Limit: {limits['hour']} / hour\n⏱ Try again in {int(minutes_left)} minutes\n\nInvite friends to unlock higher badges 🚀"
+    if rl['day_count'] >= limits['day']:
+        hours_left = (rl['day_reset'] - now).total_seconds() / 3600
+        return f"⏳ Slow down a bit\n\n🏅 Badge: {badge['emoji']} {badge['name']}\n📨 Limit: {limits['day']} / day\n⏱ Try again in {int(hours_left)} hours\n\nInvite friends to unlock higher badges 🚀"
+    
+    # Check abuse
+    if rl['day_count'] > limits['day'] * 2:
+        # Throttle harder, e.g., reset day count to max, extend reset
+        rl['day_count'] = limits['day']
+        rl['day_reset'] = now + timedelta(days=2)
+        update_rate_limits(telegram_id, rl)
+        return "🚫 Excessive usage detected. Cooldown extended."
+    
+    # Increment
+    rl['minute_count'] += 1
+    rl['hour_count'] += 1
+    rl['day_count'] += 1
+    update_rate_limits(telegram_id, rl)
+    increment_tg_request_count(telegram_id)
+    return None
+
+# ================ ADMIN HELPERS ================
+
+def get_user_stats(telegram_id: int) -> Dict[str, Any]:
+    user = get_tg_user(telegram_id)
+    if not user:
+        return {}
+    badge = get_user_badge(telegram_id)
+    rl = get_rate_limits(telegram_id)
+    saves = count_saved_accounts(telegram_id)
+    return {
+        'user': user,
+        'badge': badge,
+        'rate_limits': rl,
+        'save_count': saves
+    }
 
 # ================ INIT ON IMPORT ================
 try:
