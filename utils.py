@@ -31,12 +31,15 @@ def get_tg_db():
 # ================ INIT TABLES ================
 def init_tg_db():
     """
-    Create all tg-related tables idempotently. Safe to call every startup.
+    Create/patch tg-related tables and required columns idempotently.
+    Safe to call every startup.
     """
+    conn = None
     try:
         conn = get_tg_db()
         cur = conn.cursor()
-        # tg_users table
+
+        # Core table (create if missing)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS tg_users (
             id SERIAL PRIMARY KEY,
@@ -46,11 +49,14 @@ def init_tg_db():
             is_banned INTEGER DEFAULT 0,
             request_count INTEGER DEFAULT 0,
             last_request_at TIMESTAMP,
-            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            invite_count INTEGER DEFAULT 0,
-            is_admin INTEGER DEFAULT 0
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+
+        # Ensure optional columns exist (safe on existing DBs)
+        cur.execute("ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS invite_count INTEGER DEFAULT 0;")
+        cur.execute("ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS is_admin INTEGER DEFAULT 0;")
+
         # saved_accounts table
         cur.execute("""
         CREATE TABLE IF NOT EXISTS saved_accounts (
@@ -63,7 +69,8 @@ def init_tg_db():
             UNIQUE(owner_telegram_id, platform, account_name)
         );
         """)
-        # rate limits table
+
+        # Rate limits table
         cur.execute("""
         CREATE TABLE IF NOT EXISTS tg_rate_limits (
             telegram_id BIGINT PRIMARY KEY,
@@ -75,7 +82,8 @@ def init_tg_db():
             day_reset TIMESTAMP
         );
         """)
-        # badges table
+
+        # Badges table (needed by get_explicit_badge)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS tg_badges (
             telegram_id BIGINT PRIMARY KEY,
@@ -83,8 +91,8 @@ def init_tg_db():
             assigned_at TIMESTAMP DEFAULT NOW()
         );
         """)
-        # social_posts caching table (in separate DB if DB_URL provided)
-        # (only create if DB_URL set)
+
+        # social_posts in main DB only if DB_URL is set (keeps previous behavior)
         if DB_URL:
             db_conn = get_db()
             db_cur = db_conn.cursor()
@@ -101,7 +109,7 @@ def init_tg_db():
             db_cur.close()
             db_conn.close()
 
-        # Add FK constraint only if not present (safe on reruns)
+        # Add FK constraint if not present (idempotent)
         cur.execute("""
         DO $$
         BEGIN
@@ -122,12 +130,11 @@ def init_tg_db():
         cur.close()
         conn.close()
         logging.info("[utils.init_tg_db] tg DB tables created/verified successfully.")
-    except Exception as e:
-        logging.exception(f"[utils.init_tg_db] Failed to initialize tg DB tables: {e}")
-        # If anything fails, raise so caller can decide; but here we swallow to let bot run
+    except Exception:
+        logging.exception("[utils.init_tg_db] Failed to initialize tg DB tables")
         try:
-            cur.close()
-            conn.close()
+            if conn:
+                conn.close()
         except Exception:
             pass
 
@@ -262,7 +269,8 @@ def fetch_latest_urls(platform: str, account: str) -> List[str]:
 # ================ TG USER HELPERS (tg DB) ============
 def add_or_update_tg_user(telegram_id: int, first_name: str) -> Dict[str, Any]:
     """
-    Insert or update a tg user; return the row as dict.
+    Upsert the user and return the current row from tg_users.
+    This avoids relying on RETURNING columns that may not exist on older schemas.
     """
     try:
         conn = get_tg_db()
@@ -271,19 +279,32 @@ def add_or_update_tg_user(telegram_id: int, first_name: str) -> Dict[str, Any]:
             INSERT INTO tg_users (telegram_id, first_name)
             VALUES (%s, %s)
             ON CONFLICT (telegram_id)
-            DO UPDATE SET first_name = EXCLUDED.first_name
-            RETURNING telegram_id, first_name, is_admin, invite_count, request_count, is_banned, is_active, joined_at;
+            DO UPDATE SET first_name = EXCLUDED.first_name;
         """, (telegram_id, first_name))
-        row = cur.fetchone()
         conn.commit()
+
+        # Now SELECT the row explicitly (choose only columns we expect to exist).
+        # Using explicit column list reduces chance of issues if new columns are added/removed.
+        cur.execute("""
+            SELECT telegram_id, first_name,
+                   COALESCE(is_admin, 0) AS is_admin,
+                   COALESCE(invite_count, 0) AS invite_count,
+                   COALESCE(request_count, 0) AS request_count,
+                   COALESCE(is_banned, 0) AS is_banned,
+                   COALESCE(is_active, 1) AS is_active,
+                   joined_at
+            FROM tg_users
+            WHERE telegram_id = %s
+        """, (telegram_id,))
+        row = cur.fetchone()
         cur.close()
         conn.close()
         return dict(row) if row else {}
     except Exception:
-        logging.debug("add_or_update_tg_user failed", exc_info=True)
+        logging.exception("add_or_update_tg_user failed")
         try:
-            cur.close()
-            conn.close()
+            if conn:
+                conn.close()
         except Exception:
             pass
         return {}
