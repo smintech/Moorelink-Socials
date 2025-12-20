@@ -3,6 +3,7 @@ import os
 import asyncio
 import io
 import csv
+import math
 from typing import Optional, List, Dict, Any
 from functools import wraps
 from datetime import datetime
@@ -274,6 +275,18 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_tg_user(tid) or {}
     invites = int(user.get('invite_count', 0))
     saves = count_saved_accounts(tid)
+    allowed = badge.get('save_slots')
+    
+    if isinstance(allowed, (int, float)) and not math.isinf(allowed):
+        allowed_str = str(int(allowed))
+    else:
+        allowed_str = "∞"
+        
+    over_text = ""
+    if isinstance(allowed, (int, float)) and not math.isinf(allowed) and saves > allowed:
+        over_text = " (over limit — remove some or invite to increase)"
+        
+    text += f"📦 Save Slots: {saves}/{allowed_str}{over_text}\n\n"
     # find next badge
     next_badge = None
     invites_left = 0
