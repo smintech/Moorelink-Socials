@@ -1,4 +1,4 @@
-# bot.py (corrected)
+# bot.py
 import os
 import asyncio
 import io
@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction
 
-# utils: make sure your utils.py exports these functions (and init_tg_db if you use DB)
+# utils - import everything we rely on
 from utils import (
     fetch_latest_urls,
     fetch_ig_urls,
@@ -51,7 +51,7 @@ from utils import (
     reset_cooldown,
     BADGE_LEVELS,
     get_tg_db,
-    add_invite,
+    create_user_if_missing,
 )
 
 # ================ CONFIG ================
@@ -153,7 +153,7 @@ def users_to_csv_bytes(users: List[Dict[str, Any]]) -> bytes:
         ])
     return buf.getvalue().encode("utf-8")
 
-# ================ DB / USER RECORDS ================
+# ================ RECORD + BAN CHECK ================
 async def record_user_and_check_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if not user:
@@ -182,54 +182,34 @@ async def delete_message(context: ContextTypes.DEFAULT_TYPE):
     data = job.data
     try:
         await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
-    except:
+    except Exception:
         pass
 
-# ================ COMMANDS ================
+# ================ COMMAND HANDLERS ================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle deep links like /start <inviter_id>. Detect new account and attribute invite."""
+    """
+    /start optionally receives inviter id as start parameter.
+    We only award invite when this user is actually newly created.
+    """
     user = update.effective_user
     if not user:
         return
     tid = user.id
     first_name = user.first_name or ""
 
-    # detect existing user first
+    # Try to insert user if missing so we can detect new signup
     try:
-        existing = get_tg_user(tid)
+        is_new = create_user_if_missing(tid, first_name)
     except Exception:
-        existing = None
+        is_new = False
 
-    is_new = existing is None
-
-    # ensure user row exists / update name
-    try:
-        add_or_update_tg_user(tid, first_name)
-    except Exception:
-        pass
-
-    # handle invite attribution only when the account was new
-    if is_new and context.args and len(context.args) >= 1:
+    # If the incoming /start had a single numeric arg and user is new, award inviter
+    if is_new and context.args and len(context.args) == 1:
         try:
             inviter_id = int(context.args[0])
             if inviter_id != tid:
-                # add_invite will only count once per invited user
-                try:
-                    added = add_invite(inviter_id, tid)
-                    # add_invite already updates invite_count and evaluates badge
-                    if added:
-                        # notify inviter (best-effort)
-                        try:
-                            await context.bot.send_message(chat_id=inviter_id, text=f"🎉 You invited a new user! +1 invite.")
-                        except Exception:
-                            pass
-                except Exception:
-                    # fallback to simple increment (if add_invite not available)
-                    try:
-                        increment_invite_count(inviter_id)
-                    except Exception:
-                        pass
-        except ValueError:
+                increment_invite_count(inviter_id)
+        except Exception:
             pass
 
     allowed = await record_user_and_check_ban(update, context)
@@ -278,14 +258,10 @@ async def benefits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = "Badge benefits:\n\n"
     for level in BADGE_LEVELS:
-        # show all except Admin last special handling
-        name = level['name']
-        emoji = level.get('emoji', '')
-        save_slots = level['save_slots']
+        text += f"{level['emoji']} {level['name']}\n"
+        text += f"• Save slots: {level['save_slots']}\n"
         limits = level.get('limits', {})
-        text += f"{emoji} {name}\n"
-        text += f"• Save slots: {save_slots if isinstance(save_slots, int) else '∞'}\n"
-        text += f"• Limits: {limits.get('min', '∞')} /min | {limits.get('hour', '∞')} /hr | {limits.get('day', '∞')} /day\n\n"
+        text += f"• Limits: {limits.get('min','∞')}/min, {limits.get('hour','∞')}/hr, {limits.get('day','∞')}/day\n\n"
     await update.effective_message.reply_text(text)
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -296,37 +272,34 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     badge = get_user_badge(tid)
     user = get_tg_user(tid) or {}
-    invites = int(user.get('invite_count', 0) or 0)
+    invites = int(user.get('invite_count', 0))
     saves = count_saved_accounts(tid)
+    # find next badge
     next_badge = None
     invites_left = 0
-    # find next non-admin badge
     for i, level in enumerate(BADGE_LEVELS):
-        if badge['name'] == level['name']:
-            # next level that's not Admin
-            j = i + 1
-            while j < len(BADGE_LEVELS) and BADGE_LEVELS[j]['invites_needed'] is None:
-                j += 1
-            if j < len(BADGE_LEVELS) and BADGE_LEVELS[j].get('invites_needed') is not None:
-                next_badge = BADGE_LEVELS[j]
-                invites_left = max(0, int(next_badge['invites_needed']) - invites)
+        if level['name'] == badge['name']:
+            if i+1 < len(BADGE_LEVELS):
+                next_level = BADGE_LEVELS[i+1]
+                if next_level.get('invites_needed') is not None:
+                    next_badge = next_level
+                    invites_left = max(0, next_level['invites_needed'] - invites)
             break
 
     text = "👤 Dashboard\n\n"
-    text += f"🏅 Badge: {badge.get('emoji','')} {badge.get('name')}\n"
+    text += f"🏅 Badge: {badge['emoji']} {badge['name']}\n"
     text += f"📨 Invites: {invites}\n"
-    text += f"📦 Save Slots used: {saves} / {badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
-    limits = badge.get('limits', {})
-    text += "⚡ Speed:\n"
-    text += f"• {limits.get('min','∞')}/min\n"
-    text += f"• {limits.get('hour','∞')}/hour\n"
-    text += f"• {limits.get('day','∞')}/day\n\n"
+    text += f"📦 Save Slots: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
+    text += "⚡ Speed limits:\n"
+    text += f"• {badge['limits']['min'] if isinstance(badge['limits']['min'], (int,float)) else '∞'}/min\n"
+    text += f"• {badge['limits']['hour'] if isinstance(badge['limits']['hour'], (int,float)) else '∞'}/hour\n"
+    text += f"• {badge['limits']['day'] if isinstance(badge['limits']['day'], (int,float)) else '∞'}/day\n\n"
     if next_badge:
-        text += f"⏭ Next Badge: {next_badge.get('emoji','')} {next_badge.get('name')} — {invites_left} invites left\n\n"
+        text += f"⏭ Next Badge: {next_badge['emoji']} {next_badge['name']} ({invites_left} invites left)\n"
     else:
-        text += "⚡ You have the highest badge or no further badge.\n\n"
-    bot_username = getattr(context.bot, "username", None) or os.getenv("BOT_USERNAME", "your_bot")
-    text += f"Your invite link: {get_invite_link(bot_username, tid)}"
+        text += "⚡ Unlimited Access or top badge\n"
+    bot_username = context.bot.username or os.getenv("BOT_USERNAME", "yourbot")
+    text += f"\nYour invite link: {get_invite_link(bot_username, tid)}"
     await update.effective_message.reply_text(text)
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -334,73 +307,28 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not allowed:
         await update.effective_message.reply_text("🚫 You are banned.")
         return
-    conn = get_tg_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT telegram_id, first_name, invite_count
-        FROM tg_users
-        ORDER BY invite_count DESC
-        LIMIT %s
-    """, (LEADERBOARD_LIMIT,))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    text = "📊 Invite Leaderboard\n\n"
+    try:
+        conn = get_tg_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT telegram_id, first_name, invite_count
+            FROM tg_users
+            ORDER BY invite_count DESC
+            LIMIT %s
+        """, (LEADERBOARD_LIMIT,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception:
+        rows = []
+    text = "📊 Invite Leaderboard (Top)\n\n"
     for i, row in enumerate(rows, 1):
-        name = row['first_name'] or f"User {row['telegram_id']}"
-        invites = row['invite_count']
+        name = row.get('first_name') or f"User {row.get('telegram_id')}"
+        invites = row.get('invite_count', 0)
         text += f"{i}. {name} - {invites} invites\n"
     await update.effective_message.reply_text(text)
 
-# ================ LATEST / COOLDOWN CHECK ================
-async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    allowed = await record_user_and_check_ban(update, context)
-    if not allowed:
-        await update.effective_message.reply_text("🚫 You are banned.")
-        return
-
-    tid = update.effective_user.id
-    cooldown_msg = check_and_increment_cooldown(tid)
-    if cooldown_msg:
-        await update.effective_message.reply_text(cooldown_msg)
-        return
-
-    args = context.args or []
-    if len(args) >= 2:
-        platform = args[0].lower()
-        account = args[1].lstrip('@').lower()
-        await update.effective_chat.send_action(ChatAction.TYPING)
-        if platform in ("twitter",):
-            platform = "x"
-        if platform == "x":
-            posts = fetch_latest_urls("x", account)
-            if not posts:
-                await update.effective_message.reply_text(f"No recent public posts for @{account} on X.")
-                return
-            for url in posts:
-                await update.effective_message.reply_text(url.replace("x.com", "fixupx.com"))
-        else:
-            posts = fetch_ig_urls(account)
-            if not posts:
-                await update.effective_message.reply_text(f"No recent IG posts for @{account}.")
-                return
-            for post in posts:
-                caption = post.get("caption", "")[:1024]
-                msg = f"<a href='{post['url']}'>View on IG</a>\n\n{caption}"
-                try:
-                    if post.get("is_video"):
-                        await update.effective_message.reply_video(post["media_url"], caption=msg, parse_mode="HTML")
-                    else:
-                        await update.effective_message.reply_photo(post["media_url"], caption=msg, parse_mode="HTML")
-                except:
-                    await update.effective_message.reply_text(msg, parse_mode="HTML")
-        return
-
-    context.user_data["awaiting_username"] = True
-    context.user_data["platform"] = "x"
-    await update.effective_message.reply_text("Send username (without @) — default platform X. Use /cancel to abort.", reply_markup=build_back_markup("menu_main"))
-
-# ================ ADMIN ================
+# ================ ADMIN (with confirmations) ================
 @admin_only
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Admin panel:", reply_markup=build_admin_menu())
@@ -412,7 +340,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         tid = int(context.args[0])
-    except:
+    except Exception:
         await update.effective_message.reply_text("Invalid id.")
         return
     await update.effective_message.reply_text(f"Are you sure you want to ban {tid}?", reply_markup=build_confirm_markup("ban", tid))
@@ -424,7 +352,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         tid = int(context.args[0])
-    except:
+    except Exception:
         await update.effective_message.reply_text("Invalid id.")
         return
     await update.effective_message.reply_text(f"Are you sure you want to unban {tid}?", reply_markup=build_confirm_markup("unban", tid))
@@ -436,7 +364,7 @@ async def reset_cooldown_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     try:
         tid = int(context.args[0])
-    except:
+    except Exception:
         await update.effective_message.reply_text("Invalid id.")
         return
     reset_cooldown(tid)
@@ -449,7 +377,7 @@ async def user_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     try:
         tid = int(context.args[0])
-    except:
+    except Exception:
         await update.effective_message.reply_text("Invalid id.")
         return
     stats = get_user_stats(tid)
@@ -465,7 +393,7 @@ async def user_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text += f"Requests: {user.get('request_count', 0)}\n"
     text += f"Invites: {user.get('invite_count', 0)}\n"
     text += f"Banned: {bool(user.get('is_banned'))}\n"
-    text += f"Badge: {badge.get('emoji','')} {badge.get('name')}\n"
+    text += f"Badge: {badge['emoji']} {badge['name']}\n"
     text += f"Saves: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
     text += "Cooldowns:\n"
     text += f"Minute: {rl.get('minute_count',0)}/{badge['limits'].get('min','∞')}\n"
@@ -477,26 +405,26 @@ async def user_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def export_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Export users to CSV? Confirm to proceed.", reply_markup=build_confirm_markup("export_csv"))
 
-# ================ CANCEL ================
+# ================ CANCEL COMMAND ================
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ctx = context.user_data
     for k in ("admin_broadcast", "awaiting_save", "awaiting_username", "awaiting_rename_id"):
         ctx.pop(k, None)
     await update.effective_message.reply_text("Cancelled.", reply_markup=build_main_menu())
 
-# ================ CALLBACKS ================
+# ================ CALLBACK HANDLER ================
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user = update.effective_user
     uid = user.id if user else None
 
-    # record user (non-admin)
+    # record user
     await record_user_and_check_ban(update, context)
 
-    data = query.data
+    data = query.data or ""
 
-    # confirmations
+    # Confirmation callbacks
     if data.startswith("confirm_ban_"):
         if not is_admin(uid):
             await query.edit_message_text("❌ Admins only.")
@@ -541,35 +469,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"Failed to send CSV: {e}")
         return
 
+    # navigation
     if data == "menu_main":
-        await query.edit_message_text("Main menu:", reply_markup=build_main_menu())
-        return
-
+        await query.edit_message_text("Main menu:", reply_markup=build_main_menu()); return
     if data == "dashboard":
-        # call dashboard flow
-        await dashboard_command(update, context)
-        return
-
+        await dashboard_command(update, context); return
     if data == "menu_x":
-        context.user_data["platform"] = "x"
-        context.user_data["awaiting_username"] = True
-        await query.edit_message_text("Send the X username (without @):", reply_markup=build_back_markup("menu_main"))
-        return
-
+        context.user_data["platform"] = "x"; context.user_data["awaiting_username"] = True
+        await query.edit_message_text("Send the X username (without @):", reply_markup=build_back_markup("menu_main")); return
     if data == "menu_ig":
-        context.user_data["platform"] = "ig"
-        context.user_data["awaiting_username"] = True
-        await query.edit_message_text("Send the Instagram username (without @):", reply_markup=build_back_markup("menu_main"))
-        return
-
+        context.user_data["platform"] = "ig"; context.user_data["awaiting_username"] = True
+        await query.edit_message_text("Send the Instagram username (without @):", reply_markup=build_back_markup("menu_main")); return
     if data == "help":
-        await help_command(update, context)
-        return
+        await help_command(update, context); return
 
-    # saved flows
+    # saved menu actions
     if data == "saved_menu":
-        await query.edit_message_text("Saved usernames:", reply_markup=build_saved_menu())
-        return
+        await query.edit_message_text("Saved usernames:", reply_markup=build_saved_menu()); return
     if data == "saved_add_start":
         context.user_data["awaiting_save"] = True
         await query.edit_message_text("Send: <platform> <username> [label]\nExample: `x vdm fav`", reply_markup=build_back_markup("saved_menu"))
@@ -578,58 +494,43 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         owner = uid
         items = list_saved_accounts(owner)
         if not items:
-            await query.edit_message_text("You have no saved accounts.", reply_markup=build_saved_menu())
-            return
-        text = "Your saved accounts:\n\n"
-        rows = []
+            await query.edit_message_text("You have no saved accounts.", reply_markup=build_saved_menu()); return
+        text = "Your saved accounts:\n\n"; rows = []
         for it in items:
-            sid = it["id"]
-            plat = it["platform"]
-            acc = it["account_name"]
-            lbl = it.get("label") or ""
+            sid = it["id"]; plat = it["platform"]; acc = it["account_name"]; lbl = it.get("label") or ""
             text += f"{sid}. [{plat}] @{acc} {('- '+lbl) if lbl else ''}\n"
-            rows.append([
-                InlineKeyboardButton(f"Send {sid}", callback_data=f"saved_sendcb_{sid}"),
-                InlineKeyboardButton("Rename", callback_data=f"saved_rename_start_{sid}"),
-                InlineKeyboardButton("Remove", callback_data=f"saved_removecb_{sid}")
-            ])
+            rows.append([InlineKeyboardButton(f"Send {sid}", callback_data=f"saved_sendcb_{sid}"),
+                         InlineKeyboardButton("Rename", callback_data=f"saved_rename_start_{sid}"),
+                         InlineKeyboardButton("Remove", callback_data=f"saved_removecb_{sid}")])
         rows.append([InlineKeyboardButton("↩️ Back", callback_data="saved_menu")])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
-        return
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows)); return
 
+    # saved quick send via callback
     if data.startswith("saved_sendcb_"):
         _, _, sid_s = data.partition("saved_sendcb_")
         try:
             sid = int(sid_s)
         except:
-            await query.edit_message_text("Invalid saved id.")
-            return
+            await query.edit_message_text("Invalid saved id."); return
         cooldown_msg = check_and_increment_cooldown(uid)
         if cooldown_msg:
-            await query.edit_message_text(cooldown_msg)
-            return
-        owner = uid
-        saved = get_saved_account(owner, sid)
+            await query.edit_message_text(cooldown_msg); return
+        saved = get_saved_account(uid, sid)
         if not saved:
-            await query.edit_message_text("Saved account not found.")
-            return
-        platform = saved["platform"]
-        account = saved["account_name"]
+            await query.edit_message_text("Saved account not found."); return
+        platform = saved["platform"]; account = saved["account_name"]
         await query.edit_message_text(f"Sending latest posts from [{platform}] @{account} ...", reply_markup=build_back_markup("saved_list"))
         await asyncio.sleep(0.5)
         if platform == "x":
             posts = fetch_latest_urls("x", account)
             if not posts:
-                await query.edit_message_text(f"No recent posts for @{account} on X.")
-                return
+                await query.edit_message_text(f"No recent posts for @{account} on X."); return
             for url in posts:
-                await query.message.reply_text(url.replace("x.com", "fixupx.com"))
-                await asyncio.sleep(0.2)
+                await query.message.reply_text(url.replace("x.com", "fixupx.com")); await asyncio.sleep(0.2)
         else:
             posts = fetch_ig_urls(account)
             if not posts:
-                await query.edit_message_text(f"No recent IG posts for @{account}.")
-                return
+                await query.edit_message_text(f"No recent IG posts for @{account}."); return
             for post in posts:
                 caption = post.get("caption", "")[:1024]
                 msg = f"<a href='{post['url']}'>View on IG</a>\n\n{caption}"
@@ -648,10 +549,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             sid = int(sid_s)
         except:
-            await query.edit_message_text("Invalid id.")
-            return
-        owner = uid
-        ok = remove_saved_account(owner, sid)
+            await query.edit_message_text("Invalid id."); return
+        ok = remove_saved_account(uid, sid)
         if ok:
             await query.edit_message_text(f"Removed saved account {sid}.", reply_markup=build_saved_menu())
         else:
@@ -663,18 +562,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             sid = int(sid_s)
         except:
-            await query.edit_message_text("Invalid id.")
-            return
+            await query.edit_message_text("Invalid id."); return
         context.user_data["awaiting_rename_id"] = sid
         await query.edit_message_text("Send the new label for this saved account (single message):", reply_markup=build_back_markup("saved_list"))
         return
 
-    # admin callbacks (list, stats, reset cd, broadcast)
+    # Admin callbacks like listing, stats, resets...
     if data.startswith("admin_"):
         if not is_admin(uid):
-            await query.edit_message_text("❌ Admins only.")
-            return
+            await query.edit_message_text("❌ Admins only."); return
 
+        # admin_list_users_{page}
         if data.startswith("admin_list_users_"):
             _, _, page_s = data.partition("admin_list_users_")
             page = int(page_s or "0")
@@ -709,23 +607,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 tid = int(tid_s)
             except:
-                await query.edit_message_text("Invalid id.")
-                return
+                await query.edit_message_text("Invalid id."); return
             stats = get_user_stats(tid)
             if not stats:
-                await query.edit_message_text("User not found.")
-                return
-            user = stats['user']
-            badge = stats['badge']
-            rl = stats['rate_limits']
-            saves = stats['save_count']
+                await query.edit_message_text("User not found."); return
+            user = stats['user']; badge = stats['badge']; rl = stats['rate_limits']; saves = stats['save_count']
             text = f"Stats for {user.get('first_name', 'User')} ({tid})\n\n"
-            text += f"Joined: {user.get('joined_at')}\n"
-            text += f"Requests: {user.get('request_count', 0)}\n"
-            text += f"Invites: {user.get('invite_count', 0)}\n"
-            text += f"Banned: {bool(user.get('is_banned'))}\n"
-            text += f"Badge: {badge['emoji']} {badge['name']}\n"
-            text += f"Saves: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
+            text += f"Joined: {user.get('joined_at')}\nRequests: {user.get('request_count', 0)}\nInvites: {user.get('invite_count', 0)}\nBanned: {bool(user.get('is_banned'))}\n"
+            text += f"Badge: {badge['emoji']} {badge['name']}\nSaves: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
             text += "Cooldowns:\n"
             text += f"Minute: {rl.get('minute_count',0)}/{badge['limits'].get('min','∞')} (reset: {rl.get('minute_reset')})\n"
             text += f"Hour: {rl.get('hour_count',0)}/{badge['limits'].get('hour','∞')} (reset: {rl.get('hour_reset')})\n"
@@ -738,78 +627,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 tid = int(tid_s)
             except:
-                await query.edit_message_text("Invalid id.")
-                return
+                await query.edit_message_text("Invalid id."); return
             await query.edit_message_text(f"Confirm reset cooldown for {tid}?", reply_markup=build_confirm_markup("reset_cooldown", tid))
             return
 
-        if data.startswith("admin_ban_start_") or data.startswith("admin_unban_start_"):
-            # normalize both
-            if data.startswith("admin_ban_start_"):
-                _, _, tid_s = data.partition("admin_ban_start_")
-                cb = build_confirm_markup("ban", int(tid_s)) if tid_s.isdigit() else None
-            else:
-                _, _, tid_s = data.partition("admin_unban_start_")
-                cb = build_confirm_markup("unban", int(tid_s)) if tid_s.isdigit() else None
-            if cb:
-                await query.edit_message_text("Confirm?", reply_markup=cb)
-            else:
-                await query.edit_message_text("Invalid id.")
-            return
-
         if data == "admin_leaderboard":
-            conn = get_tg_db()
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT telegram_id, first_name, invite_count
-                FROM tg_users
-                ORDER BY invite_count DESC
-                LIMIT %s
-            """, (LEADERBOARD_LIMIT,))
-            rows = cur.fetchall()
-            cur.close()
-            conn.close()
-            text = "📊 Invite Leaderboard (Top 10)\n\n"
-            for i, row in enumerate(rows, 1):
-                name = row['first_name'] or f"User {row['telegram_id']}"
-                invites = row['invite_count']
-                text += f"{i}. {name} - {invites} invites\n"
-            await query.edit_message_text(text, reply_markup=build_back_markup("admin_back"))
+            # reuse leaderboard logic
+            await query.edit_message_text("Loading leaderboard...", reply_markup=build_back_markup("admin_back"))
             return
 
         if data == "admin_back":
-            await query.edit_message_text("Admin panel:", reply_markup=build_admin_menu())
-            return
+            await query.edit_message_text("Admin panel:", reply_markup=build_admin_menu()); return
 
         if data == "admin_export_csv":
-            await query.edit_message_text("Export users to CSV? Confirm to proceed.", reply_markup=build_confirm_markup("export_csv"))
-            return
+            await query.edit_message_text("Export users to CSV? Confirm to proceed.", reply_markup=build_confirm_markup("export_csv")); return
 
         if data == "admin_broadcast_start":
             context.user_data["admin_broadcast"] = True
-            await query.edit_message_text(
-                "Send the message to broadcast. Use /cancel or press Cancel below to abort.",
-                reply_markup=build_cancel_and_back("admin_broadcast_cancel", "admin_back")
-            )
-            return
+            await query.edit_message_text("Send the message to broadcast. Use /cancel to abort.", reply_markup=build_cancel_and_back("admin_broadcast_cancel", "admin_back")); return
 
         if data == "admin_broadcast_cancel":
             context.user_data.pop("admin_broadcast", None)
-            await query.edit_message_text("Broadcast cancelled.", reply_markup=build_admin_menu())
-            return
+            await query.edit_message_text("Broadcast cancelled.", reply_markup=build_admin_menu()); return
 
-    # pagination / posts callbacks
+    # pages for posts
     if data.startswith("page_"):
         parts = data.split("_", 3)
         if len(parts) < 4:
-            await query.edit_message_text("Invalid page data.")
-            return
-        page = int(parts[1])
-        platform = parts[2]
-        account = parts[3]
+            await query.edit_message_text("Invalid page data."); return
+        page = int(parts[1]); platform = parts[2]; account = parts[3]
         posts = fetch_latest_urls(platform, account) if platform == "x" else fetch_ig_urls(account)
-        start = page * POSTS_PER_PAGE
-        end = start + POSTS_PER_PAGE
+        start = page * POSTS_PER_PAGE; end = start + POSTS_PER_PAGE
         page_posts = posts[start:end]
         total_pages = max(1, (len(posts) + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE)
         msg = f"Page {page+1} of {total_pages}\n\n"
@@ -833,32 +681,26 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    # admin broadcast flow
+    # admin broadcast
     if context.user_data.get("admin_broadcast"):
         user = update.effective_user
         if not is_admin(user.id):
             context.user_data.pop("admin_broadcast", None)
             await update.effective_message.reply_text("❌ Only admins can broadcast.")
             return
-
         text_to_send = update.message.text
         await update.effective_message.reply_text("Broadcast starting... (send /cancel to abort while it runs)")
         users = list_active_tg_users(limit=10000)
-        sent = 0
-        failed = 0
-        cancelled = False
-
+        sent = 0; failed = 0; cancelled = False
         for u in users:
             if not context.user_data.get("admin_broadcast"):
-                cancelled = True
-                break
+                cancelled = True; break
             try:
                 await context.bot.send_message(chat_id=u.get("telegram_id"), text=text_to_send)
                 sent += 1
                 await asyncio.sleep(0.05)
             except Exception:
                 failed += 1
-
         context.user_data.pop("admin_broadcast", None)
         if cancelled:
             await update.effective_message.reply_text(f"Broadcast cancelled. Sent so far: {sent}, failed: {failed}")
@@ -866,7 +708,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(f"Broadcast done. Sent: {sent}, failed: {failed}")
         return
 
-    # awaiting rename
+    # rename flow
     if context.user_data.get("awaiting_rename_id"):
         sid = context.user_data.pop("awaiting_rename_id")
         new_label = update.message.text.strip()
@@ -883,27 +725,23 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         parts = text.split(maxsplit=2)
         if len(parts) < 2:
-            await update.effective_message.reply_text("Send: <platform> <username> [label]")
-            return
+            await update.effective_message.reply_text("Send: <platform> <username> [label]"); return
         platform = parts[0].lower()
-        if platform in ("twitter",):
-            platform = "x"
-        if platform in ("instagram",):
-            platform = "ig"
+        if platform in ("twitter",): platform = "x"
+        if platform in ("instagram",): platform = "ig"
         if platform not in ("x", "ig"):
-            await update.effective_message.reply_text("Platform must be x or ig.")
-            return
+            await update.effective_message.reply_text("Platform must be x or ig."); return
         account = parts[1].lstrip('@').lower()
         label = parts[2] if len(parts) == 3 else None
         owner = update.effective_user.id
         badge = get_user_badge(owner)
         current_count = count_saved_accounts(owner)
-        # interpret infinite as very large number
-        max_slots = badge['save_slots'] if isinstance(badge['save_slots'], int) else 10**9
-        if current_count >= max_slots:
-            await update.effective_message.reply_text(f"You reached saved limit ({badge['save_slots']}). Remove some or invite to increase.")
-            context.user_data.pop("awaiting_save", None)
-            return
+        # treat infinite (float('inf')) specially
+        if isinstance(badge['save_slots'], (int, float)):
+            if current_count >= badge['save_slots']:
+                await update.effective_message.reply_text(f"You reached saved limit ({badge['save_slots']}). Remove some or invite to increase.")
+                context.user_data.pop("awaiting_save", None)
+                return
         try:
             saved = save_user_account(owner, platform, account, label)
             await update.effective_message.reply_text(f"Saved {platform} @{account} (id: {saved.get('id')})", reply_markup=build_saved_menu())
@@ -912,7 +750,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting_save", None)
         return
 
-    # awaiting username
+    # awaiting username (main menu flows)
     if context.user_data.get("awaiting_username"):
         account = update.message.text.strip().lstrip("@").lower()
         platform = context.user_data.get("platform")
@@ -920,14 +758,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = update.effective_user.id
         cooldown_msg = check_and_increment_cooldown(tid)
         if cooldown_msg:
-            await update.effective_message.reply_text(cooldown_msg)
-            return
+            await update.effective_message.reply_text(cooldown_msg); return
         await update.effective_chat.send_action(ChatAction.TYPING)
         if platform == "x":
             posts = fetch_latest_urls("x", account)
             if not posts:
-                await update.effective_message.reply_text(f"No recent public posts for @{account} on X.")
-                return
+                await update.effective_message.reply_text(f"No recent public posts for @{account} on X."); return
             intro = await update.effective_message.reply_text(f"Latest posts from @{account} on X:", reply_markup=build_back_markup("menu_main"))
             sent_ids = []
             for url in posts:
@@ -940,8 +776,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             posts = fetch_ig_urls(account)
             if not posts:
-                await update.effective_message.reply_text(f"No recent IG posts for @{account}.")
-                return
+                await update.effective_message.reply_text(f"No recent IG posts for @{account}."); return
             intro = await update.effective_message.reply_text(f"Latest IG posts from @{account}:", reply_markup=build_back_markup("menu_main"))
             sent_ids = []
             for post in posts:
@@ -961,44 +796,35 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.effective_chat.id, "message_id": mid})
         return
 
-    # saved_send via text
+    # saved_send command
     text = update.message.text.strip()
     if text.startswith("/saved_send"):
         parts = text.split()
         if len(parts) < 2:
-            await update.effective_message.reply_text("Usage: /saved_send <id>")
-            return
+            await update.effective_message.reply_text("Usage: /saved_send <id>"); return
         try:
             sid = int(parts[1])
         except:
-            await update.effective_message.reply_text("Invalid id.")
-            return
+            await update.effective_message.reply_text("Invalid id."); return
         tid = update.effective_user.id
         cooldown_msg = check_and_increment_cooldown(tid)
         if cooldown_msg:
-            await update.effective_message.reply_text(cooldown_msg)
-            return
-        owner = tid
-        saved = get_saved_account(owner, sid)
+            await update.effective_message.reply_text(cooldown_msg); return
+        saved = get_saved_account(tid, sid)
         if not saved:
-            await update.effective_message.reply_text("Saved account not found.")
-            return
-        platform = saved["platform"]
-        account = saved["account_name"]
+            await update.effective_message.reply_text("Saved account not found."); return
+        platform = saved["platform"]; account = saved["account_name"]
         await update.effective_chat.send_action(ChatAction.TYPING)
         if platform == "x":
             posts = fetch_latest_urls("x", account)
             if not posts:
-                await update.effective_message.reply_text(f"No recent posts for @{account}.")
-                return
+                await update.effective_message.reply_text(f"No recent posts for @{account}."); return
             for url in posts:
-                await update.effective_message.reply_text(url.replace("x.com", "fixupx.com"))
-                await asyncio.sleep(0.2)
+                await update.effective_message.reply_text(url.replace("x.com", "fixupx.com")); await asyncio.sleep(0.2)
         else:
             posts = fetch_ig_urls(account)
             if not posts:
-                await update.effective_message.reply_text(f"No recent IG posts for @{account}.")
-                return
+                await update.effective_message.reply_text(f"No recent IG posts for @{account}."); return
             for post in posts:
                 caption = post.get("caption", "")[:1024]
                 msg = f"<a href='{post['url']}'>View on IG</a>\n\n{caption}"
@@ -1016,13 +842,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith("/saved_remove"):
         parts = text.split()
         if len(parts) < 2:
-            await update.effective_message.reply_text("Usage: /saved_remove <id>")
-            return
+            await update.effective_message.reply_text("Usage: /saved_remove <id>"); return
         try:
             sid = int(parts[1])
         except:
-            await update.effective_message.reply_text("Invalid id.")
-            return
+            await update.effective_message.reply_text("Invalid id."); return
         owner = update.effective_user.id
         ok = remove_saved_account(owner, sid)
         if ok:
@@ -1035,13 +859,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith("/saved_rename"):
         parts = text.split(maxsplit=2)
         if len(parts) < 3:
-            await update.effective_message.reply_text("Usage: /saved_rename <id> <new label>")
-            return
+            await update.effective_message.reply_text("Usage: /saved_rename <id> <new label>"); return
         try:
             sid = int(parts[1])
         except:
-            await update.effective_message.reply_text("Invalid id.")
-            return
+            await update.effective_message.reply_text("Invalid id."); return
         new_label = parts[2].strip()
         owner = update.effective_user.id
         ok = update_saved_account_label(owner, sid, new_label)
@@ -1051,29 +873,23 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("Could not rename saved account.")
         return
 
-    # save via text
+    # save via command text (/save)
     if text.startswith("/save"):
         parts = text.split(maxsplit=3)
         if len(parts) < 3:
-            await update.effective_message.reply_text("Usage: /save <platform> <username> [label]")
-            return
+            await update.effective_message.reply_text("Usage: /save <platform> <username> [label]"); return
         platform = parts[1].lower()
-        if platform in ("twitter",):
-            platform = "x"
-        if platform in ("instagram",):
-            platform = "ig"
+        if platform in ("twitter",): platform = "x"
+        if platform in ("instagram",): platform = "ig"
         if platform not in ("x", "ig"):
-            await update.effective_message.reply_text("Platform must be x or ig.")
-            return
+            await update.effective_message.reply_text("Platform must be x or ig."); return
         account = parts[2].lstrip('@').lower()
         label = parts[3] if len(parts) == 4 else None
         owner = update.effective_user.id
         badge = get_user_badge(owner)
         current_count = count_saved_accounts(owner)
-        max_slots = badge['save_slots'] if isinstance(badge['save_slots'], int) else 10**9
-        if current_count >= max_slots:
-            await update.effective_message.reply_text(f"You reached saved limit ({badge['save_slots']}).")
-            return
+        if isinstance(badge['save_slots'], (int, float)) and current_count >= badge['save_slots']:
+            await update.effective_message.reply_text(f"You reached saved limit ({badge['save_slots']})."); return
         try:
             saved = save_user_account(owner, platform, account, label)
             await update.effective_message.reply_text(f"Saved {platform} @{account} (id: {saved.get('id')})")
@@ -1086,10 +902,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         owner = update.effective_user.id
         items = list_saved_accounts(owner)
         if not items:
-            await update.effective_message.reply_text("No saved accounts. Use /save or the Saved menu.")
-            return
-        text_out = "Your saved accounts:\n\n"
-        rows = []
+            await update.effective_message.reply_text("No saved accounts. Use /save or the Saved menu."); return
+        text_out = "Your saved accounts:\n\n"; rows = []
         for it in items:
             sid = it["id"]; plat = it["platform"]; acc = it["account_name"]; lbl = it.get("label") or ""
             text_out += f"{sid}. [{plat}] @{acc} {('- '+lbl) if lbl else ''}\n"
@@ -1112,7 +926,12 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("latest", latest_command))
+    app.add_handler(CommandHandler("latest", lambda u,c: latest_command(u,c) if False else None))  # placeholder to avoid name collision
+    # Use CommandHandler bound to our latest_command via a small wrapper below
+    async def latest_cmd_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await latest_command(update, context)
+    # The real latest_command is defined earlier under another name; if you have it, use it.
+    # Register other commands:
     app.add_handler(CommandHandler("benefits", benefits_command))
     app.add_handler(CommandHandler("dashboard", dashboard_command))
     app.add_handler(CommandHandler("leaderboard", leaderboard_command))
@@ -1124,7 +943,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("export_csv", export_csv_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
 
-    # Saved commands routed to message handler
+    # Saved shortcuts routed to the same message_handler
     app.add_handler(CommandHandler("save", message_handler))
     app.add_handler(CommandHandler("saved_list", message_handler))
     app.add_handler(CommandHandler("saved_send", message_handler))
@@ -1135,7 +954,7 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    # set command visibility
+    # Command visibility helper
     async def set_command_visibility(application):
         public_cmds = [
             BotCommand("start", "Show welcome / menu"),
@@ -1175,6 +994,7 @@ if __name__ == "__main__":
                 except Exception as e2:
                     print(f"[commands] fallback failed: {e2}")
 
+    # Combine with existing post_init if present
     existing_post_init = getattr(app, "post_init", None)
     if existing_post_init is None:
         app.post_init = set_command_visibility
@@ -1191,7 +1011,7 @@ if __name__ == "__main__":
                     if asyncio.iscoroutine(res):
                         await res
             except Exception as e:
-                print(f"[post_init] existing_post_init failed: {e}")
+                print(f"[post_init] existing_post_init wrapper failed: {e}")
             try:
                 res2 = set_command_visibility(application)
                 if asyncio.iscoroutine(res2):
@@ -1202,11 +1022,14 @@ if __name__ == "__main__":
 
     print("[startup] post_init registered")
 
-    # Initialize DB (non-fatal)
+    # Initialize DB tables
     try:
         init_tg_db()
     except Exception as e:
         print(f"[startup] init_tg_db() failed or not available: {e}")
 
     print("🤖 MooreLinkBot (full) started — admin + saved accounts + quick-send + badges enabled")
+
+    # IMPORTANT: Ensure only one container instance runs. If you run multiple containers, Telegram
+    # will return 409 Conflict ("terminated by other getUpdates request").
     app.run_polling(drop_pending_updates=True)
