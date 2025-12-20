@@ -575,36 +575,39 @@ def get_explicit_badge(telegram_id: int) -> Optional[str]:
 
 def get_user_badge(telegram_id: int) -> Dict[str, Any]:
     """
-    Determine user's badge:
-      - explicit badge in tg_badges overrides
-      - is_admin flag -> Admin badge
-      - otherwise badge by invite_count
+    Determine badge for a user.
+    - Honors tg_users.is_admin column if present.
+    - Honors ADMIN_IDS environment variable (comma-separated list) so bot admins always get Admin badge.
     """
-    user = get_tg_user(telegram_id) or {}
-    # explicit override
-    explicit = get_explicit_badge(telegram_id)
-    if explicit:
-        # try to match explicit to known badges
+    user = get_tg_user(telegram_id)
+    # check env-admin list too (helps when DB hasn't been updated)
+    admin_ids_env = os.getenv("ADMIN_IDS", "")
+    admin_ids = []
+    if admin_ids_env:
+        try:
+            admin_ids = [int(x.strip()) for x in admin_ids_env.split(",") if x.strip()]
+        except Exception:
+            admin_ids = []
+
+    # Admin if flagged in DB or present in ADMIN_IDS env var
+    if (user and int(user.get("is_admin", 0)) == 1) or (telegram_id in admin_ids):
+        # find Admin badge entry (fallback to last)
         for b in BADGE_LEVELS:
-            if b['name'].lower() == explicit.lower() or b['emoji'] == explicit:
+            if b.get("name") == "Admin":
                 return b
-        # fallback: return Basic
-        return BADGE_LEVELS[0]
-    # admin flag
-    try:
-        if int(user.get('is_admin', 0)) == 1:
-            return BADGE_LEVELS[-1]  # Admin
-    except Exception:
-        pass
-    invites = int(user.get('invite_count') or 0)
-    # pick highest badge satisfying invites_needed
-    chosen = BADGE_LEVELS[0]
-    for level in BADGE_LEVELS:
-        if level.get('invites_needed') is None:
-            continue
-        if invites >= level['invites_needed']:
-            chosen = level
-    return chosen
+        return BADGE_LEVELS[-1]
+
+    invites = user.get("invite_count", 0) if user else 0
+
+    # Walk levels (exclude Admin) and pick highest that fits
+    non_admin_levels = [lvl for lvl in BADGE_LEVELS if lvl.get("name") != "Admin"]
+    for level in reversed(non_admin_levels):
+        # invites_needed could be 0 for Basic
+        needed = level.get("invites_needed") or 0
+        if invites >= needed:
+            return level
+
+    return BADGE_LEVELS[0]
 
 def increment_invite_count(telegram_id: int, amount: int = 1) -> int:
     try:
