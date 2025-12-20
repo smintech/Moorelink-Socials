@@ -2,7 +2,7 @@
 import os
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from telegram.constants import ChatAction
 from utils import fetch_latest_urls, fetch_ig_urls
 
@@ -40,10 +40,11 @@ async def delete_message(context: ContextTypes.DEFAULT_TYPE):
 # ===================== COMMANDS =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 Welcome to MoorelinkBot! 🔥\n\n"
+        "👋 Welcome to MooreLinkBot! 🔥\n\n"
         "This bot dey help you see latest posts from X (Twitter) and Instagram sharp sharp.\n\n"
         "Commands:\n"
         "/menu - See main menu with buttons\n"
+        "/latest <username> - Auto-detect X or IG\n"
         "/xlatest <username> - Get X posts\n"
         "/iglatest <username> - Get IG posts\n"
         "/help - Full guide\n\n"
@@ -56,18 +57,20 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "📖 MoorelinkBot Guide (English + Pidgin)\n\n"
+        "📖 MooreLinkBot Guide (English + Pidgin)\n\n"
         "Commands:\n"
         "/start - Welcome + menu\n"
         "/menu - Open main menu\n"
-        "/xlatest <username> - X (Twitter) latest posts\n"
+        "/latest <username> - Auto-detect X or IG\n"
+        "/xlatest <username> - Get X (Twitter) latest posts\n"
         "Example: /xlatest vdm\n\n"
-        "/iglatest <username> - Instagram latest posts\n"
+        "/iglatest <username> - Get Instagram latest posts\n"
         "Example: /iglatest davido\n\n"
         "/help - This message\n\n"
         "Pidgin Version:\n"
-        "Bros, use /xlatest <name> make you see Twitter posts\n"
-        "/iglatest <name> make you see IG posts\n"
+        "Bros, use /latest <name> make you see Twitter or IG posts automatic\n"
+        "/xlatest <name> for Twitter only\n"
+        "/iglatest <name> for Instagram only\n"
         "Posts go auto delete after 24 hours.\n"
         "Enjoy the vibe! 😎🔥"
     )
@@ -80,9 +83,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "menu_x":
-        await query.edit_message_text("Send /xlatest <username> to get X posts!")
+        context.user_data['platform'] = "x"
+        await query.edit_message_text("Send username for X posts (e.g. vdm):")
+        context.user_data['waiting_for_username'] = True
     elif data == "menu_ig":
-        await query.edit_message_text("Send /iglatest <username> to get IG posts!")
+        context.user_data['platform'] = "ig"
+        await query.edit_message_text("Send username for IG posts (e.g. davido):")
+        context.user_data['waiting_for_username'] = True
     elif data == "help":
         await help_command(update, context)
     elif data.startswith("page_"):
@@ -92,8 +99,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platform = parts[2]
         account = parts[3]
 
-        # Re-fetch posts (assume you have posts in context.user_data or DB)
-        # For simplicity, let's assume we re-fetch
         posts = fetch_latest_urls(platform, account) if platform == "x" else fetch_ig_urls(account)
 
         start = page * POSTS_PER_PAGE
@@ -107,88 +112,81 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = build_pagination_keyboard(page, len(posts) // POSTS_PER_PAGE + 1, platform, account)
         await query.edit_message_text(msg, reply_markup=keyboard)
 
-# ===================== MAIN FETCH HANDLER =====================
-async def xlatest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /xlatest <username>\nExample: /xlatest vdm")
+# ===================== USERNAME HANDLER (After Button Click) =====================
+async def handle_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('waiting_for_username'):
         return
 
-    account = context.args[0].lstrip('@').lower()
-    platform = "x"
+    account = update.message.text.strip().lstrip('@').lower()
+    platform = context.user_data.get('platform', "x")
 
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    posts = fetch_latest_urls(platform, account)
+    if platform == "x":
+        urls = fetch_latest_urls(platform, account)
+        if not urls:
+            await update.message.reply_text(f"No recent public posts found for @{account} on X 😕")
+            return
 
-    if not posts:
-        await update.message.reply_text(f"No recent public posts found for @{account} on X 😕")
-        return
+        intro_msg = await update.message.reply_text(f"🔥 Latest {len(urls)} posts from @{account} on X:")
 
-    intro_msg = await update.message.reply_text(f"🔥 Latest {len(posts)} posts from @{account} on X:")
+        sent_message_ids = []
 
-    sent_message_ids = []
+        for url in urls:
+            fixed_url = url.replace("x.com", "fixupx.com").replace("twitter.com", "fixupx.com")
+            sent_msg = await update.message.reply_text(fixed_url, disable_web_page_preview=False)
+            sent_message_ids.append(sent_msg.message_id)
+            await asyncio.sleep(3)
 
-    for url in posts:
-        fixed_url = url.replace("x.com", "fixupx.com").replace("twitter.com", "fixupx.com")
-        sent_msg = await update.message.reply_text(fixed_url, disable_web_page_preview=False)
-        sent_message_ids.append(sent_msg.message_id)
-        await asyncio.sleep(3)
+        # Auto-delete
+        context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro_msg.chat.id, "message_id": intro_msg.message_id})
+        for msg_id in sent_message_ids:
+            context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": msg_id})
 
-    # Auto-delete
-    context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro_msg.chat.id, "message_id": intro_msg.message_id})
-    for msg_id in sent_message_ids:
-        context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": msg_id})
+    else:  # IG
+        posts = fetch_ig_urls(account)
+        if not posts:
+            await update.message.reply_text(f"No recent public posts found for @{account} on IG 😕")
+            return
 
-async def iglatest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /iglatest <username>\nExample: /iglatest chiomaavril")
-        return
+        intro_msg = await update.message.reply_text(f"🔥 Latest {len(posts)} public IG posts from @{account}:")
 
-    account = context.args[0].lstrip('@').lower()
+        sent_message_ids = []
 
-    await update.message.chat.send_action(ChatAction.TYPING)
+        for post in posts:
+            caption = post.get('caption', '').strip()[:1024]
+            media_url = post.get('media_url')
 
-    posts = fetch_ig_urls(account)
+            msg = f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>"
 
-    if not posts:
-        await update.message.reply_text(f"No recent public posts found for @{account} on IG 😕")
-        return
+            try:
+                if post.get('is_video'):
+                    sent_msg = await update.message.reply_video(
+                        video=media_url,
+                        caption=msg,
+                        parse_mode="HTML"
+                    )
+                else:
+                    sent_msg = await update.message.reply_photo(
+                        photo=media_url,
+                        caption=msg,
+                        parse_mode="HTML"
+                    )
+            except:
+                sent_msg = await update.message.reply_text(msg, parse_mode="HTML")
 
-    intro_msg = await update.message.reply_text(f"🔥 Latest {len(posts)} public IG posts from @{account}:")
+            sent_message_ids.append(sent_msg.message_id)
+            await asyncio.sleep(5)
 
-    sent_message_ids = []
+        # Auto-delete
+        context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro_msg.chat.id, "message_id": intro_msg.message_id})
+        for msg_id in sent_message_ids:
+            context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": msg_id})
 
-    for post in posts:
-        caption = post.get('caption', '').strip()[:1024]
-        media_url = post.get('media_url')
+        await update.message.reply_text("Posts sent! They will auto-delete in 24hrs.")
 
-        msg = f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>"
-
-        try:
-            if post.get('is_video'):
-                sent_msg = await update.message.reply_video(
-                    video=media_url,
-                    caption=msg,
-                    parse_mode="HTML"
-                )
-            else:
-                sent_msg = await update.message.reply_photo(
-                    photo=media_url,
-                    caption=msg,
-                    parse_mode="HTML"
-                )
-        except:
-            sent_msg = await update.message.reply_text(msg, parse_mode="HTML")
-
-        sent_message_ids.append(sent_msg.message_id)
-        await asyncio.sleep(5)
-
-    # Auto-delete
-    context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro_msg.chat.id, "message_id": intro_msg.message_id})
-    for msg_id in sent_message_ids:
-        context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": msg_id})
-
-    await update.message.reply_text("Posts sent! They will auto delete in 24hrs.")
+    # Clear waiting state
+    context.user_data['waiting_for_username'] = False
 
 # ===================== MAIN =====================
 if __name__ == "__main__":
@@ -203,6 +201,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("xlatest", xlatest))
     app.add_handler(CommandHandler("iglatest", iglatest))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_username))  # Handle plain text after button click
 
-    print("🤖 PostBot started! Powerful & UI-friendly mode ON!")
+    print("🤖 MooreLinkBot started! Powerful & UI-friendly mode ON!")
     app.run_polling(drop_pending_updates=True)
