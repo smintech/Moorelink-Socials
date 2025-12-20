@@ -270,50 +270,63 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed:
         await update.effective_message.reply_text("🚫 You are banned.")
         return
+
     tid = update.effective_user.id
     badge = get_user_badge(tid)
     user = get_tg_user(tid) or {}
-    invites = int(user.get('invite_count', 0))
+    invites = int(user.get('invite_count', 0) or 0)
     saves = count_saved_accounts(tid)
-    allowed = badge.get('save_slots')
-    
-    if isinstance(allowed, (int, float)) and not math.isinf(allowed):
-        allowed_str = str(int(allowed))
-    else:
-        allowed_str = "∞"
-        
-    over_text = ""
-    if isinstance(allowed, (int, float)) and not math.isinf(allowed) and saves > allowed:
-        over_text = " (over limit — remove some or invite to increase)"
-        
-    text += f"📦 Save Slots: {saves}/{allowed_str}{over_text}\n\n"
-    # find next badge
+
+    # compute next badge info
     next_badge = None
     invites_left = 0
     for i, level in enumerate(BADGE_LEVELS):
-        if level['name'] == badge['name']:
-            if i+1 < len(BADGE_LEVELS):
-                next_level = BADGE_LEVELS[i+1]
-                if next_level.get('invites_needed') is not None:
-                    next_badge = next_level
-                    invites_left = max(0, next_level['invites_needed'] - invites)
+        if level.get("name") == badge.get("name"):
+            # try to pick next non-admin badge (if any)
+            if i + 1 < len(BADGE_LEVELS):
+                cand = BADGE_LEVELS[i + 1]
+                # only show next when it has invites_needed (skip Admin sentinel if necessary)
+                if cand.get("invites_needed") is not None:
+                    next_badge = cand
+                    invites_left = max(0, cand["invites_needed"] - invites)
             break
 
-    text = "👤 Dashboard\n\n"
-    text += f"🏅 Badge: {badge['emoji']} {badge['name']}\n"
-    text += f"📨 Invites: {invites}\n"
-    text += f"📦 Save Slots: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
-    text += "⚡ Speed limits:\n"
-    text += f"• {badge['limits']['min'] if isinstance(badge['limits']['min'], (int,float)) else '∞'}/min\n"
-    text += f"• {badge['limits']['hour'] if isinstance(badge['limits']['hour'], (int,float)) else '∞'}/hour\n"
-    text += f"• {badge['limits']['day'] if isinstance(badge['limits']['day'], (int,float)) else '∞'}/day\n\n"
-    if next_badge:
-        text += f"⏭ Next Badge: {next_badge['emoji']} {next_badge['name']} ({invites_left} invites left)\n"
+    # build safe display strings
+    allowed_slots = badge.get("save_slots")
+    if isinstance(allowed_slots, (int, float)) and not math.isinf(allowed_slots):
+        allowed_str = str(int(allowed_slots))
     else:
-        text += "⚡ Unlimited Access or top badge\n"
-    bot_username = context.bot.username or os.getenv("BOT_USERNAME", "yourbot")
-    text += f"\nYour invite link: {get_invite_link(bot_username, tid)}"
-    await update.effective_message.reply_text(text)
+        allowed_str = "∞"
+
+    def lim_str(val):
+        if isinstance(val, (int, float)) and not math.isinf(val):
+            return str(int(val))
+        return "∞"
+
+    over_text = ""
+    if isinstance(allowed_slots, (int, float)) and not math.isinf(allowed_slots) and saves > allowed_slots:
+        over_text = " (over limit — remove some or invite to increase)"
+
+    # assemble message lines to avoid accidental uninitialized variable usage
+    lines = []
+    lines.append("👤 Dashboard\n")
+    lines.append(f"🏅 Badge: {badge.get('emoji','')} {badge.get('name','')}")
+    lines.append(f"📨 Invites: {invites}")
+    lines.append(f"📦 Save Slots: {saves}/{allowed_str}{over_text}\n")
+    lines.append("⚡ Speed limits:")
+    lines.append(f"• {lim_str(badge.get('limits', {}).get('min'))}/min")
+    lines.append(f"• {lim_str(badge.get('limits', {}).get('hour'))}/hour")
+    lines.append(f"• {lim_str(badge.get('limits', {}).get('day'))}/day\n")
+
+    if next_badge:
+        lines.append(f"⏭ Next Badge: {next_badge.get('emoji','')} {next_badge.get('name','')} ({invites_left} invites left)")
+    else:
+        lines.append("⚡ Unlimited Access")
+
+    bot_username = context.bot.username or ""
+    lines.append(f"\nYour invite link: {get_invite_link(bot_username, tid)}")
+
+    await update.effective_message.reply_text("\n".join(lines))
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed = await record_user_and_check_ban(update, context)
