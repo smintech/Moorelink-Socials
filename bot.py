@@ -48,7 +48,7 @@ if not TELEGRAM_TOKEN:
     raise ValueError("BOTTOKEN env var not set")
 
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-MAX_SAVED_PER_USER = int(os.getenv("MAX_SAVED_PER_USER", "10"))
+MAX_SAVED_PER_USER = 10
 
 POSTS_PER_PAGE = 5
 PAGE_SIZE_USERS = 10
