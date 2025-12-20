@@ -551,12 +551,48 @@ def update_saved_account_label(owner_telegram_id: int, saved_id: int, new_label:
 
 # ================ BADGE AND INVITE HELPERS ================
 BADGE_LEVELS = [
-    {"name": "Basic", "emoji": "🪪", "invites_needed": 0, "save_slots": 5, "limits": {"min": 2, "hour": 15, "day": 40}},
-    {"name": "Bronze", "emoji": "🥉", "invites_needed": 5, "save_slots": 7, "limits": {"min": 3, "hour": 30, "day": 80}},
-    {"name": "Silver", "emoji": "🥈", "invites_needed": 15, "save_slots": 10, "limits": {"min": 5, "hour": 60, "day": 150}},
-    {"name": "Gold", "emoji": "🥇", "invites_needed": 40, "save_slots": 15, "limits": {"min": 8, "hour": 120, "day": 300}},
-    {"name": "Diamond", "emoji": "💎", "invites_needed": 100, "save_slots": float('inf'), "limits": {"min": float('inf'), "hour": float('inf'), "day": float('inf')}},
-    {"name": "Admin", "emoji": "👑", "invites_needed": None, "save_slots": float('inf'), "limits": {"min": float('inf'), "hour": float('inf'), "day": float('inf')}},
+    {
+        "name": "Basic",
+        "emoji": "🪪",
+        "invites_needed": 0,
+        "save_slots": 5,                     # Fair starter
+        "limits": {"min": 2, "hour": 12, "day": 30}   # Stricter: only 2/min, 12/hour
+    },
+    {
+        "name": "Bronze",
+        "emoji": "🥉",
+        "invites_needed": 8,
+        "save_slots": 10,
+        "limits": {"min": 4, "hour": 30, "day": 80}
+    },
+    {
+        "name": "Silver",
+        "emoji": "🥈",
+        "invites_needed": 25,
+        "save_slots": 15,
+        "limits": {"min": 8, "hour": 70, "day": 200}
+    },
+    {
+        "name": "Gold",
+        "emoji": "🥇",
+        "invites_needed": 60,
+        "save_slots": 25,
+        "limits": {"min": 15, "hour": 150, "day": 500}
+    },
+    {
+        "name": "Diamond",
+        "emoji": "💎",
+        "invites_needed": 150,
+        "save_slots": float('inf'),          # Unlimited
+        "limits": {"min": float('inf'), "hour": float('inf'), "day": float('inf')}
+    },
+    {
+        "name": "Admin",
+        "emoji": "👑",
+        "invites_needed": None,
+        "save_slots": float('inf'),
+        "limits": {"min": float('inf'), "hour": float('inf'), "day": float('inf')}
+    },
 ]
 
 def get_explicit_badge(telegram_id: int) -> Optional[str]:
