@@ -190,6 +190,76 @@ async def iglatest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Posts sent! They will auto-delete in 24hrs.")
 
+async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /latest <username>\nExample: /latest vdm")
+        return
+
+    account = context.args[0].lstrip('@').lower()
+
+    # Simple auto-detect (customize this rule)
+    platform = "ig" if account in ["davido", "chiomaavril", "wizkidayo", "burnaboy"] else "x"
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    if platform == "x":
+        urls = fetch_latest_urls(platform, account)
+        if not urls:
+            await update.message.reply_text(f"No recent public posts found for @{account} on X 😕")
+            return
+
+        intro_msg = await update.message.reply_text(f"🔥 Latest {len(urls)} posts from @{account} on X:")
+
+        sent_message_ids = []
+
+        for url in urls:
+            fixed_url = url.replace("x.com", "fixupx.com").replace("twitter.com", "fixupx.com")
+            sent_msg = await update.message.reply_text(fixed_url, disable_web_page_preview=False)
+            sent_message_ids.append(sent_msg.message_id)
+            await asyncio.sleep(3)
+
+    else:  # IG
+        posts = fetch_ig_urls(account)
+        if not posts:
+            await update.message.reply_text(f"No recent public posts found for @{account} on IG 😕")
+            return
+
+        intro_msg = await update.message.reply_text(f"🔥 Latest {len(posts)} public IG posts from @{account}:")
+
+        sent_message_ids = []
+
+        for post in posts:
+            caption = post.get('caption', '').strip()[:1024]
+            media_url = post.get('media_url')
+
+            msg = f"<a href='{post['url']}'>View on IG</a>\n\n{caption}" if caption else f"<a href='{post['url']}'>View on IG</a>"
+
+            try:
+                if post.get('is_video'):
+                    sent_msg = await update.message.reply_video(
+                        video=media_url,
+                        caption=msg,
+                        parse_mode="HTML"
+                    )
+                else:
+                    sent_msg = await update.message.reply_photo(
+                        photo=media_url,
+                        caption=msg,
+                        parse_mode="HTML"
+                    )
+            except:
+                sent_msg = await update.message.reply_text(msg, parse_mode="HTML")
+
+            sent_message_ids.append(sent_msg.message_id)
+            await asyncio.sleep(5)
+
+    # Auto-delete
+    context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro_msg.chat.id, "message_id": intro_msg.message_id})
+    for msg_id in sent_message_ids:
+        context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": msg_id})
+
+    await update.message.reply_text("Posts sent! They will auto-delete in 24hrs.")
+
 # ===================== MAIN =====================
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
