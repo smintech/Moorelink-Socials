@@ -534,8 +534,8 @@ BADGE_LEVELS = [
     {"name": "Bronze", "emoji": "🥉", "invites_needed": 5, "save_slots": 7, "limits": {"min": 3, "hour": 30, "day": 80}},
     {"name": "Silver", "emoji": "🥈", "invites_needed": 15, "save_slots": 10, "limits": {"min": 5, "hour": 60, "day": 150}},
     {"name": "Gold", "emoji": "🥇", "invites_needed": 40, "save_slots": 15, "limits": {"min": 8, "hour": 120, "day": 300}},
-    {"name": "Diamond", "emoji": "💎", "invites_needed": 100, "save_slots": float('inf'), "limits": {"min": float('inf'), "hour': float('inf'), "day': float('inf')}},
-    {"name": "Admin", "emoji": "👑", "invites_needed": None, "save_slots": float('inf'), "limits": {"min": float('inf'), "hour': float('inf'), "day': float('inf')}},
+    {"name": "Diamond", "emoji": "💎", "invites_needed": 100, "save_slots": float('inf'), "limits": {"min": float('inf'), "hour": float('inf'), "day": float('inf')}},
+    {"name": "Admin", "emoji": "👑", "invites_needed": None, "save_slots": float('inf'), "limits": {"min": float('inf'), "hour": float('inf'), "day": float('inf')}},
 ]
 
 def get_explicit_badge(telegram_id: int) -> Optional[str]:
