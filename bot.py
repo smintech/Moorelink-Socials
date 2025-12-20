@@ -1,10 +1,10 @@
-# bot.py
 import os
 import asyncio
 import io
 import csv
 from typing import Optional, List, Dict, Any
 from functools import wraps
+from datetime import datetime
 
 from telegram import (
     Update,
@@ -43,6 +43,12 @@ from utils import (
     count_saved_accounts,
     update_saved_account_label,
     init_tg_db,
+    get_user_badge,
+    increment_invite_count,
+    check_and_increment_cooldown,
+    get_user_stats,
+    reset_cooldown,
+    BADGE_LEVELS,
 )
 
 # ================ CONFIG ================
@@ -51,10 +57,10 @@ if not TELEGRAM_TOKEN:
     raise ValueError("BOTTOKEN env var not set")
 
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-MAX_SAVED_PER_USER = 5
 
 POSTS_PER_PAGE = 5
 PAGE_SIZE_USERS = 10
+LEADERBOARD_LIMIT = 10
 
 # ================ HELPERS ================
 def is_admin(user_id: Optional[int]) -> bool:
@@ -76,12 +82,16 @@ def admin_only(handler_func):
         return await handler_func(update, context, *args, **kwargs)
     return wrapper
 
+def get_invite_link(bot_username: str, user_id: int) -> str:
+    return f"https://t.me/{bot_username}?start={user_id}"
+
 # ================ UI BUILDERS ================
 def build_main_menu():
     keyboard = [
         [InlineKeyboardButton("X (Twitter)", callback_data="menu_x")],
         [InlineKeyboardButton("Instagram", callback_data="menu_ig")],
         [InlineKeyboardButton("Saved usernames", callback_data="saved_menu")],
+        [InlineKeyboardButton("👤 Dashboard", callback_data="dashboard")],
         [InlineKeyboardButton("Help / Guide", callback_data="help")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -97,6 +107,7 @@ def build_saved_menu():
 def build_admin_menu():
     keyboard = [
         [InlineKeyboardButton("👥 List users", callback_data="admin_list_users_0")],
+        [InlineKeyboardButton("📊 Leaderboard", callback_data="admin_leaderboard")],
         [InlineKeyboardButton("📤 Broadcast", callback_data="admin_broadcast_start")],
         [InlineKeyboardButton("📥 Export CSV", callback_data="admin_export_csv")],
         [InlineKeyboardButton("↩️ Back", callback_data="menu_main")],
@@ -134,7 +145,7 @@ def build_confirm_markup(action: str, obj_id: Optional[int] = None, yes_label="C
 def users_to_csv_bytes(users: List[Dict[str, Any]]) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["telegram_id", "first_name", "is_active", "is_banned", "request_count", "last_request_at", "joined_at"])
+    writer.writerow(["telegram_id", "first_name", "is_active", "is_banned", "request_count", "last_request_at", "joined_at", "invite_count"])
     for u in users:
         writer.writerow([
             u.get("telegram_id"),
@@ -144,6 +155,7 @@ def users_to_csv_bytes(users: List[Dict[str, Any]]) -> bytes:
             u.get("request_count"),
             u.get("last_request_at"),
             u.get("joined_at"),
+            u.get("invite_count"),
         ])
     return buf.getvalue().encode("utf-8")
 
@@ -185,6 +197,36 @@ async def delete_message(context: ContextTypes.DEFAULT_TYPE):
 
 # ================ COMMANDS ================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    tid = user.id
+    first_name = user.first_name or ""
+    is_new = False
+    try:
+        # Add or update user, check if new
+        conn = get_tg_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO tg_users (telegram_id, first_name)
+            VALUES (%s, %s)
+            ON CONFLICT (telegram_id) DO UPDATE SET first_name = EXCLUDED.first_name
+            RETURNING (xmax = 0) AS is_new
+        """, (tid, first_name))
+        is_new = cur.fetchone()['is_new']
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+
+    # Handle invite if new user and arg provided
+    if is_new and context.args and len(context.args) == 1:
+        try:
+            inviter_id = int(context.args[0])
+            if inviter_id != tid:  # prevent self-invite
+                increment_invite_count(inviter_id)
+        except ValueError:
+            pass
+
     allowed = await record_user_and_check_ban(update, context)
     if not allowed:
         await update.message.reply_text("🚫 You are banned.")
@@ -215,10 +257,86 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/saved_list\n"
         "/saved_send <id>\n"
         "/saved_remove <id>\n"
-        "/saved_rename <id> <new label>\n\n"
+        "/saved_rename <id> <new label>\n"
+        "/dashboard - Show your badge, invites, etc.\n"
+        "/benefits - See badge levels\n"
+        "/leaderboard - Top inviters\n\n"
         "Use the Saved menu for one-tap actions."
     )
     await update.message.reply_text(help_text)
+
+async def benefits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    allowed = await record_user_and_check_ban(update, context)
+    if not allowed:
+        await update.message.reply_text("🚫 You are banned.")
+        return
+    text = "/benefits\n\n"
+    for level in BADGE_LEVELS[:-1]:  # exclude admin
+        text += f"{level['emoji']} {level['name']}\n"
+        text += f"• {level['save_slots']} saved usernames\n"
+        text += f"• {level['limits']['min']} requests/min\n\n"
+    text += f"{BADGE_LEVELS[-2]['emoji']} Diamond\n• Unlimited access\n"
+    await update.message.reply_text(text)
+
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    allowed = await record_user_and_check_ban(update, context)
+    if not allowed:
+        await update.message.reply_text("🚫 You are banned.")
+        return
+    tid = update.effective_user.id
+    badge = get_user_badge(tid)
+    user = get_tg_user(tid)
+    invites = user.get('invite_count', 0)
+    saves = count_saved_accounts(tid)
+    next_badge = None
+    invites_left = 0
+    for i, level in enumerate(BADGE_LEVELS):
+        if badge['name'] == level['name']:
+            if i + 1 < len(BADGE_LEVELS) - 1:  # next non-admin
+                next_badge = BADGE_LEVELS[i+1]
+                invites_left = next_badge['invites_needed'] - invites
+                if invites_left < 0:
+                    invites_left = 0
+            break
+    text = "👤 Dashboard\n\n"
+    text += f"🏅 Badge: {badge['emoji']} {badge['name']}\n"
+    text += f"📨 Invites: {invites}\n"
+    text += f"📦 Save Slots: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
+    text += "⚡ Speed:\n"
+    text += f"• {badge['limits']['min'] if isinstance(badge['limits']['min'], int) else '∞'}/min\n"
+    text += f"• {badge['limits']['hour'] if isinstance(badge['limits']['hour'], int) else '∞'}/hour\n"
+    text += f"• {badge['limits']['day'] if isinstance(badge['limits']['day'], int) else '∞'}/day\n\n"
+    if next_badge:
+        text += f"⏭ Next Badge: {next_badge['emoji']} {next_badge['name']} ({invites_left} invites left)\n"
+    else:
+        text += "⚡ Unlimited Access\n"
+    bot_username = context.bot.username
+    text += f"\nYour invite link: {get_invite_link(bot_username, tid)}"
+    await update.message.reply_text(text)
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    allowed = await record_user_and_check_ban(update, context)
+    if not allowed:
+        await update.message.reply_text("🚫 You are banned.")
+        return
+    # Fetch top users by invite_count
+    conn = get_tg_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT telegram_id, first_name, invite_count
+        FROM tg_users
+        ORDER BY invite_count DESC
+        LIMIT %s
+    """, (LEADERBOARD_LIMIT,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    text = "📊 Invite Leaderboard (Top 10)\n\n"
+    for i, row in enumerate(rows, 1):
+        name = row['first_name'] or f"User {row['telegram_id']}"
+        invites = row['invite_count']
+        text += f"{i}. {name} - {invites} invites\n"
+    await update.message.reply_text(text)
 
 # quick /latest that accepts args or asks for username (small convenience)
 async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -226,6 +344,12 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed = await record_user_and_check_ban(update, context)
     if not allowed:
         await update.message.reply_text("🚫 You are banned.")
+        return
+
+    tid = update.effective_user.id
+    cooldown_msg = check_and_increment_cooldown(tid)
+    if cooldown_msg:
+        await update.message.reply_text(cooldown_msg)
         return
 
     args = context.args or []
@@ -306,6 +430,50 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_only
+async def reset_cooldown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /reset_cooldown <telegram_id>")
+        return
+    try:
+        tid = int(context.args[0])
+    except:
+        await update.message.reply_text("Invalid id.")
+        return
+    reset_cooldown(tid)
+    await update.message.reply_text(f"Cooldown reset for {tid}.")
+
+@admin_only
+async def user_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /user_stats <telegram_id>")
+        return
+    try:
+        tid = int(context.args[0])
+    except:
+        await update.message.reply_text("Invalid id.")
+        return
+    stats = get_user_stats(tid)
+    if not stats:
+        await update.message.reply_text("User not found.")
+        return
+    user = stats['user']
+    badge = stats['badge']
+    rl = stats['rate_limits']
+    saves = stats['save_count']
+    text = f"Stats for {user.get('first_name', 'User')} ({tid})\n\n"
+    text += f"Joined: {user.get('joined_at')}\n"
+    text += f"Requests: {user.get('request_count', 0)}\n"
+    text += f"Invites: {user.get('invite_count', 0)}\n"
+    text += f"Banned: {bool(user.get('is_banned'))}\n"
+    text += f"Badge: {badge['emoji']} {badge['name']}\n"
+    text += f"Saves: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
+    text += "Cooldowns:\n"
+    text += f"Minute: {rl['minute_count']}/{badge['limits']['min'] if isinstance(badge['limits']['min'], int) else '∞'}\n"
+    text += f"Hour: {rl['hour_count']}/{badge['limits']['hour'] if isinstance(badge['limits']['hour'], int) else '∞'}\n"
+    text += f"Day: {rl['day_count']}/{badge['limits']['day'] if isinstance(badge['limits']['day'], int) else '∞'}\n"
+    await update.message.reply_text(text)
+
+@admin_only
 async def export_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # confirmation before exporting potentially large data
     await update.message.reply_text("Export users to CSV? Confirm to proceed.", reply_markup=build_confirm_markup("export_csv"))
@@ -364,6 +532,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"User {tid} unbanned.", reply_markup=build_admin_menu())
         return
 
+    if data.startswith("confirm_reset_cooldown_"):
+        if not is_admin(uid):
+            await query.edit_message_text("❌ Admins only.")
+            return
+        _, _, tid_s = data.partition("confirm_reset_cooldown_")
+        try:
+            tid = int(tid_s)
+        except:
+            await query.edit_message_text("Invalid id.")
+            return
+        reset_cooldown(tid)
+        await query.edit_message_text(f"Cooldown reset for {tid}.", reply_markup=build_admin_menu())
+        return
+
     if data == "confirm_export_csv":
         if not is_admin(uid):
             await query.edit_message_text("❌ Admins only.")
@@ -383,6 +565,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # main menu navigation
     if data == "menu_main":
         await query.edit_message_text("Main menu:", reply_markup=build_main_menu())
+        return
+
+    if data == "dashboard":
+        await dashboard_command(update, context)
         return
 
     if data == "menu_x":
@@ -440,6 +626,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sid = int(sid_s)
         except:
             await query.edit_message_text("Invalid saved id.")
+            return
+        cooldown_msg = check_and_increment_cooldown(uid)
+        if cooldown_msg:
+            await query.edit_message_text(cooldown_msg)
             return
         owner = uid
         saved = get_saved_account(owner, sid)
@@ -522,16 +712,107 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             end = start + PAGE_SIZE_USERS
             page_users = users[start:end]
             text = f"Users (page {page+1}):\n\n"
-            for u in page_users:
-                text += f"- {u.get('first_name') or ''} ({u.get('telegram_id')}) banned={u.get('is_banned')} reqs={u.get('request_count')}\n"
             rows = []
+            for u in page_users:
+                tid = u.get('telegram_id')
+                text += f"- {u.get('first_name') or ''} ({tid}) banned={u.get('is_banned')} reqs={u.get('request_count')} invites={u.get('invite_count')}\n"
+                rows.append([
+                    InlineKeyboardButton(f"Stats {tid}", callback_data=f"admin_user_stats_{tid}"),
+                    InlineKeyboardButton(f"Reset CD {tid}", callback_data=f"admin_reset_cooldown_start_{tid}"),
+                    InlineKeyboardButton(f"Ban {tid}" if not u.get('is_banned') else f"Unban {tid}", callback_data=f"admin_{'ban' if not u.get('is_banned') else 'unban'}_start_{tid}")
+                ])
+            nav_row = []
             if page > 0:
-                rows.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin_list_users_{page-1}"))
+                nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin_list_users_{page-1}"))
             if end < total:
-                rows.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_list_users_{page+1}"))
-            rows2 = [[b] for b in rows] if rows else []
-            rows2.append([InlineKeyboardButton("↩️ Back", callback_data="admin_back")])
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows2))
+                nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_list_users_{page+1}"))
+            if nav_row:
+                rows.append(nav_row)
+            rows.append([InlineKeyboardButton("↩️ Back", callback_data="admin_back")])
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+            return
+        if data.startswith("admin_user_stats_"):
+            _, _, tid_s = data.partition("admin_user_stats_")
+            try:
+                tid = int(tid_s)
+            except:
+                await query.edit_message_text("Invalid id.")
+                return
+            stats = get_user_stats(tid)
+            if not stats:
+                await query.edit_message_text("User not found.")
+                return
+            user = stats['user']
+            badge = stats['badge']
+            rl = stats['rate_limits']
+            saves = stats['save_count']
+            text = f"Stats for {user.get('first_name', 'User')} ({tid})\n\n"
+            text += f"Joined: {user.get('joined_at')}\n"
+            text += f"Requests: {user.get('request_count', 0)}\n"
+            text += f"Invites: {user.get('invite_count', 0)}\n"
+            text += f"Banned: {bool(user.get('is_banned'))}\n"
+            text += f"Badge: {badge['emoji']} {badge['name']}\n"
+            text += f"Saves: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
+            text += "Cooldowns:\n"
+            text += f"Minute: {rl['minute_count']}/{badge['limits']['min'] if isinstance(badge['limits']['min'], int) else '∞'} (reset: {rl['minute_reset']})\n"
+            text += f"Hour: {rl['hour_count']}/{badge['limits']['hour'] if isinstance(badge['limits']['hour'], int) else '∞'} (reset: {rl['hour_reset']})\n"
+            text += f"Day: {rl['day_count']}/{badge['limits']['day'] if isinstance(badge['limits']['day'], int) else '∞'} (reset: {rl['day_reset']})\n"
+            await query.edit_message_text(text, reply_markup=build_back_markup("admin_list_users_0"))
+            return
+        if data.startswith("admin_reset_cooldown_start_"):
+            _, _, tid_s = data.partition("admin_reset_cooldown_start_")
+            try:
+                tid = int(tid_s)
+            except:
+                await query.edit_message_text("Invalid id.")
+                return
+            await query.edit_message_text(
+                f"Confirm reset cooldown for {tid}?",
+                reply_markup=build_confirm_markup("reset_cooldown", tid)
+            )
+            return
+        if data.startswith("admin_ban_start_"):
+            _, _, tid_s = data.partition("admin_ban_start_")
+            try:
+                tid = int(tid_s)
+            except:
+                await query.edit_message_text("Invalid id.")
+                return
+            await query.edit_message_text(
+                f"Confirm ban {tid}?",
+                reply_markup=build_confirm_markup("ban", tid)
+            )
+            return
+        if data.startswith("admin_unban_start_"):
+            _, _, tid_s = data.partition("admin_unban_start_")
+            try:
+                tid = int(tid_s)
+            except:
+                await query.edit_message_text("Invalid id.")
+                return
+            await query.edit_message_text(
+                f"Confirm unban {tid}?",
+                reply_markup=build_confirm_markup("unban", tid)
+            )
+            return
+        if data == "admin_leaderboard":
+            conn = get_tg_db()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT telegram_id, first_name, invite_count
+                FROM tg_users
+                ORDER BY invite_count DESC
+                LIMIT %s
+            """, (LEADERBOARD_LIMIT,))
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            text = "📊 Invite Leaderboard (Top 10)\n\n"
+            for i, row in enumerate(rows, 1):
+                name = row['first_name'] or f"User {row['telegram_id']}"
+                invites = row['invite_count']
+                text += f"{i}. {name} - {invites} invites\n"
+            await query.edit_message_text(text, reply_markup=build_back_markup("admin_back"))
             return
         if data == "admin_back":
             await query.edit_message_text("Admin panel:", reply_markup=build_admin_menu())
@@ -657,11 +938,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         account = parts[1].lstrip('@').lower()
         label = parts[2] if len(parts) == 3 else None
         owner = update.effective_user.id
+        badge = get_user_badge(owner)
         current_count = count_saved_accounts(owner)
-        # <-- Exempt admins from the saved limit:
-        if not is_admin(owner) and current_count >= MAX_SAVED_PER_USER:
+        if current_count >= badge['save_slots']:
             await update.message.reply_text(
-                f"You reached saved limit ({MAX_SAVED_PER_USER}). Remove some or invite to increase.")
+                f"You reached saved limit ({badge['save_slots']}). Remove some or invite to increase.")
             context.user_data.pop("awaiting_save", None)
             return
         try:
@@ -677,6 +958,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         account = update.message.text.strip().lstrip("@").lower()
         platform = context.user_data.get("platform")
         context.user_data["awaiting_username"] = False
+        tid = update.effective_user.id
+        cooldown_msg = check_and_increment_cooldown(tid)
+        if cooldown_msg:
+            await update.message.reply_text(cooldown_msg)
+            return
         await update.message.chat.send_action(ChatAction.TYPING)
         if platform == "x":
             posts = fetch_latest_urls("x", account)
@@ -729,7 +1015,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             await update.message.reply_text("Invalid id.")
             return
-        owner = update.effective_user.id
+        tid = update.effective_user.id
+        cooldown_msg = check_and_increment_cooldown(tid)
+        if cooldown_msg:
+            await update.message.reply_text(cooldown_msg)
+            return
+        owner = tid
         saved = get_saved_account(owner, sid)
         if not saved:
             await update.message.reply_text("Saved account not found.")
@@ -819,9 +1110,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         account = parts[2].lstrip('@').lower()
         label = parts[3] if len(parts) == 4 else None
         owner = update.effective_user.id
+        badge = get_user_badge(owner)
         current_count = count_saved_accounts(owner)
-        if not is_admin(owner) and current_count >= MAX_SAVED_PER_USER:
-            await update.message.reply_text(f"You reached saved limit ({MAX_SAVED_PER_USER}).")
+        if current_count >= badge['save_slots']:
+            await update.message.reply_text(f"You reached saved limit ({badge['save_slots']}).")
             return
         try:
             saved = save_user_account(owner, platform, account, label)
@@ -862,9 +1154,14 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("latest", latest_command))
+    app.add_handler(CommandHandler("benefits", benefits_command))
+    app.add_handler(CommandHandler("dashboard", dashboard_command))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("ban", ban_command))
     app.add_handler(CommandHandler("unban", unban_command))
+    app.add_handler(CommandHandler("reset_cooldown", reset_cooldown_command))
+    app.add_handler(CommandHandler("user_stats", user_stats_command))
     app.add_handler(CommandHandler("export_csv", export_csv_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
 
@@ -891,6 +1188,9 @@ if __name__ == "__main__":
             BotCommand("latest", "Get latest posts for a username"),
             BotCommand("saved_list", "List your saved usernames"),
             BotCommand("save", "Save a username for quick sending"),
+            BotCommand("benefits", "See badge benefits"),
+            BotCommand("dashboard", "View your status"),
+            BotCommand("leaderboard", "Top inviters"),
             BotCommand("help", "Show help"),
         ]
         try:
@@ -902,6 +1202,8 @@ if __name__ == "__main__":
             BotCommand("admin", "Open admin panel"),
             BotCommand("ban", "Ban a user (admin only)"),
             BotCommand("unban", "Unban a user (admin only)"),
+            BotCommand("reset_cooldown", "Reset user cooldown"),
+            BotCommand("user_stats", "View user stats"),
             BotCommand("broadcast", "Start a broadcast (admin only)"),
             BotCommand("export_csv", "Export users CSV (admin only)"),
         ]
@@ -964,5 +1266,5 @@ if __name__ == "__main__":
         # log but continue — bot can run without DB, but some features will be disabled
         print(f"[startup] init_tg_db() failed or not available: {e}")
 
-    print("🤖 MooreLinkBot (full) started — admin + saved accounts + quick-send enabled")
+    print("🤖 MooreLinkBot (full) started — admin + saved accounts + quick-send + badges enabled")
     app.run_polling(drop_pending_updates=True)
