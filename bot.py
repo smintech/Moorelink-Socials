@@ -658,8 +658,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = parts[2] if len(parts) == 3 else None
         owner = update.effective_user.id
         current_count = count_saved_accounts(owner)
-        if current_count >= MAX_SAVED_PER_USER:
-            await update.message.reply_text(f"You reached saved limit ({MAX_SAVED_PER_USER}). Remove some or ask admin to increase.")
+        # <-- Exempt admins from the saved limit:
+        if not is_admin(owner) and current_count >= MAX_SAVED_PER_USER:
+            await update.message.reply_text(
+                f"You reached saved limit ({MAX_SAVED_PER_USER}). Remove some or invite to increase.")
             context.user_data.pop("awaiting_save", None)
             return
         try:
