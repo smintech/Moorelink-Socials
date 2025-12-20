@@ -1,3 +1,4 @@
+# bot.py (corrected)
 import os
 import asyncio
 import io
@@ -49,6 +50,8 @@ from utils import (
     get_user_stats,
     reset_cooldown,
     BADGE_LEVELS,
+    get_tg_db,
+    add_invite,
 )
 
 # ================ CONFIG ================
@@ -74,7 +77,6 @@ def admin_only(handler_func):
         user_id = user.id if user else None
         if not is_admin(user_id):
             if update.callback_query:
-                # ephemeral message to non-admin trying admin callback
                 await update.callback_query.answer("❌ You are not authorized.", show_alert=True)
             elif update.effective_message:
                 await update.effective_message.reply_text("❌ You are not authorized to use this command.")
@@ -114,24 +116,16 @@ def build_admin_menu():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# Small reusable back/cancel/confirm markups
 def build_back_markup(target="menu_main", label="↩️ Back"):
-    """Simple inline back button to jump to a callback action."""
     return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])
 
 def build_cancel_and_back(cancel_cb="admin_broadcast_cancel", back_cb="admin_back"):
-    """Cancel button (for broadcast) plus a Back button."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Cancel", callback_data=cancel_cb)],
         [InlineKeyboardButton("↩️ Back", callback_data=back_cb)],
     ])
 
 def build_confirm_markup(action: str, obj_id: Optional[int] = None, yes_label="Confirm", no_label="Cancel"):
-    """
-    action: short token like 'ban', 'unban', 'export_csv'
-    obj_id: optional integer id to include in callback payload
-    Returns markup with Confirm / Cancel.
-    """
     if obj_id is None:
         yes_cb = f"confirm_{action}"
     else:
@@ -161,10 +155,6 @@ def users_to_csv_bytes(users: List[Dict[str, Any]]) -> bytes:
 
 # ================ DB / USER RECORDS ================
 async def record_user_and_check_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Ensure user exists and increment request count.
-    Return False if user is banned.
-    """
     user = update.effective_user
     if not user:
         return True
@@ -197,33 +187,48 @@ async def delete_message(context: ContextTypes.DEFAULT_TYPE):
 
 # ================ COMMANDS ================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle deep links like /start <inviter_id>. Detect new account and attribute invite."""
     user = update.effective_user
+    if not user:
+        return
     tid = user.id
     first_name = user.first_name or ""
-    is_new = False
+
+    # detect existing user first
     try:
-        # Add or update user, check if new
-        conn = get_tg_db()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO tg_users (telegram_id, first_name)
-            VALUES (%s, %s)
-            ON CONFLICT (telegram_id) DO UPDATE SET first_name = EXCLUDED.first_name
-            RETURNING (xmax = 0) AS is_new
-        """, (tid, first_name))
-        is_new = cur.fetchone()['is_new']
-        conn.commit()
-        cur.close()
-        conn.close()
+        existing = get_tg_user(tid)
+    except Exception:
+        existing = None
+
+    is_new = existing is None
+
+    # ensure user row exists / update name
+    try:
+        add_or_update_tg_user(tid, first_name)
     except Exception:
         pass
 
-    # Handle invite if new user and arg provided
-    if is_new and context.args and len(context.args) == 1:
+    # handle invite attribution only when the account was new
+    if is_new and context.args and len(context.args) >= 1:
         try:
             inviter_id = int(context.args[0])
-            if inviter_id != tid:  # prevent self-invite
-                increment_invite_count(inviter_id)
+            if inviter_id != tid:
+                # add_invite will only count once per invited user
+                try:
+                    added = add_invite(inviter_id, tid)
+                    # add_invite already updates invite_count and evaluates badge
+                    if added:
+                        # notify inviter (best-effort)
+                        try:
+                            await context.bot.send_message(chat_id=inviter_id, text=f"🎉 You invited a new user! +1 invite.")
+                        except Exception:
+                            pass
+                except Exception:
+                    # fallback to simple increment (if add_invite not available)
+                    try:
+                        increment_invite_count(inviter_id)
+                    except Exception:
+                        pass
         except ValueError:
             pass
 
@@ -231,6 +236,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed:
         await update.effective_message.reply_text("🚫 You are banned.")
         return
+
     text = (
         "👋 Welcome to MooreLinkBot!\n\n"
         "Commands & quick actions available in the menu.\n"
@@ -270,12 +276,16 @@ async def benefits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed:
         await update.effective_message.reply_text("🚫 You are banned.")
         return
-    text = "/benefits\n\n"
-    for level in BADGE_LEVELS[:-1]:  # exclude admin
-        text += f"{level['emoji']} {level['name']}\n"
-        text += f"• {level['save_slots']} saved usernames\n"
-        text += f"• {level['limits']['min']} requests/min\n\n"
-    text += f"{BADGE_LEVELS[-2]['emoji']} Diamond\n• Unlimited access\n"
+    text = "Badge benefits:\n\n"
+    for level in BADGE_LEVELS:
+        # show all except Admin last special handling
+        name = level['name']
+        emoji = level.get('emoji', '')
+        save_slots = level['save_slots']
+        limits = level.get('limits', {})
+        text += f"{emoji} {name}\n"
+        text += f"• Save slots: {save_slots if isinstance(save_slots, int) else '∞'}\n"
+        text += f"• Limits: {limits.get('min', '∞')} /min | {limits.get('hour', '∞')} /hr | {limits.get('day', '∞')} /day\n\n"
     await update.effective_message.reply_text(text)
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -285,33 +295,38 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tid = update.effective_user.id
     badge = get_user_badge(tid)
-    user = get_tg_user(tid)
-    invites = user.get('invite_count', 0)
+    user = get_tg_user(tid) or {}
+    invites = int(user.get('invite_count', 0) or 0)
     saves = count_saved_accounts(tid)
     next_badge = None
     invites_left = 0
+    # find next non-admin badge
     for i, level in enumerate(BADGE_LEVELS):
         if badge['name'] == level['name']:
-            if i + 1 < len(BADGE_LEVELS) - 1:  # next non-admin
-                next_badge = BADGE_LEVELS[i+1]
-                invites_left = next_badge['invites_needed'] - invites
-                if invites_left < 0:
-                    invites_left = 0
+            # next level that's not Admin
+            j = i + 1
+            while j < len(BADGE_LEVELS) and BADGE_LEVELS[j]['invites_needed'] is None:
+                j += 1
+            if j < len(BADGE_LEVELS) and BADGE_LEVELS[j].get('invites_needed') is not None:
+                next_badge = BADGE_LEVELS[j]
+                invites_left = max(0, int(next_badge['invites_needed']) - invites)
             break
+
     text = "👤 Dashboard\n\n"
-    text += f"🏅 Badge: {badge['emoji']} {badge['name']}\n"
+    text += f"🏅 Badge: {badge.get('emoji','')} {badge.get('name')}\n"
     text += f"📨 Invites: {invites}\n"
-    text += f"📦 Save Slots: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
+    text += f"📦 Save Slots used: {saves} / {badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
+    limits = badge.get('limits', {})
     text += "⚡ Speed:\n"
-    text += f"• {badge['limits']['min'] if isinstance(badge['limits']['min'], int) else '∞'}/min\n"
-    text += f"• {badge['limits']['hour'] if isinstance(badge['limits']['hour'], int) else '∞'}/hour\n"
-    text += f"• {badge['limits']['day'] if isinstance(badge['limits']['day'], int) else '∞'}/day\n\n"
+    text += f"• {limits.get('min','∞')}/min\n"
+    text += f"• {limits.get('hour','∞')}/hour\n"
+    text += f"• {limits.get('day','∞')}/day\n\n"
     if next_badge:
-        text += f"⏭ Next Badge: {next_badge['emoji']} {next_badge['name']} ({invites_left} invites left)\n"
+        text += f"⏭ Next Badge: {next_badge.get('emoji','')} {next_badge.get('name')} — {invites_left} invites left\n\n"
     else:
-        text += "⚡ Unlimited Access\n"
-    bot_username = context.bot.username
-    text += f"\nYour invite link: {get_invite_link(bot_username, tid)}"
+        text += "⚡ You have the highest badge or no further badge.\n\n"
+    bot_username = getattr(context.bot, "username", None) or os.getenv("BOT_USERNAME", "your_bot")
+    text += f"Your invite link: {get_invite_link(bot_username, tid)}"
     await update.effective_message.reply_text(text)
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -319,7 +334,6 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not allowed:
         await update.effective_message.reply_text("🚫 You are banned.")
         return
-    # Fetch top users by invite_count
     conn = get_tg_db()
     cur = conn.cursor()
     cur.execute("""
@@ -331,16 +345,15 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    text = "📊 Invite Leaderboard (Top 10)\n\n"
+    text = "📊 Invite Leaderboard\n\n"
     for i, row in enumerate(rows, 1):
         name = row['first_name'] or f"User {row['telegram_id']}"
         invites = row['invite_count']
         text += f"{i}. {name} - {invites} invites\n"
     await update.effective_message.reply_text(text)
 
-# quick /latest that accepts args or asks for username (small convenience)
+# ================ LATEST / COOLDOWN CHECK ================
 async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /latest x|ig username  OR run command and follow prompt"""
     allowed = await record_user_and_check_ban(update, context)
     if not allowed:
         await update.effective_message.reply_text("🚫 You are banned.")
@@ -383,18 +396,13 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.effective_message.reply_text(msg, parse_mode="HTML")
         return
 
-    # otherwise prompt and set awaiting_username state (default platform x)
     context.user_data["awaiting_username"] = True
     context.user_data["platform"] = "x"
     await update.effective_message.reply_text("Send username (without @) — default platform X. Use /cancel to abort.", reply_markup=build_back_markup("menu_main"))
 
-# ================ ADMIN (with confirmations) ================
+# ================ ADMIN ================
 @admin_only
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_admin(user.id):
-        await update.effective_message.reply_text("❌ Not an admin.")
-        return
     await update.effective_message.reply_text("Admin panel:", reply_markup=build_admin_menu())
 
 @admin_only
@@ -407,11 +415,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.effective_message.reply_text("Invalid id.")
         return
-    # ask for confirmation
-    await update.effective_message.reply_text(
-        f"Are you sure you want to ban {tid}?",
-        reply_markup=build_confirm_markup("ban", tid)
-    )
+    await update.effective_message.reply_text(f"Are you sure you want to ban {tid}?", reply_markup=build_confirm_markup("ban", tid))
 
 @admin_only
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -423,11 +427,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.effective_message.reply_text("Invalid id.")
         return
-    # ask for confirmation
-    await update.effective_message.reply_text(
-        f"Are you sure you want to unban {tid}?",
-        reply_markup=build_confirm_markup("unban", tid)
-    )
+    await update.effective_message.reply_text(f"Are you sure you want to unban {tid}?", reply_markup=build_confirm_markup("unban", tid))
 
 @admin_only
 async def reset_cooldown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -465,30 +465,23 @@ async def user_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text += f"Requests: {user.get('request_count', 0)}\n"
     text += f"Invites: {user.get('invite_count', 0)}\n"
     text += f"Banned: {bool(user.get('is_banned'))}\n"
-    text += f"Badge: {badge['emoji']} {badge['name']}\n"
+    text += f"Badge: {badge.get('emoji','')} {badge.get('name')}\n"
     text += f"Saves: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
     text += "Cooldowns:\n"
-    text += f"Minute: {rl['minute_count']}/{badge['limits']['min'] if isinstance(badge['limits']['min'], int) else '∞'}\n"
-    text += f"Hour: {rl['hour_count']}/{badge['limits']['hour'] if isinstance(badge['limits']['hour'], int) else '∞'}\n"
-    text += f"Day: {rl['day_count']}/{badge['limits']['day'] if isinstance(badge['limits']['day'], int) else '∞'}\n"
+    text += f"Minute: {rl.get('minute_count',0)}/{badge['limits'].get('min','∞')}\n"
+    text += f"Hour: {rl.get('hour_count',0)}/{badge['limits'].get('hour','∞')}\n"
+    text += f"Day: {rl.get('day_count',0)}/{badge['limits'].get('day','∞')}\n"
     await update.effective_message.reply_text(text)
 
 @admin_only
 async def export_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # confirmation before exporting potentially large data
     await update.effective_message.reply_text("Export users to CSV? Confirm to proceed.", reply_markup=build_confirm_markup("export_csv"))
 
-# ================ CANCEL COMMAND ================
+# ================ CANCEL ================
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generic cancel: clears any awaiting_* or admin_broadcast states and returns to menu."""
-    user = update.effective_user
     ctx = context.user_data
-    cleared = []
     for k in ("admin_broadcast", "awaiting_save", "awaiting_username", "awaiting_rename_id"):
-        if k in ctx:
-            ctx.pop(k, None)
-            cleared.append(k)
-    # respond
+        ctx.pop(k, None)
     await update.effective_message.reply_text("Cancelled.", reply_markup=build_main_menu())
 
 # ================ CALLBACKS ================
@@ -503,7 +496,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    # -- Confirmation callbacks for admin actions --
+    # confirmations
     if data.startswith("confirm_ban_"):
         if not is_admin(uid):
             await query.edit_message_text("❌ Admins only.")
@@ -532,20 +525,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"User {tid} unbanned.", reply_markup=build_admin_menu())
         return
 
-    if data.startswith("confirm_reset_cooldown_"):
-        if not is_admin(uid):
-            await query.edit_message_text("❌ Admins only.")
-            return
-        _, _, tid_s = data.partition("confirm_reset_cooldown_")
-        try:
-            tid = int(tid_s)
-        except:
-            await query.edit_message_text("Invalid id.")
-            return
-        reset_cooldown(tid)
-        await query.edit_message_text(f"Cooldown reset for {tid}.", reply_markup=build_admin_menu())
-        return
-
     if data == "confirm_export_csv":
         if not is_admin(uid):
             await query.edit_message_text("❌ Admins only.")
@@ -562,12 +541,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"Failed to send CSV: {e}")
         return
 
-    # main menu navigation
     if data == "menu_main":
         await query.edit_message_text("Main menu:", reply_markup=build_main_menu())
         return
 
     if data == "dashboard":
+        # call dashboard flow
         await dashboard_command(update, context)
         return
 
@@ -576,25 +555,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_username"] = True
         await query.edit_message_text("Send the X username (without @):", reply_markup=build_back_markup("menu_main"))
         return
+
     if data == "menu_ig":
         context.user_data["platform"] = "ig"
         context.user_data["awaiting_username"] = True
         await query.edit_message_text("Send the Instagram username (without @):", reply_markup=build_back_markup("menu_main"))
         return
+
     if data == "help":
         await help_command(update, context)
         return
 
-    # saved menu
+    # saved flows
     if data == "saved_menu":
         await query.edit_message_text("Saved usernames:", reply_markup=build_saved_menu())
         return
     if data == "saved_add_start":
         context.user_data["awaiting_save"] = True
-        await query.edit_message_text(
-            "Send: <platform> <username> [label]\nExample: `x vdm fav`",
-            reply_markup=build_back_markup("saved_menu")
-        )
+        await query.edit_message_text("Send: <platform> <username> [label]\nExample: `x vdm fav`", reply_markup=build_back_markup("saved_menu"))
         return
     if data == "saved_list":
         owner = uid
@@ -619,7 +597,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    # saved quick send via callback
     if data.startswith("saved_sendcb_"):
         _, _, sid_s = data.partition("saved_sendcb_")
         try:
@@ -666,7 +643,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(0.3)
         return
 
-    # saved remove via callback
     if data.startswith("saved_removecb_"):
         _, _, sid_s = data.partition("saved_removecb_")
         try:
@@ -682,7 +658,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Could not remove saved account.", reply_markup=build_saved_menu())
         return
 
-    # saved rename start via callback (interactive)
     if data.startswith("saved_rename_start_"):
         _, _, sid_s = data.partition("saved_rename_start_")
         try:
@@ -691,18 +666,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Invalid id.")
             return
         context.user_data["awaiting_rename_id"] = sid
-        await query.edit_message_text(
-            "Send the new label for this saved account (single message):",
-            reply_markup=build_back_markup("saved_list")
-        )
+        await query.edit_message_text("Send the new label for this saved account (single message):", reply_markup=build_back_markup("saved_list"))
         return
 
-    # ---------------- Admin callbacks ----------------
+    # admin callbacks (list, stats, reset cd, broadcast)
     if data.startswith("admin_"):
         if not is_admin(uid):
             await query.edit_message_text("❌ Admins only.")
             return
-        # admin_list_users_{page}
+
         if data.startswith("admin_list_users_"):
             _, _, page_s = data.partition("admin_list_users_")
             page = int(page_s or "0")
@@ -731,6 +703,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows.append([InlineKeyboardButton("↩️ Back", callback_data="admin_back")])
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
             return
+
         if data.startswith("admin_user_stats_"):
             _, _, tid_s = data.partition("admin_user_stats_")
             try:
@@ -754,11 +727,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"Badge: {badge['emoji']} {badge['name']}\n"
             text += f"Saves: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
             text += "Cooldowns:\n"
-            text += f"Minute: {rl['minute_count']}/{badge['limits']['min'] if isinstance(badge['limits']['min'], int) else '∞'} (reset: {rl['minute_reset']})\n"
-            text += f"Hour: {rl['hour_count']}/{badge['limits']['hour'] if isinstance(badge['limits']['hour'], int) else '∞'} (reset: {rl['hour_reset']})\n"
-            text += f"Day: {rl['day_count']}/{badge['limits']['day'] if isinstance(badge['limits']['day'], int) else '∞'} (reset: {rl['day_reset']})\n"
+            text += f"Minute: {rl.get('minute_count',0)}/{badge['limits'].get('min','∞')} (reset: {rl.get('minute_reset')})\n"
+            text += f"Hour: {rl.get('hour_count',0)}/{badge['limits'].get('hour','∞')} (reset: {rl.get('hour_reset')})\n"
+            text += f"Day: {rl.get('day_count',0)}/{badge['limits'].get('day','∞')} (reset: {rl.get('day_reset')})\n"
             await query.edit_message_text(text, reply_markup=build_back_markup("admin_list_users_0"))
             return
+
         if data.startswith("admin_reset_cooldown_start_"):
             _, _, tid_s = data.partition("admin_reset_cooldown_start_")
             try:
@@ -766,35 +740,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 await query.edit_message_text("Invalid id.")
                 return
-            await query.edit_message_text(
-                f"Confirm reset cooldown for {tid}?",
-                reply_markup=build_confirm_markup("reset_cooldown", tid)
-            )
+            await query.edit_message_text(f"Confirm reset cooldown for {tid}?", reply_markup=build_confirm_markup("reset_cooldown", tid))
             return
-        if data.startswith("admin_ban_start_"):
-            _, _, tid_s = data.partition("admin_ban_start_")
-            try:
-                tid = int(tid_s)
-            except:
+
+        if data.startswith("admin_ban_start_") or data.startswith("admin_unban_start_"):
+            # normalize both
+            if data.startswith("admin_ban_start_"):
+                _, _, tid_s = data.partition("admin_ban_start_")
+                cb = build_confirm_markup("ban", int(tid_s)) if tid_s.isdigit() else None
+            else:
+                _, _, tid_s = data.partition("admin_unban_start_")
+                cb = build_confirm_markup("unban", int(tid_s)) if tid_s.isdigit() else None
+            if cb:
+                await query.edit_message_text("Confirm?", reply_markup=cb)
+            else:
                 await query.edit_message_text("Invalid id.")
-                return
-            await query.edit_message_text(
-                f"Confirm ban {tid}?",
-                reply_markup=build_confirm_markup("ban", tid)
-            )
             return
-        if data.startswith("admin_unban_start_"):
-            _, _, tid_s = data.partition("admin_unban_start_")
-            try:
-                tid = int(tid_s)
-            except:
-                await query.edit_message_text("Invalid id.")
-                return
-            await query.edit_message_text(
-                f"Confirm unban {tid}?",
-                reply_markup=build_confirm_markup("unban", tid)
-            )
-            return
+
         if data == "admin_leaderboard":
             conn = get_tg_db()
             cur = conn.cursor()
@@ -814,13 +776,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += f"{i}. {name} - {invites} invites\n"
             await query.edit_message_text(text, reply_markup=build_back_markup("admin_back"))
             return
+
         if data == "admin_back":
             await query.edit_message_text("Admin panel:", reply_markup=build_admin_menu())
             return
+
         if data == "admin_export_csv":
-            # ask for confirmation
             await query.edit_message_text("Export users to CSV? Confirm to proceed.", reply_markup=build_confirm_markup("export_csv"))
             return
+
         if data == "admin_broadcast_start":
             context.user_data["admin_broadcast"] = True
             await query.edit_message_text(
@@ -828,13 +792,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=build_cancel_and_back("admin_broadcast_cancel", "admin_back")
             )
             return
+
         if data == "admin_broadcast_cancel":
-            # cancel the waiting broadcast prompt
             context.user_data.pop("admin_broadcast", None)
             await query.edit_message_text("Broadcast cancelled.", reply_markup=build_admin_menu())
             return
 
-    # pagination / posts callbacks (like page_x)
+    # pagination / posts callbacks
     if data.startswith("page_"):
         parts = data.split("_", 3)
         if len(parts) < 4:
@@ -864,13 +828,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text("Unknown action or handled elsewhere.")
 
-# ================ MESSAGE HANDLER (saved add, rename, broadcast, username flows) ================
+# ================ MESSAGE HANDLER ================
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ignore empty messages
     if not update.message or not update.message.text:
         return
 
-    # admin broadcast flow (cooperative & cancelable)
+    # admin broadcast flow
     if context.user_data.get("admin_broadcast"):
         user = update.effective_user
         if not is_admin(user.id):
@@ -879,7 +842,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         text_to_send = update.message.text
-        # reassure admin that broadcast started & how to cancel mid-run
         await update.effective_message.reply_text("Broadcast starting... (send /cancel to abort while it runs)")
         users = list_active_tg_users(limit=10000)
         sent = 0
@@ -887,28 +849,24 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cancelled = False
 
         for u in users:
-            # allow graceful cancellation while the loop yields (we sleep between sends)
             if not context.user_data.get("admin_broadcast"):
                 cancelled = True
                 break
             try:
                 await context.bot.send_message(chat_id=u.get("telegram_id"), text=text_to_send)
                 sent += 1
-                # small sleep to yield event loop so /cancel can be received
                 await asyncio.sleep(0.05)
             except Exception:
                 failed += 1
 
-        # clear the flag if it still exists
         context.user_data.pop("admin_broadcast", None)
-
         if cancelled:
             await update.effective_message.reply_text(f"Broadcast cancelled. Sent so far: {sent}, failed: {failed}")
         else:
             await update.effective_message.reply_text(f"Broadcast done. Sent: {sent}, failed: {failed}")
         return
 
-    # awaiting rename label
+    # awaiting rename
     if context.user_data.get("awaiting_rename_id"):
         sid = context.user_data.pop("awaiting_rename_id")
         new_label = update.message.text.strip()
@@ -920,7 +878,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("Could not rename saved account (not found or permission).", reply_markup=build_saved_menu())
         return
 
-    # awaiting save interactive flow
+    # awaiting save
     if context.user_data.get("awaiting_save"):
         text = update.message.text.strip()
         parts = text.split(maxsplit=2)
@@ -940,9 +898,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         owner = update.effective_user.id
         badge = get_user_badge(owner)
         current_count = count_saved_accounts(owner)
-        if current_count >= badge['save_slots']:
-            await update.effective_message.reply_text(
-                f"You reached saved limit ({badge['save_slots']}). Remove some or invite to increase.")
+        # interpret infinite as very large number
+        max_slots = badge['save_slots'] if isinstance(badge['save_slots'], int) else 10**9
+        if current_count >= max_slots:
+            await update.effective_message.reply_text(f"You reached saved limit ({badge['save_slots']}). Remove some or invite to increase.")
             context.user_data.pop("awaiting_save", None)
             return
         try:
@@ -953,7 +912,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting_save", None)
         return
 
-    # awaiting username (main menu flows)
+    # awaiting username
     if context.user_data.get("awaiting_username"):
         account = update.message.text.strip().lstrip("@").lower()
         platform = context.user_data.get("platform")
@@ -975,7 +934,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sent = await update.effective_message.reply_text(url.replace("x.com", "fixupx.com"))
                 sent_ids.append(sent.message_id)
                 await asyncio.sleep(0.2)
-            # schedule deletion
             context.job_queue.run_once(delete_message, 86400, data={"chat_id": intro.chat.id, "message_id": intro.message_id})
             for mid in sent_ids:
                 context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.effective_chat.id, "message_id": mid})
@@ -1003,7 +961,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.effective_chat.id, "message_id": mid})
         return
 
-    # saved_send via text (/saved_send <id>)
+    # saved_send via text
     text = update.message.text.strip()
     if text.startswith("/saved_send"):
         parts = text.split()
@@ -1054,7 +1012,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(0.3)
         return
 
-    # saved_remove via text
+    # saved_remove
     if text.startswith("/saved_remove"):
         parts = text.split()
         if len(parts) < 2:
@@ -1073,7 +1031,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("Could not remove saved account.")
         return
 
-    # saved_rename via text
+    # saved_rename
     if text.startswith("/saved_rename"):
         parts = text.split(maxsplit=2)
         if len(parts) < 3:
@@ -1093,7 +1051,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("Could not rename saved account.")
         return
 
-    # save via command text (/save)
+    # save via text
     if text.startswith("/save"):
         parts = text.split(maxsplit=3)
         if len(parts) < 3:
@@ -1112,7 +1070,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         owner = update.effective_user.id
         badge = get_user_badge(owner)
         current_count = count_saved_accounts(owner)
-        if current_count >= badge['save_slots']:
+        max_slots = badge['save_slots'] if isinstance(badge['save_slots'], int) else 10**9
+        if current_count >= max_slots:
             await update.effective_message.reply_text(f"You reached saved limit ({badge['save_slots']}).")
             return
         try:
@@ -1122,7 +1081,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(f"Error saving: {e}")
         return
 
-    # saved_list via command
+    # saved_list
     if text.startswith("/saved_list"):
         owner = update.effective_user.id
         items = list_saved_accounts(owner)
@@ -1141,7 +1100,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(text_out, reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    # default: not a managed command -> show guide
+    # default
     await record_user_and_check_ban(update, context)
     await update.effective_message.reply_text("Use the menu or /help for commands.")
 
@@ -1165,7 +1124,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("export_csv", export_csv_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
 
-    # Saved shortcuts routed to the same message handler (it parses the /save etc. commands)
+    # Saved commands routed to message handler
     app.add_handler(CommandHandler("save", message_handler))
     app.add_handler(CommandHandler("saved_list", message_handler))
     app.add_handler(CommandHandler("saved_send", message_handler))
@@ -1176,12 +1135,8 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    # ================ COMMAND VISIBILITY (hide admin commands from non-admins) ================
+    # set command visibility
     async def set_command_visibility(application):
-        """
-        Runs during application.post_init in the same event loop as the bot.
-        Registers public commands for everyone and admin-only commands per admin private chat.
-        """
         public_cmds = [
             BotCommand("start", "Show welcome / menu"),
             BotCommand("menu", "Open main menu"),
@@ -1220,50 +1175,37 @@ if __name__ == "__main__":
                 except Exception as e2:
                     print(f"[commands] fallback failed: {e2}")
 
-    # robustly combine with any existing post_init value
     existing_post_init = getattr(app, "post_init", None)
-
     if existing_post_init is None:
         app.post_init = set_command_visibility
     else:
-        # create a single coroutine that will call the existing post_init (list/callable) then ours
         async def _combined_post_init(application):
-            # call existing post_init in whichever shape it is
             try:
                 if isinstance(existing_post_init, list):
                     for item in existing_post_init:
-                        try:
-                            res = item(application)
-                            if asyncio.iscoroutine(res):
-                                await res
-                        except Exception as e:
-                            print(f"[post_init] one existing item failed: {e}")
+                        res = item(application)
+                        if asyncio.iscoroutine(res):
+                            await res
                 elif callable(existing_post_init):
                     res = existing_post_init(application)
                     if asyncio.iscoroutine(res):
                         await res
-                else:
-                    print("[post_init] existing_post_init is neither None, list nor callable — skipping it.")
             except Exception as e:
-                print(f"[post_init] existing_post_init wrapper failed: {e}")
-
-            # then call our function
+                print(f"[post_init] existing_post_init failed: {e}")
             try:
                 res2 = set_command_visibility(application)
                 if asyncio.iscoroutine(res2):
                     await res2
             except Exception as e:
                 print(f"[post_init] set_command_visibility failed: {e}")
-
         app.post_init = _combined_post_init
 
     print("[startup] post_init registered")
 
-    # Initialize DB (will log/skip if env not set or if init fails)
+    # Initialize DB (non-fatal)
     try:
         init_tg_db()
     except Exception as e:
-        # log but continue — bot can run without DB, but some features will be disabled
         print(f"[startup] init_tg_db() failed or not available: {e}")
 
     print("🤖 MooreLinkBot (full) started — admin + saved accounts + quick-send + badges enabled")
