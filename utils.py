@@ -12,7 +12,7 @@ import instaloader
 
 # ===================== CONFIG =====================
 DB_URL = os.getenv("DATABASE_URL")                # existing social_posts DB
-TG_DB_URL = os.getenv("USERS_DATABASE_URL")  # new separate DB for tg_users
+TG_DB_URL = os.getenv("USERS_DATABASE_URL")  # separate TG DB
 CACHE_HOURS = 24
 POST_LIMIT = 5
 
@@ -24,26 +24,38 @@ def get_db():
     return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
 
 def get_tg_db():
-    """Connect to a separate Postgres DB used solely for tg_users."""
+    """Connect to a separate Postgres DB used solely for tg_users and saved_accounts."""
     if not TG_DB_URL:
         raise RuntimeError("TG_DATABASE_URL or TG_DB_URL not set")
     return psycopg2.connect(TG_DB_URL, cursor_factory=RealDictCursor)
 
 # ===================== OPTIONAL: INIT TABLES =====================
 def init_tg_db():
-    """Create tg_users table in the separate TG DB if it doesn't exist."""
+    """Create tg_users and saved_accounts tables in the separate TG DB if they don't exist."""
     conn = get_tg_db()
     cur = conn.cursor()
-    # Postgres-compatible schema based on your provided table
+    # tg_users
     cur.execute("""
     CREATE TABLE IF NOT EXISTS tg_users (
         telegram_id BIGINT UNIQUE NOT NULL,
         first_name TEXT,
-        is_active INTEGER DEFAULT 1,     -- 1 = active, 0 = inactive
-        is_banned INTEGER DEFAULT 0,     -- 1 = banned
+        is_active INTEGER DEFAULT 1,
+        is_banned INTEGER DEFAULT 0,
         request_count INTEGER DEFAULT 0,
         last_request_at TIMESTAMP,
         joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    # saved_accounts (each user can save many)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS saved_accounts (
+        id SERIAL PRIMARY KEY,
+        owner_telegram_id BIGINT NOT NULL,
+        platform TEXT NOT NULL,            -- 'x' or 'ig'
+        account_name TEXT NOT NULL,
+        label TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(owner_telegram_id, platform, account_name)
     );
     """)
     conn.commit()
@@ -53,7 +65,6 @@ def init_tg_db():
 def init_social_posts_table_if_needed():
     """(Optional) Create social_posts table in the main DB if you want the cache table auto-created."""
     if not DB_URL:
-        # skip if main DB not configured
         return
     conn = get_db()
     cur = conn.cursor()
@@ -117,7 +128,6 @@ def get_recent_urls(platform: str, account: str) -> list:
 
 # ===================== TELEGRAM USER HELPERS (separate DB) =====================
 def add_or_update_tg_user(telegram_id: int, first_name: str) -> None:
-    """Insert or update a Telegram user in the separate tg_users DB."""
     conn = get_tg_db()
     cur = conn.cursor()
     cur.execute("""
@@ -156,7 +166,6 @@ def set_tg_user_active(telegram_id: int, active: bool) -> None:
     conn.close()
 
 def increment_tg_request_count(telegram_id: int) -> None:
-    """Increment request_count and set last_request_at for auditing / rate-limiting."""
     conn = get_tg_db()
     cur = conn.cursor()
     cur.execute("""
@@ -165,7 +174,6 @@ def increment_tg_request_count(telegram_id: int) -> None:
             last_request_at = NOW()
         WHERE telegram_id = %s
     """, (telegram_id,))
-    # If the user doesn't exist yet, create them with defaults (no first_name)
     if cur.rowcount == 0:
         cur.execute("""
             INSERT INTO tg_users (telegram_id, request_count, last_request_at)
@@ -200,10 +208,74 @@ def list_active_tg_users(limit: Optional[int] = 100) -> List[Dict[str, Any]]:
     conn.close()
     return [dict(r) for r in rows]
 
-# ===================== FETCHERS =====================
+# ===================== SAVED ACCOUNTS HELPERS =====================
+def save_user_account(owner_telegram_id: int, platform: str, account_name: str, label: Optional[str]=None) -> Dict[str, Any]:
+    """
+    Save an account for a user. Returns the saved row dictionary.
+    """
+    platform = platform.lower()
+    account_name = account_name.lstrip('@').lower()
+    conn = get_tg_db()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO saved_accounts (owner_telegram_id, platform, account_name, label)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (owner_telegram_id, platform, account_name) DO UPDATE
+            SET label = COALESCE(EXCLUDED.label, saved_accounts.label)
+            RETURNING *
+        """, (owner_telegram_id, platform, account_name, label))
+        row = cur.fetchone()
+        conn.commit()
+        return dict(row) if row else {}
+    finally:
+        cur.close()
+        conn.close()
+
+def list_saved_accounts(owner_telegram_id: int) -> List[Dict[str, Any]]:
+    conn = get_tg_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, owner_telegram_id, platform, account_name, label, created_at
+        FROM saved_accounts
+        WHERE owner_telegram_id = %s
+        ORDER BY created_at DESC
+    """, (owner_telegram_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_saved_account(owner_telegram_id: int, saved_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_tg_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, owner_telegram_id, platform, account_name, label, created_at
+        FROM saved_accounts
+        WHERE owner_telegram_id = %s AND id = %s
+    """, (owner_telegram_id, saved_id))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return dict(row) if row else None
+
+def remove_saved_account(owner_telegram_id: int, saved_id: int) -> bool:
+    conn = get_tg_db()
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM saved_accounts
+        WHERE owner_telegram_id = %s AND id = %s
+    """, (owner_telegram_id, saved_id))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    return deleted > 0
+
+# ===================== FETCHERS (unchanged) =====================
 NITTER_INSTANCES = [
-    "https://xcancel.com",          # Top one right now, high uptime
-    "https://nitter.net",           # Official, back strong
+    "https://xcancel.com",
+    "https://nitter.net",
     "https://nitter.poast.org",
     "https://nitter.space",
     "https://nuku.trabun.org",
@@ -213,7 +285,6 @@ NITTER_INSTANCES = [
 
 def fetch_x_urls(account: str):
     account = account.lstrip('@').lower()
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -222,16 +293,13 @@ def fetch_x_urls(account: str):
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
-
     for base in NITTER_INSTANCES:
         try:
             url = f"{base}/{account}"
             resp = requests.get(url, headers=headers, timeout=10)
             resp.raise_for_status()
-
             if len(resp.text) < 5000:
                 continue
-
             soup = BeautifulSoup(resp.text, "html.parser")
             urls = []
             for item in soup.select("div.timeline-item"):
@@ -241,84 +309,59 @@ def fetch_x_urls(account: str):
                     full_url = f"https://x.com{clean}"
                     if full_url not in urls:
                         urls.append(full_url)
-
             if urls:
                 print(f"Fetched {len(urls)} tweets from {base} @{account}")
                 return urls[:POST_LIMIT]
-
         except requests.RequestException as e:
             print(f"Nitter fail {base}: {e}")
             time.sleep(2)
-            continue  # try next mirror
-
+            continue
     print(f"No Nitter mirrors available for @{account}")
     return []
 
-# ===================== INSTAGRAM FETCHER =====================
 def fetch_ig_urls(account: str) -> list:
     account = account.lstrip('@').lower()
     posts = []
-
     try:
         L = instaloader.Instaloader()
         profile = instaloader.Profile.from_username(L.context, account)
-
         for i, post in enumerate(profile.get_posts()):
             if i >= POST_LIMIT:
                 break
-
             media_url = post.video_url if post.is_video else post.url
-
             posts.append({
                 "url": f"https://www.instagram.com/p/{post.shortcode}/",
                 "caption": post.caption or "",
                 "media_url": media_url,
                 "is_video": post.is_video
             })
-
         print(f"Fetched {len(posts)} IG posts from @{account}")
-
     except Exception as e:
         print(f"IG fetch error: {e}")
-
     return posts
 
-# ===================== MAIN LOGIC =====================
+# ===================== MAIN LOGIC (unchanged) =====================
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
-    """Main function: DB cache → fresh fetch"""
     account = account.lstrip('@').lower()
-
-    # 1. Try DB cache
     cached_urls = get_recent_urls(platform, account)
     if cached_urls:
         return cached_urls
-
-    # 2. No cache → fetch fresh
     new_urls = []
-
     if platform == "x":
         new_urls = fetch_x_urls(account)
     elif platform == "ig":
         new_urls = fetch_ig_urls(account)
     else:
         return []
-
     if not new_urls:
         return []
-
-    # Save to DB
     for url in new_urls:
         save_url(platform, account, url)
-
-    # Get fresh from DB
     fresh_urls = get_recent_urls(platform, account)
     return fresh_urls
 
 # ===================== INIT TG DB ON IMPORT =====================
-# This will create the tg_users table in the TG DB automatically at import.
-# Comment out if you prefer to run initialization elsewhere.
 try:
     init_tg_db()
 except Exception as e:
-    # don't crash on import if TG DB not configured; surface a helpful message in logs
     print(f"[utils] init_tg_db() skipped or failed: {e}")
