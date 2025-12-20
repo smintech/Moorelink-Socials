@@ -39,7 +39,6 @@ from utils import (
     remove_saved_account,
     count_saved_accounts,
     update_saved_account_label,
-    init_tg_db,
 )
 from functools import wraps
 
@@ -100,6 +99,33 @@ def build_admin_menu():
         [InlineKeyboardButton("↩️ Back", callback_data="menu_main")],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+# Small reusable back/cancel/confirm markups
+def build_back_markup(target="menu_main", label="↩️ Back"):
+    """Simple inline back button to jump to a callback action."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])
+
+def build_cancel_and_back(cancel_cb="admin_broadcast_cancel", back_cb="admin_back"):
+    """Cancel button (for broadcast) plus a Back button."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Cancel", callback_data=cancel_cb)],
+        [InlineKeyboardButton("↩️ Back", callback_data=back_cb)],
+    ])
+
+def build_confirm_markup(action: str, obj_id: Optional[int] = None, yes_label="Confirm", no_label="Cancel"):
+    """
+    action: short token like 'ban', 'unban', 'export_csv'
+    obj_id: optional integer id to include in callback payload
+    Returns markup with Confirm / Cancel.
+    """
+    if obj_id is None:
+        yes_cb = f"confirm_{action}"
+    else:
+        yes_cb = f"confirm_{action}_{obj_id}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(yes_label, callback_data=yes_cb)],
+        [InlineKeyboardButton(no_label, callback_data="admin_back")]
+    ])
 
 # ================ UTIL: CSV ================
 def users_to_csv_bytes(users: List[Dict[str, Any]]) -> bytes:
@@ -200,6 +226,57 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("Admin panel:", reply_markup=build_admin_menu())
 
+# Confirming ban/unban/export commands (via inline buttons)
+@admin_only
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /ban <telegram_id>")
+        return
+    try:
+        tid = int(context.args[0])
+    except:
+        await update.message.reply_text("Invalid id.")
+        return
+    # ask for confirmation
+    await update.message.reply_text(
+        f"Are you sure you want to ban {tid}?",
+        reply_markup=build_confirm_markup("ban", tid)
+    )
+
+@admin_only
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /unban <telegram_id>")
+        return
+    try:
+        tid = int(context.args[0])
+    except:
+        await update.message.reply_text("Invalid id.")
+        return
+    # ask for confirmation
+    await update.message.reply_text(
+        f"Are you sure you want to unban {tid}?",
+        reply_markup=build_confirm_markup("unban", tid)
+    )
+
+@admin_only
+async def export_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # confirmation before exporting potentially large data
+    await update.message.reply_text("Export users to CSV? Confirm to proceed.", reply_markup=build_confirm_markup("export_csv"))
+
+# ================ CANCEL COMMAND ================
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generic cancel: clears any awaiting_* or admin_broadcast states and returns to menu."""
+    user = update.effective_user
+    ctx = context.user_data
+    cleared = []
+    for k in ("admin_broadcast", "awaiting_save", "awaiting_username", "awaiting_rename_id"):
+        if k in ctx:
+            ctx.pop(k, None)
+            cleared.append(k)
+    # respond
+    await update.message.reply_text("Cancelled.", reply_markup=build_main_menu())
+
 # ================ CALLBACKS ================
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -212,19 +289,65 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
+    # -- Confirmation callbacks for admin actions --
+    if data.startswith("confirm_ban_"):
+        if not is_admin(uid):
+            await query.edit_message_text("❌ Admins only.")
+            return
+        _, _, tid_s = data.partition("confirm_ban_")
+        try:
+            tid = int(tid_s)
+        except:
+            await query.edit_message_text("Invalid id.")
+            return
+        ban_tg_user(tid)
+        await query.edit_message_text(f"User {tid} banned.")
+        return
+
+    if data.startswith("confirm_unban_"):
+        if not is_admin(uid):
+            await query.edit_message_text("❌ Admins only.")
+            return
+        _, _, tid_s = data.partition("confirm_unban_")
+        try:
+            tid = int(tid_s)
+        except:
+            await query.edit_message_text("Invalid id.")
+            return
+        unban_tg_user(tid)
+        await query.edit_message_text(f"User {tid} unbanned.")
+        return
+
+    if data == "confirm_export_csv":
+        if not is_admin(uid):
+            await query.edit_message_text("❌ Admins only.")
+            return
+        await query.edit_message_text("Preparing CSV...")
+        users = list_all_tg_users(limit=10000)
+        csv_bytes = users_to_csv_bytes(users)
+        bio = io.BytesIO(csv_bytes)
+        bio.name = "tg_users.csv"
+        try:
+            await context.bot.send_document(chat_id=uid, document=InputFile(bio))
+            await query.edit_message_text("CSV sent.")
+        except Exception as e:
+            await query.edit_message_text(f"Failed to send CSV: {e}")
+        return
+
     # main menu navigation
     if data == "menu_main":
         await query.edit_message_text("Main menu:", reply_markup=build_main_menu())
         return
+
     if data == "menu_x":
         context.user_data["platform"] = "x"
         context.user_data["awaiting_username"] = True
-        await query.edit_message_text("Send the X username (without @):")
+        await query.edit_message_text("Send the X username (without @):", reply_markup=build_back_markup("menu_main"))
         return
     if data == "menu_ig":
         context.user_data["platform"] = "ig"
         context.user_data["awaiting_username"] = True
-        await query.edit_message_text("Send the Instagram username (without @):")
+        await query.edit_message_text("Send the Instagram username (without @):", reply_markup=build_back_markup("menu_main"))
         return
     if data == "help":
         await help_command(update, context)
@@ -236,7 +359,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "saved_add_start":
         context.user_data["awaiting_save"] = True
-        await query.edit_message_text("Send: <platform> <username> [label]\nExample: `x vdm fav`")
+        await query.edit_message_text(
+            "Send: <platform> <username> [label]\nExample: `x vdm fav`",
+            reply_markup=build_back_markup("saved_menu")
+        )
         return
     if data == "saved_list":
         owner = uid
@@ -276,7 +402,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         platform = saved["platform"]
         account = saved["account_name"]
-        await query.edit_message_text(f"Sending latest posts from [{platform}] @{account} ...")
+        await query.edit_message_text(f"Sending latest posts from [{platform}] @{account} ...", reply_markup=build_back_markup("saved_list"))
         await asyncio.sleep(0.5)
         if platform == "x":
             posts = fetch_latest_urls("x", account)
@@ -329,7 +455,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Invalid id.")
             return
         context.user_data["awaiting_rename_id"] = sid
-        await query.edit_message_text("Send the new label for this saved account (single message):")
+        await query.edit_message_text(
+            "Send the new label for this saved account (single message):",
+            reply_markup=build_back_markup("saved_list")
+        )
         return
 
     # ---------------- Admin callbacks ----------------
@@ -362,17 +491,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Admin panel:", reply_markup=build_admin_menu())
             return
         if data == "admin_export_csv":
-            await query.edit_message_text("Preparing CSV...")
-            users = list_all_tg_users(limit=10000)
-            csv_bytes = users_to_csv_bytes(users)
-            bio = io.BytesIO(csv_bytes)
-            bio.name = "tg_users.csv"
-            await context.bot.send_document(chat_id=uid, document=InputFile(bio))
-            await query.edit_message_text("CSV sent.")
+            # ask for confirmation
+            await query.edit_message_text("Export users to CSV? Confirm to proceed.", reply_markup=build_confirm_markup("export_csv"))
             return
         if data == "admin_broadcast_start":
             context.user_data["admin_broadcast"] = True
-            await query.edit_message_text("Send the message to broadcast. Use /cancel to abort.")
+            await query.edit_message_text(
+                "Send the message to broadcast. Use /cancel or press Cancel below to abort.",
+                reply_markup=build_cancel_and_back("admin_broadcast_cancel", "admin_back")
+            )
+            return
+        if data == "admin_broadcast_cancel":
+            # cancel the waiting broadcast prompt
+            context.user_data.pop("admin_broadcast", None)
+            await query.edit_message_text("Broadcast cancelled.", reply_markup=build_admin_menu())
             return
 
     # pagination / posts callbacks (like page_x)
@@ -407,27 +539,42 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================ MESSAGE HANDLER (saved add, rename, broadcast, username flows) ================
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # admin broadcast flow
+    # admin broadcast flow (cooperative & cancelable)
     if context.user_data.get("admin_broadcast"):
         user = update.effective_user
         if not is_admin(user.id):
             context.user_data.pop("admin_broadcast", None)
             await update.message.reply_text("❌ Only admins can broadcast.")
             return
+
         text_to_send = update.message.text
-        await update.message.reply_text("Broadcast starting...")
+        # reassure admin that broadcast started & how to cancel mid-run
+        await update.message.reply_text("Broadcast starting... (send /cancel to abort while it runs)")
         users = list_active_tg_users(limit=10000)
         sent = 0
         failed = 0
+        cancelled = False
+
         for u in users:
+            # allow graceful cancellation while the loop yields (we sleep between sends)
+            if not context.user_data.get("admin_broadcast"):
+                cancelled = True
+                break
             try:
                 await context.bot.send_message(chat_id=u.get("telegram_id"), text=text_to_send)
                 sent += 1
+                # small sleep to yield event loop so /cancel can be received
                 await asyncio.sleep(0.05)
             except Exception:
                 failed += 1
+
+        # clear the flag if it still exists
         context.user_data.pop("admin_broadcast", None)
-        await update.message.reply_text(f"Broadcast done. Sent: {sent}, failed: {failed}")
+
+        if cancelled:
+            await update.message.reply_text(f"Broadcast cancelled. Sent so far: {sent}, failed: {failed}")
+        else:
+            await update.message.reply_text(f"Broadcast done. Sent: {sent}, failed: {failed}")
         return
 
     # awaiting rename label
@@ -519,6 +666,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # saved_send command handler via text (/saved_send <id>)
+    if not update.message or not update.message.text:
+        return
+
     text = update.message.text.strip()
     if text.startswith("/saved_send"):
         parts = text.split()
@@ -654,75 +804,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await record_user_and_check_ban(update, context)
     await update.message.reply_text("Use the menu or /help for commands.")
 
-# ================ QUICK ADMIN COMMANDS ================
-@admin_only
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /ban <telegram_id>")
-        return
-    try:
-        tid = int(context.args[0])
-    except:
-        await update.message.reply_text("Invalid id.")
-        return
-    ban_tg_user(tid)
-    await update.message.reply_text(f"Banned {tid}.")
-
-@admin_only
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /unban <telegram_id>")
-        return
-    try:
-        tid = int(context.args[0])
-    except:
-        await update.message.reply_text("Invalid id.")
-        return
-    unban_tg_user(tid)
-    await update.message.reply_text(f"Unbanned {tid}.")
-
-# ================ COMMAND VISIBILITY (hide admin commands from non-admins) ================
-# ================ COMMAND VISIBILITY (hide admin commands from non-admins) ================
-async def set_command_visibility(application):
-    """
-    Runs during app.post_init so it executes in the same event loop as the bot.
-    Registers public commands for everyone and admin-only commands per admin private chat.
-    """
-    public_cmds = [
-        BotCommand("start", "Show welcome / menu"),
-        BotCommand("menu", "Open main menu"),
-        BotCommand("latest", "Get latest posts for a username"),
-        BotCommand("saved_list", "List your saved usernames"),
-        BotCommand("save", "Save a username for quick sending"),
-        BotCommand("help", "Show help"),
-    ]
-    try:
-        await application.bot.set_my_commands(public_cmds, scope=BotCommandScopeDefault())
-    except Exception as e:
-        print(f"[commands] failed to set public commands: {e}")
-
-    admin_cmds = [
-        BotCommand("admin", "Open admin panel"),
-        BotCommand("ban", "Ban a user (admin only)"),
-        BotCommand("unban", "Unban a user (admin only)"),
-        BotCommand("broadcast", "Start a broadcast (admin only)"),
-        BotCommand("export_csv", "Export users CSV (admin only)"),
-    ]
-
-    for admin_id in ADMIN_IDS:
-        # try to set commands scoped to the admin's private chat
-        try:
-            scope = BotCommandScopeChat(chat_id=admin_id)
-            await application.bot.set_my_commands(admin_cmds, scope=scope)
-            print(f"[commands] admin commands set for private chat {admin_id}")
-        except Exception as e:
-            # fallback: try setting admin commands as default (safe fallback)
-            print(f"[commands] failed to set admin commands for {admin_id}: {e}. Falling back to default scope.")
-            try:
-                await application.bot.set_my_commands(admin_cmds, scope=BotCommandScopeDefault())
-            except Exception as e2:
-                print(f"[commands] fallback failed: {e2}")
-
 # ================ REGISTER & RUN ================
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -734,6 +815,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("ban", ban_command))
     app.add_handler(CommandHandler("unban", unban_command))
+    app.add_handler(CommandHandler("export_csv", export_csv_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
 
     # Saved shortcuts routed to the same message handler (it parses the /save etc. commands)
     app.add_handler(CommandHandler("save", message_handler))
@@ -746,28 +829,22 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
+    # Correctly attach post_init regardless of whether it's None, a callable, or a list
     existing_post_init = getattr(app, "post_init", None)
-    
+
     if existing_post_init is None:
-        app.post_init = set_command_visibility
-        
+        # Some versions expect a list of callables
+        app.post_init = [set_command_visibility]
+    elif isinstance(existing_post_init, list):
+        existing_post_init.append(set_command_visibility)
+    elif callable(existing_post_init):
+        # convert to list of callables
+        app.post_init = [existing_post_init, set_command_visibility]
     else:
-        if callable(existing_post_init):
-            async def _combined_post_init(application):
-                try:
-                    await existing_post_init(application)
-                except Exception as e:
-                    print(f"[post_init] existing_post_init failed: {e}")
-                try:
-                    await set_command_visibility(application)
-                except Exception as e:
-                    print(f"[post_init] set_command_visibility failed: {e}")
-            app.post_init = _combined_post_init
-        else:
-            app.post_init = set_command_visibility
-            
+        app.post_init = [set_command_visibility]
+
     print("[startup] post_init registered")
 
-    init_tg_db()
+    # Initialize DB (will log/skip if env not set)
     print("🤖 MooreLinkBot (full) started — admin + saved accounts + quick-send enabled")
     app.run_polling(drop_pending_updates=True)
