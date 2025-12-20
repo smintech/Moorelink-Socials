@@ -829,19 +829,76 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
+# ================ COMMAND VISIBILITY (hide admin commands from non-admins) ================
+async def set_command_visibility(application):
+    """
+    Runs during app.post_init so it executes in the same event loop as the bot.
+    Registers public commands for everyone and admin-only commands per admin private chat.
+    """
+    public_cmds = [
+        BotCommand("start", "Show welcome / menu"),
+        BotCommand("menu", "Open main menu"),
+        BotCommand("latest", "Get latest posts for a username"),
+        BotCommand("saved_list", "List your saved usernames"),
+        BotCommand("save", "Save a username for quick sending"),
+        BotCommand("help", "Show help"),
+    ]
+    try:
+        await application.bot.set_my_commands(public_cmds, scope=BotCommandScopeDefault())
+    except Exception as e:
+        print(f"[commands] failed to set public commands: {e}")
+
+    admin_cmds = [
+        BotCommand("admin", "Open admin panel"),
+        BotCommand("ban", "Ban a user (admin only)"),
+        BotCommand("unban", "Unban a user (admin only)"),
+        BotCommand("broadcast", "Start a broadcast (admin only)"),
+        BotCommand("export_csv", "Export users CSV (admin only)"),
+    ]
+
+    for admin_id in ADMIN_IDS:
+        try:
+            scope = BotCommandScopeChat(chat_id=admin_id)
+            await application.bot.set_my_commands(admin_cmds, scope=scope)
+            print(f"[commands] admin commands set for private chat {admin_id}")
+        except Exception as e:
+            print(f"[commands] failed to set admin commands for {admin_id}: {e}. Falling back to default scope.")
+            try:
+                await application.bot.set_my_commands(admin_cmds, scope=BotCommandScopeDefault())
+            except Exception as e2:
+                print(f"[commands] fallback failed: {e2}")
+
+    # Correctly attach post_init regardless of whether it's None, a callable, or a list
     # Correctly attach post_init regardless of whether it's None, a callable, or a list
     existing_post_init = getattr(app, "post_init", None)
 
+    # Ensure the set_command_visibility function is defined above this block
     if existing_post_init is None:
-        # Some versions expect a list of callables
-        app.post_init = [set_command_visibility]
+        # Many versions expect a coroutine function — store as callable
+        app.post_init = set_command_visibility
     elif isinstance(existing_post_init, list):
+        # if it's a list, append our callable
         existing_post_init.append(set_command_visibility)
+        app.post_init = existing_post_init
     elif callable(existing_post_init):
-        # convert to list of callables
-        app.post_init = [existing_post_init, set_command_visibility]
+        # If it's a single callable, wrap both into a combined coroutine
+        async def _combined_post_init(application):
+            try:
+                result = existing_post_init(application)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                print(f"[post_init] existing_post_init failed: {e}")
+            try:
+                result2 = set_command_visibility(application)
+                if asyncio.iscoroutine(result2):
+                    await result2
+            except Exception as e:
+                print(f"[post_init] set_command_visibility failed: {e}")
+        app.post_init = _combined_post_init
     else:
-        app.post_init = [set_command_visibility]
+        # fallback: set to our callable
+        app.post_init = set_command_visibility
 
     print("[startup] post_init registered")
 
