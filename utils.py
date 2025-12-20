@@ -75,14 +75,22 @@ def init_tg_db():
         );
         """)
         
-        # Optional: Add foreign key for data integrity (safe with IF NOT EXISTS in newer PostgreSQL)
-        cur.execute("""
-        ALTER TABLE saved_accounts 
-        ADD CONSTRAINT IF NOT EXISTS fk_saved_owner 
-        FOREIGN KEY (owner_telegram_id) 
-        REFERENCES tg_users(telegram_id) 
-        ON DELETE CASCADE;
-        """)
+        # Foreign key - safe for older PostgreSQL versions (no "IF NOT EXISTS" for constraints)
+        try:
+            cur.execute("""
+            ALTER TABLE saved_accounts 
+            ADD CONSTRAINT fk_saved_owner 
+            FOREIGN KEY (owner_telegram_id) 
+            REFERENCES tg_users(telegram_id) 
+            ON DELETE CASCADE;
+            """)
+            print("[DB] Foreign key constraint added.")
+        except Exception as fk_e:
+            # Ignore if constraint already exists (PostgreSQL raises error if duplicate)
+            if "already exists" in str(fk_e).lower() or "duplicate" in str(fk_e).lower():
+                print("[DB] Foreign key constraint already exists.")
+            else:
+                print(f"[DB] Could not add foreign key (non-critical): {fk_e}")
         
         conn.commit()
         print("[DB] All tables created/verified successfully.")
@@ -91,7 +99,6 @@ def init_tg_db():
     except Exception as e:
         print(f"[DB ERROR] Failed to initialize tables: {e}")
         logging.error(f"Database initialization failed: {e}")
-        # Do NOT raise — bot should start even if DB fails (as per your original code)
     finally:
         try:
             cur.close()
