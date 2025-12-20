@@ -746,7 +746,10 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     # set per-user command visibility BEFORE starting polling
-    app.post_init.append(set_command_visibility)
+    # ensure post_init exists and register the coroutine to run after initialization
+    if getattr(app, "post_init", None) is None:
+        app.post_init = []
+        app.post_init.append(set_command_visibility)
 
     print("🤖 MooreLinkBot (full) started — admin + saved accounts + quick-send enabled")
     app.run_polling(drop_pending_updates=True)
