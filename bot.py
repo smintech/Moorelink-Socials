@@ -4,6 +4,8 @@ import asyncio
 import io
 import csv
 from typing import Optional, List, Dict, Any
+from functools import wraps
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -23,6 +25,7 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction
 
+# utils: make sure your utils.py exports these functions (and init_tg_db if you use DB)
 from utils import (
     fetch_latest_urls,
     fetch_ig_urls,
@@ -39,8 +42,8 @@ from utils import (
     remove_saved_account,
     count_saved_accounts,
     update_saved_account_label,
+    init_tg_db,
 )
-from functools import wraps
 
 # ================ CONFIG ================
 TELEGRAM_TOKEN = os.getenv("BOTTOKEN")
@@ -217,7 +220,51 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(help_text)
 
-# ================ ADMIN ================
+# quick /latest that accepts args or asks for username (small convenience)
+async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /latest x|ig username  OR run command and follow prompt"""
+    allowed = await record_user_and_check_ban(update, context)
+    if not allowed:
+        await update.message.reply_text("🚫 You are banned.")
+        return
+
+    args = context.args or []
+    if len(args) >= 2:
+        platform = args[0].lower()
+        account = args[1].lstrip('@').lower()
+        await update.message.chat.send_action(ChatAction.TYPING)
+        if platform in ("twitter",):
+            platform = "x"
+        if platform == "x":
+            posts = fetch_latest_urls("x", account)
+            if not posts:
+                await update.message.reply_text(f"No recent public posts for @{account} on X.")
+                return
+            for url in posts:
+                await update.message.reply_text(url.replace("x.com", "fixupx.com"))
+        else:
+            posts = fetch_ig_urls(account)
+            if not posts:
+                await update.message.reply_text(f"No recent IG posts for @{account}.")
+                return
+            for post in posts:
+                caption = post.get("caption", "")[:1024]
+                msg = f"<a href='{post['url']}'>View on IG</a>\n\n{caption}"
+                try:
+                    if post.get("is_video"):
+                        await update.message.reply_video(post["media_url"], caption=msg, parse_mode="HTML")
+                    else:
+                        await update.message.reply_photo(post["media_url"], caption=msg, parse_mode="HTML")
+                except:
+                    await update.message.reply_text(msg, parse_mode="HTML")
+        return
+
+    # otherwise prompt and set awaiting_username state (default platform x)
+    context.user_data["awaiting_username"] = True
+    context.user_data["platform"] = "x"
+    await update.message.reply_text("Send username (without @) — default platform X. Use /cancel to abort.", reply_markup=build_back_markup("menu_main"))
+
+# ================ ADMIN (with confirmations) ================
 @admin_only
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -226,7 +273,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("Admin panel:", reply_markup=build_admin_menu())
 
-# Confirming ban/unban/export commands (via inline buttons)
 @admin_only
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -301,7 +347,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Invalid id.")
             return
         ban_tg_user(tid)
-        await query.edit_message_text(f"User {tid} banned.")
+        await query.edit_message_text(f"User {tid} banned.", reply_markup=build_admin_menu())
         return
 
     if data.startswith("confirm_unban_"):
@@ -315,7 +361,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Invalid id.")
             return
         unban_tg_user(tid)
-        await query.edit_message_text(f"User {tid} unbanned.")
+        await query.edit_message_text(f"User {tid} unbanned.", reply_markup=build_admin_menu())
         return
 
     if data == "confirm_export_csv":
@@ -539,6 +585,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================ MESSAGE HANDLER (saved add, rename, broadcast, username flows) ================
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ignore empty messages
+    if not update.message or not update.message.text:
+        return
+
     # admin broadcast flow (cooperative & cancelable)
     if context.user_data.get("admin_broadcast"):
         user = update.effective_user
@@ -584,9 +634,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         owner = update.effective_user.id
         ok = update_saved_account_label(owner, sid, new_label)
         if ok:
-            await update.message.reply_text(f"Saved account {sid} renamed to: {new_label}")
+            await update.message.reply_text(f"Saved account {sid} renamed to: {new_label}", reply_markup=build_saved_menu())
         else:
-            await update.message.reply_text("Could not rename saved account (not found or permission).")
+            await update.message.reply_text("Could not rename saved account (not found or permission).", reply_markup=build_saved_menu())
         return
 
     # awaiting save interactive flow
@@ -614,9 +664,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             saved = save_user_account(owner, platform, account, label)
-            await update.message.reply_text(f"Saved {platform} @{account} (id: {saved.get('id')})")
+            await update.message.reply_text(f"Saved {platform} @{account} (id: {saved.get('id')})", reply_markup=build_saved_menu())
         except Exception as e:
-            await update.message.reply_text(f"Error saving: {e}")
+            await update.message.reply_text(f"Error saving: {e}", reply_markup=build_saved_menu())
         context.user_data.pop("awaiting_save", None)
         return
 
@@ -631,7 +681,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not posts:
                 await update.message.reply_text(f"No recent public posts for @{account} on X.")
                 return
-            intro = await update.message.reply_text(f"Latest posts from @{account} on X:")
+            intro = await update.message.reply_text(f"Latest posts from @{account} on X:", reply_markup=build_back_markup("menu_main"))
             sent_ids = []
             for url in posts:
                 sent = await update.message.reply_text(url.replace("x.com", "fixupx.com"))
@@ -646,7 +696,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not posts:
                 await update.message.reply_text(f"No recent IG posts for @{account}.")
                 return
-            intro = await update.message.reply_text(f"Latest IG posts from @{account}:")
+            intro = await update.message.reply_text(f"Latest IG posts from @{account}:", reply_markup=build_back_markup("menu_main"))
             sent_ids = []
             for post in posts:
                 caption = post.get("caption", "")[:1024]
@@ -665,10 +715,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.job_queue.run_once(delete_message, 86400, data={"chat_id": update.message.chat.id, "message_id": mid})
         return
 
-    # saved_send command handler via text (/saved_send <id>)
-    if not update.message or not update.message.text:
-        return
-
+    # saved_send via text (/saved_send <id>)
     text = update.message.text.strip()
     if text.startswith("/saved_send"):
         parts = text.split()
@@ -812,6 +859,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("latest", latest_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("ban", ban_command))
     app.add_handler(CommandHandler("unban", unban_command))
@@ -829,79 +877,90 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-# ================ COMMAND VISIBILITY (hide admin commands from non-admins) ================
-async def set_command_visibility(application):
-    """
-    Runs during app.post_init so it executes in the same event loop as the bot.
-    Registers public commands for everyone and admin-only commands per admin private chat.
-    """
-    public_cmds = [
-        BotCommand("start", "Show welcome / menu"),
-        BotCommand("menu", "Open main menu"),
-        BotCommand("latest", "Get latest posts for a username"),
-        BotCommand("saved_list", "List your saved usernames"),
-        BotCommand("save", "Save a username for quick sending"),
-        BotCommand("help", "Show help"),
-    ]
-    try:
-        await application.bot.set_my_commands(public_cmds, scope=BotCommandScopeDefault())
-    except Exception as e:
-        print(f"[commands] failed to set public commands: {e}")
-
-    admin_cmds = [
-        BotCommand("admin", "Open admin panel"),
-        BotCommand("ban", "Ban a user (admin only)"),
-        BotCommand("unban", "Unban a user (admin only)"),
-        BotCommand("broadcast", "Start a broadcast (admin only)"),
-        BotCommand("export_csv", "Export users CSV (admin only)"),
-    ]
-
-    for admin_id in ADMIN_IDS:
+    # ================ COMMAND VISIBILITY (hide admin commands from non-admins) ================
+    async def set_command_visibility(application):
+        """
+        Runs during application.post_init in the same event loop as the bot.
+        Registers public commands for everyone and admin-only commands per admin private chat.
+        """
+        public_cmds = [
+            BotCommand("start", "Show welcome / menu"),
+            BotCommand("menu", "Open main menu"),
+            BotCommand("latest", "Get latest posts for a username"),
+            BotCommand("saved_list", "List your saved usernames"),
+            BotCommand("save", "Save a username for quick sending"),
+            BotCommand("help", "Show help"),
+        ]
         try:
-            scope = BotCommandScopeChat(chat_id=admin_id)
-            await application.bot.set_my_commands(admin_cmds, scope=scope)
-            print(f"[commands] admin commands set for private chat {admin_id}")
+            await application.bot.set_my_commands(public_cmds, scope=BotCommandScopeDefault())
         except Exception as e:
-            print(f"[commands] failed to set admin commands for {admin_id}: {e}. Falling back to default scope.")
-            try:
-                await application.bot.set_my_commands(admin_cmds, scope=BotCommandScopeDefault())
-            except Exception as e2:
-                print(f"[commands] fallback failed: {e2}")
+            print(f"[commands] failed to set public commands: {e}")
 
-    # Correctly attach post_init regardless of whether it's None, a callable, or a list
-    # Correctly attach post_init regardless of whether it's None, a callable, or a list
+        admin_cmds = [
+            BotCommand("admin", "Open admin panel"),
+            BotCommand("ban", "Ban a user (admin only)"),
+            BotCommand("unban", "Unban a user (admin only)"),
+            BotCommand("broadcast", "Start a broadcast (admin only)"),
+            BotCommand("export_csv", "Export users CSV (admin only)"),
+        ]
+
+        for admin_id in ADMIN_IDS:
+            try:
+                scope = BotCommandScopeChat(chat_id=admin_id)
+                await application.bot.set_my_commands(admin_cmds, scope=scope)
+                print(f"[commands] admin commands set for private chat {admin_id}")
+            except Exception as e:
+                print(f"[commands] failed to set admin commands for {admin_id}: {e}. Falling back to default scope.")
+                try:
+                    await application.bot.set_my_commands(admin_cmds, scope=BotCommandScopeDefault())
+                except Exception as e2:
+                    print(f"[commands] fallback failed: {e2}")
+
+    # robustly combine with any existing post_init value
     existing_post_init = getattr(app, "post_init", None)
 
-    # Ensure the set_command_visibility function is defined above this block
     if existing_post_init is None:
-        # Many versions expect a coroutine function — store as callable
         app.post_init = set_command_visibility
-    elif isinstance(existing_post_init, list):
-        # if it's a list, append our callable
-        existing_post_init.append(set_command_visibility)
-        app.post_init = existing_post_init
-    elif callable(existing_post_init):
-        # If it's a single callable, wrap both into a combined coroutine
+    else:
+        # create a single coroutine that will call the existing post_init (list/callable) then ours
         async def _combined_post_init(application):
+            # call existing post_init in whichever shape it is
             try:
-                result = existing_post_init(application)
-                if asyncio.iscoroutine(result):
-                    await result
+                if isinstance(existing_post_init, list):
+                    for item in existing_post_init:
+                        try:
+                            res = item(application)
+                            if asyncio.iscoroutine(res):
+                                await res
+                        except Exception as e:
+                            print(f"[post_init] one existing item failed: {e}")
+                elif callable(existing_post_init):
+                    res = existing_post_init(application)
+                    if asyncio.iscoroutine(res):
+                        await res
+                else:
+                    print("[post_init] existing_post_init is neither None, list nor callable — skipping it.")
             except Exception as e:
-                print(f"[post_init] existing_post_init failed: {e}")
+                print(f"[post_init] existing_post_init wrapper failed: {e}")
+
+            # then call our function
             try:
-                result2 = set_command_visibility(application)
-                if asyncio.iscoroutine(result2):
-                    await result2
+                res2 = set_command_visibility(application)
+                if asyncio.iscoroutine(res2):
+                    await res2
             except Exception as e:
                 print(f"[post_init] set_command_visibility failed: {e}")
+
         app.post_init = _combined_post_init
-    else:
-        # fallback: set to our callable
-        app.post_init = set_command_visibility
 
     print("[startup] post_init registered")
 
-    # Initialize DB (will log/skip if env not set)
+    # Initialize DB (will log/skip if env not set or if init fails)
+    try:
+        init_tg_db()
+    except Exception as e:
+        # log but continue — bot can run without DB, but some features will be disabled
+        print(f"[startup] init_tg_db() failed or not available: {e}")
+
     print("🤖 MooreLinkBot (full) started — admin + saved accounts + quick-send enabled")
     app.run_polling(drop_pending_updates=True)
