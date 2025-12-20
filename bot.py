@@ -51,7 +51,7 @@ if not TELEGRAM_TOKEN:
     raise ValueError("BOTTOKEN env var not set")
 
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-MAX_SAVED_PER_USER = 10
+MAX_SAVED_PER_USER = 5
 
 POSTS_PER_PAGE = 5
 PAGE_SIZE_USERS = 10
@@ -818,8 +818,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = parts[3] if len(parts) == 4 else None
         owner = update.effective_user.id
         current_count = count_saved_accounts(owner)
-        if current_count >= MAX_SAVED_PER_USER:
-            await update.message.reply_text(f"You've reached the saved limit ({MAX_SAVED_PER_USER}).")
+        if not is_admin(owner) and current_count >= MAX_SAVED_PER_USER:
+            await update.message.reply_text(f"You reached saved limit ({MAX_SAVED_PER_USER}).")
             return
         try:
             saved = save_user_account(owner, platform, account, label)
