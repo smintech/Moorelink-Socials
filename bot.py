@@ -11,7 +11,7 @@ from telegram import (
     InputFile,
     BotCommand,
     BotCommandScopeDefault,
-    BotCommandScopeChatMember,
+    BotCommandScopeChat,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -681,8 +681,12 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Unbanned {tid}.")
 
 # ================ COMMAND VISIBILITY (hide admin commands from non-admins) ================
-async def set_command_visibility(app):
-    """Register public commands for everyone and admin-only commands per admin private chat."""
+# ================ COMMAND VISIBILITY (hide admin commands from non-admins) ================
+async def set_command_visibility(application):
+    """
+    Runs during app.post_init so it executes in the same event loop as the bot.
+    Registers public commands for everyone and admin-only commands per admin private chat.
+    """
     public_cmds = [
         BotCommand("start", "Show welcome / menu"),
         BotCommand("menu", "Open main menu"),
@@ -691,7 +695,10 @@ async def set_command_visibility(app):
         BotCommand("save", "Save a username for quick sending"),
         BotCommand("help", "Show help"),
     ]
-    await app.bot.set_my_commands(public_cmds, scope=BotCommandScopeDefault())
+    try:
+        await application.bot.set_my_commands(public_cmds, scope=BotCommandScopeDefault())
+    except Exception as e:
+        print(f"[commands] failed to set public commands: {e}")
 
     admin_cmds = [
         BotCommand("admin", "Open admin panel"),
@@ -700,14 +707,20 @@ async def set_command_visibility(app):
         BotCommand("broadcast", "Start a broadcast (admin only)"),
         BotCommand("export_csv", "Export users CSV (admin only)"),
     ]
-    # set commands for each admin in their private scope
+
     for admin_id in ADMIN_IDS:
+        # try to set commands scoped to the admin's private chat
         try:
-            scope = BotCommandScopeChatMember(chat_id=admin_id, user_id=admin_id)
-            await app.bot.set_my_commands(admin_cmds, scope=scope)
+            scope = BotCommandScopeChat(chat_id=admin_id)
+            await application.bot.set_my_commands(admin_cmds, scope=scope)
+            print(f"[commands] admin commands set for private chat {admin_id}")
         except Exception as e:
-            # don't crash startup if one fails
-            print(f"[commands] failed to set admin commands for {admin_id}: {e}")
+            # fallback: try setting admin commands as default (safe fallback)
+            print(f"[commands] failed to set admin commands for {admin_id}: {e}. Falling back to default scope.")
+            try:
+                await application.bot.set_my_commands(admin_cmds, scope=BotCommandScopeDefault())
+            except Exception as e2:
+                print(f"[commands] fallback failed: {e2}")
 
 # ================ REGISTER & RUN ================
 if __name__ == "__main__":
@@ -733,10 +746,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     # set per-user command visibility BEFORE starting polling
-    try:
-        asyncio.run(set_command_visibility(app))
-    except Exception as e:
-        print(f"[startup] set_command_visibility failed: {e}")
+    app.post_init.append(set_command_visibility)
 
     print("🤖 MooreLinkBot (full) started — admin + saved accounts + quick-send enabled")
     app.run_polling(drop_pending_updates=True)
