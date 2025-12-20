@@ -1,4 +1,5 @@
 import os
+import logging
 import hashlib
 import requests
 import time
@@ -28,47 +29,75 @@ def get_tg_db():
 
 # ================ INIT TABLES ================
 def init_tg_db():
-    conn = get_tg_db()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS tg_users (
-        id SERIAL PRIMARY KEY,
-        telegram_id BIGINT UNIQUE NOT NULL,
-        first_name TEXT,
-        is_active INTEGER DEFAULT 1,
-        is_banned INTEGER DEFAULT 0,
-        request_count INTEGER DEFAULT 0,
-        last_request_at TIMESTAMP,
-        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        invite_count INTEGER DEFAULT 0,
-        is_admin INTEGER DEFAULT 0
-    );
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS saved_accounts (
-        id SERIAL PRIMARY KEY,
-        owner_telegram_id BIGINT NOT NULL,
-        platform TEXT NOT NULL,            -- 'x' or 'ig'
-        account_name TEXT NOT NULL,
-        label TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(owner_telegram_id, platform, account_name)
-    );
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS tg_rate_limits (
-        telegram_id BIGINT PRIMARY KEY,
-        minute_count INTEGER DEFAULT 0,
-        hour_count INTEGER DEFAULT 0,
-        day_count INTEGER DEFAULT 0,
-        minute_reset TIMESTAMP,
-        hour_reset TIMESTAMP,
-        day_reset TIMESTAMP
-    );
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        conn = get_tg_db()
+        cur = conn.cursor()
+        
+        # tg_users table
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS tg_users (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE NOT NULL,
+            first_name TEXT,
+            is_active INTEGER DEFAULT 1,
+            is_banned INTEGER DEFAULT 0,
+            request_count INTEGER DEFAULT 0,
+            last_request_at TIMESTAMP,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            invite_count INTEGER DEFAULT 0,
+            is_admin INTEGER DEFAULT 0
+        );
+        """)
+        
+        # saved_accounts table
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS saved_accounts (
+            id SERIAL PRIMARY KEY,
+            owner_telegram_id BIGINT NOT NULL,
+            platform TEXT NOT NULL CHECK (platform IN ('x', 'ig')),
+            account_name TEXT NOT NULL,
+            label TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(owner_telegram_id, platform, account_name)
+        );
+        """)
+        
+        # tg_rate_limits table
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS tg_rate_limits (
+            telegram_id BIGINT PRIMARY KEY,
+            minute_count INTEGER DEFAULT 0,
+            hour_count INTEGER DEFAULT 0,
+            day_count INTEGER DEFAULT 0,
+            minute_reset TIMESTAMP,
+            hour_reset TIMESTAMP,
+            day_reset TIMESTAMP
+        );
+        """)
+        
+        # Optional: Add foreign key for data integrity (safe with IF NOT EXISTS in newer PostgreSQL)
+        cur.execute("""
+        ALTER TABLE saved_accounts 
+        ADD CONSTRAINT IF NOT EXISTS fk_saved_owner 
+        FOREIGN KEY (owner_telegram_id) 
+        REFERENCES tg_users(telegram_id) 
+        ON DELETE CASCADE;
+        """)
+        
+        conn.commit()
+        print("[DB] All tables created/verified successfully.")
+        logging.info("Database tables initialized successfully.")
+        
+    except Exception as e:
+        print(f"[DB ERROR] Failed to initialize tables: {e}")
+        logging.error(f"Database initialization failed: {e}")
+        # Do NOT raise — bot should start even if DB fails (as per your original code)
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except:
+            pass
 
 def init_social_posts_table_if_needed():
     if not DB_URL:
