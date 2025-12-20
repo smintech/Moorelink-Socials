@@ -14,8 +14,8 @@ import instaloader
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
 TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separate TG DB
-CACHE_HOURS = int(os.getenv("CACHE_HOURS", "24"))
-POST_LIMIT = int(os.getenv("POST_LIMIT", "5"))
+CACHE_HOURS = 24
+POST_LIMIT = 5
 
 # ================ DB CONNECTIONS ============
 def get_db():
@@ -652,7 +652,7 @@ def set_admin(telegram_id: int, is_admin: bool) -> None:
     except Exception:
         logging.debug("set_admin failed", exc_info=True)
 
-# ================ COOLDOWN HELPERS ================
+# ================ COOLDOWN HELPERS (ONLY FOR FETCH REQUESTS) ================
 def get_rate_limits(telegram_id: int) -> Dict[str, Any]:
     try:
         conn = get_tg_db()
@@ -717,12 +717,14 @@ def reset_cooldown(telegram_id: int) -> None:
 def check_and_increment_cooldown(telegram_id: int) -> Optional[str]:
     """
     Returns None if allowed, else a block message string.
+    ONLY called when a real fetch (X/IG posts) is about to happen.
     """
     user = get_tg_user(telegram_id)
     if user and int(user.get('is_banned', 0)) == 1:
         return "You are banned."
     badge = get_user_badge(telegram_id)
     if badge['name'] == 'Admin':
+        # Admins bypass cooldown but still count as activity
         increment_tg_request_count(telegram_id)
         return None
 
@@ -778,7 +780,7 @@ def check_and_increment_cooldown(telegram_id: int) -> Optional[str]:
     rl['day_count'] = int(rl.get('day_count', 0)) + 1
 
     update_rate_limits(telegram_id, rl)
-    increment_tg_request_count(telegram_id)
+    increment_tg_request_count(telegram_id)  # Still track general activity
     return None
 
 # ================ ADMIN HELPERS ================
