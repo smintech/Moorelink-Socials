@@ -39,6 +39,7 @@ from utils import (
     remove_saved_account,
     count_saved_accounts,
     update_saved_account_label,
+    init_tg_db,
 )
 from functools import wraps
 
@@ -745,11 +746,28 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    # set per-user command visibility BEFORE starting polling
-    # ensure post_init exists and register the coroutine to run after initialization
-    if getattr(app, "post_init", None) is None:
-        app.post_init = []
-        app.post_init.append(set_command_visibility)
+    existing_post_init = getattr(app, "post_init", None)
+    
+    if existing_post_init is None:
+        app.post_init = set_command_visibility
+        
+    else:
+        if callable(existing_post_init):
+            async def _combined_post_init(application):
+                try:
+                    await existing_post_init(application)
+                except Exception as e:
+                    print(f"[post_init] existing_post_init failed: {e}")
+                try:
+                    await set_command_visibility(application)
+                except Exception as e:
+                    print(f"[post_init] set_command_visibility failed: {e}")
+            app.post_init = _combined_post_init
+        else:
+            app.post_init = set_command_visibility
+            
+    print("[startup] post_init registered")
 
+    init_tg_db()
     print("🤖 MooreLinkBot (full) started — admin + saved accounts + quick-send enabled")
     app.run_polling(drop_pending_updates=True)
