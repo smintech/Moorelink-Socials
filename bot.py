@@ -233,17 +233,33 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("🚫 You are banned.")
         return
     help_text = (
-        "Guide:\n"
-        "/save <platform> <username> [label]\n"
-        "/saved_list\n"
-        "/saved_send <id>\n"
-        "/saved_remove <id>\n"
-        "/saved_rename <id> <new label>\n"
-        "/dashboard - Show your badge, invites, etc.\n"
-        "/benefits - See badge levels\n"
-        "/leaderboard - Top inviters\n\n"
-        "Use the Saved menu for one-tap actions."
-    )
+    "🔥 <b>Welcome to MooreLinkBot – Your Ultimate Social Media Tracker!</b> 🔥\n\n"
+    
+    "Get the latest posts from X (Twitter) & Instagram instantly – no login needed! "
+    "Save your favorite accounts for one-tap access, climb the ranks with invites, and unlock unlimited power 💎\n\n"
+    
+    "<b>🚀 Quick Commands</b>\n"
+    "• /save &lt;platform&gt; &lt;username&gt; [label] → Save an account for lightning-fast access\n"
+    "   Example: <code>/save x elonmusk My GOAT</code>\n"
+    "• /saved_list → View all your saved accounts\n"
+    "• /saved_send &lt;id&gt; → Instantly fetch latest posts from a saved account\n"
+    "• /saved_remove &lt;id&gt; → Delete a saved account\n"
+    "• /saved_rename &lt;id&gt; &lt;new label&gt; → Give it a cool nickname\n\n"
+    
+    "<b>📊 Track Your Progress</b>\n"
+    "• /dashboard → See your badge 🏅, invites 📨, save slots 📦, and speed limits ⚡\n"
+    "• /benefits → Full breakdown of what each badge unlocks\n"
+    "• /leaderboard → Check the top inviters – will YOU claim the throne? 👑\n\n"
+    
+    "<b>💥 Pro Tip: Invite Friends = Power Up!</b>\n"
+    "Every person who joins using <b>your personal invite link</b> boosts your invite count.\n"
+    "Higher invites = higher badge = MORE saved slots + FASTER fetching (no waiting!)\n"
+    "Reach Diamond 💎 for <u>unlimited everything</u> – no cooldowns, infinite saves!\n\n"
+    
+    "Your invite link is in /dashboard. Share it everywhere – groups, bio, stories – and watch your power grow! 🚀\n\n"
+    
+    "<i>Best way to use me? Tap the menu button below for one-tap magic! ✨</i>"
+)
     await update.effective_message.reply_text(help_text)
 
 async def benefits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -251,12 +267,23 @@ async def benefits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed:
         await update.effective_message.reply_text("🚫 You are banned.")
         return
-    text = "Badge benefits:\n\n"
-    for level in BADGE_LEVELS:
-        text += f"{level['emoji']} {level['name']}\n"
-        text += f"• Save slots: {level['save_slots']}\n"
-        limits = level.get('limits', {})
-        text += f"• Limits: {limits.get('min','∞')}/min, {limits.get('hour','∞')}/hr, {limits.get('day','∞')}/day\n\n"
+    text = (
+    "🏆 <b>Badge Levels & Perks</b> 🏆\n\n"
+    "Invite friends → level up → get massive boosts!\n\n"
+    )
+    for level in BADGE_LEVELS[:-1]:
+        slots = "Unlimited ♾️" if isinstance(level['save_slots'], float) and math.isinf(level['save_slots']) else level['save_slots']
+        min_lim = "Unlimited ♾️" if isinstance(level['limits']['min'], float) and math.isinf(level['limits']['min']) else level['limits']['min']
+        hour_lim = "Unlimited ♾️" if isinstance(level['limits']['hour'], float) and math.isinf(level['limits']['hour']) else level['limits']['hour']
+        day_lim = "Unlimited ♾️" if isinstance(level['limits']['day'], float) and math.isinf(level['limits']['day']) else level['limits']['day']
+        
+        text += f"{level['emoji']} <b>{level['name']}</b> ({level.get('invites_needed', 0)} invites needed)\n"
+        text += f"• Save slots: {slots}\n"
+        text += f"• Speed: {min_lim}/min | {hour_lim}/hour | {day_lim}/day\n\n"
+        
+    text += "💎 <b>Diamond</b>: Truly unlimited – fetch as much as you want, save everything! 👑\n\n"
+    text += "<i>Share your invite link (in /dashboard) and climb the ranks today! 🚀</i>"
+
     await update.effective_message.reply_text(text)
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
