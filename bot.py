@@ -65,6 +65,7 @@ from utils import (
     is_post_new,
     mark_posts_seen,
     call_social_ai,
+    fetch_fb_urls,
 )
 
 # ================ CONFIG ================
