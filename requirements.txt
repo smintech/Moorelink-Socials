@@ -6,3 +6,4 @@ instaloader
 openai
 httpx
 facebook-scraper
+lxml_html_clean
