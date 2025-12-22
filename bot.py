@@ -771,6 +771,7 @@ Answer in short, engaging Pidgin-mixed English. Use slang where e fit. Max 6 sen
         return  # consume the message
         
         # Manual AI Analysis (Admin only, button-driven)
+    # Manual AI Analysis (Admin only, button-driven - NOW MULTI-TURN!)
     if context.user_data.get("awaiting_manual_ai"):
         if not is_admin(uid):
             context.user_data.pop("awaiting_manual_ai", None)
@@ -779,14 +780,17 @@ Answer in short, engaging Pidgin-mixed English. Use slang where e fit. Max 6 sen
 
         user_text = update.message.text.strip()
 
-        # Optional: If no text sent and recent posts exist, use them — but for manual, better require input
         if not user_text:
-            await update.effective_message.reply_text("Please send some text, post link, or caption to analyze.\nOr /cancel to abort.")
+            await update.effective_message.reply_text(
+                "📝 Send the text, post, link, or caption you want analyzed.\n"
+                "I go analyze each one sharp-sharp.\n"
+                "/cancel to stop Manual AI mode."
+            )
             return
 
-        context.user_data.pop("awaiting_manual_ai", None)
+        # DO NOT pop the flag here → keep mode active for multiple inputs!
 
-        # Create and run the AI task
+        # Run AI task
         task = asyncio.create_task(
             run_ai_task(
                 user_id=uid,
@@ -797,11 +801,11 @@ Answer in short, engaging Pidgin-mixed English. Use slang where e fit. Max 6 sen
             )
         )
         ai_tasks[uid] = task
-        context.user_data["ai_task"] = task  # for cancellation tracking
+        context.user_data["ai_task"] = task  # for /cancel support
 
         await update.effective_message.reply_text(
-            "🚀 Manual AI analysis started...\n"
-            "You can /cancel if needed."
+            "🚀 AI dey think on top your text...\n"
+            "(You fit send another one while this one dey run)"
         )
         return
         
