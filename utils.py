@@ -278,7 +278,7 @@ async def fetch_fb_urls_async(account: str) -> List[Dict[str, Any]]:
     posts = []
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)  # Set False first time for manual login
+            browser = await p.chromium.launch(headless=False)  # Set False first time for manual login
             context = await browser.new_context()
 
             # Load saved login cookies if exist
