@@ -11,7 +11,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import instaloader
 from openai import AsyncOpenAI, OpenAIError
-from playwright.sync_api import sync_playwright
+import asyncio
+from playwright.async_api import async_playwright
 import json
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
@@ -270,59 +271,70 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
         logging.debug("fetch_ig_urls failed", exc_info=True)
     return posts
 
-FB_STATE_FILE = "fb_state.json"  # Save cookies here
+FB_STATE_FILE = "fb_state.json"  # Cookies go save here for auto-login
 
-def fetch_fb_urls(account: str) -> List[Dict[str, Any]]:
+async def fetch_fb_urls_async(account: str) -> List[Dict[str, Any]]:
     account = account.lstrip('@').lower()
     posts = []
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)  # Change to False first time for manual login
-            context = browser.new_context()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)  # Set False first time for manual login
+            context = await browser.new_context()
 
-            # Load saved login state if exist
+            # Load saved login cookies if exist
             if os.path.exists(FB_STATE_FILE):
-                context.add_cookies(json.load(open(FB_STATE_FILE)))
-                logging.info("Loaded saved FB login cookies")
+                cookies = json.load(open(FB_STATE_FILE))
+                await context.add_cookies(cookies)
+                logging.info("Loaded saved Facebook login cookies")
 
-            page = context.new_page()
-            page.goto(f"https://www.facebook.com/{account}")
+            page = await context.new_page()
+            await page.goto(f"https://www.facebook.com/{account}")
 
-            # First time: Run with headless=False, login manually, then run this to save cookies
+            # First time setup: Run once with headless=False, login manually, then save cookies
             if not os.path.exists(FB_STATE_FILE):
-                logging.warning("No saved login – run with headless=False to login manually first")
-                json.dump(context.cookies(), open(FB_STATE_FILE, 'w'))
-                return []  # Stop and save next time
+                logging.warning("No saved FB login cookies found. Run once with headless=False to login manually.")
+                # Save cookies for next time
+                cookies = await context.cookies()
+                json.dump(cookies, open(FB_STATE_FILE, 'w'))
+                await browser.close()
+                return []  # Will work next restart
 
-            # Scroll to load posts
-            for _ in range(8):  # Load ~10-20 posts
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(3000)
+            # Scroll to load more posts
+            for _ in range(8):  # Adjust for more/less posts
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(3000)
 
-            # Extract posts (selectors may change – update if needed)
-            elements = page.query_selector_all('div[role="article"]')
+            # Extract posts (selectors fit work for most public pages in 2025)
+            elements = await page.query_selector_all('div[role="article"]')
             for el in elements[:POST_LIMIT]:
-                text_el = el.query_selector('div[dir="auto"]')
-                caption = text_el.inner_text() if text_el else ""
+                # Caption
+                caption_el = await el.query_selector('div[dir="auto"][style*="text-align:start"]')
+                caption = await caption_el.inner_text() if caption_el else ""
 
-                img_els = el.query_selector_all('img')
-                media_url = img_els[0].get_attribute('src') if img_els else None
-                is_video = bool(el.query_selector('video'))
+                # Media (image or video)
+                img_el = await el.query_selector('img')
+                media_url = await img_el.get_attribute('src') if img_el else None
+                is_video = bool(await el.query_selector('video'))
 
                 posts.append({
-                    "post_id": "",  # Hard to get reliably
+                    "post_id": "",  # FB hide am well well
                     "post_url": page.url,
-                    "caption": caption[:2000],
+                    "caption": caption.strip()[:2000],
                     "media_url": media_url,
                     "is_video": is_video,
                 })
 
-            browser.close()
-            logging.info(f"Fetched {len(posts)} FB posts for @{account}")
+            await browser.close()
+            logging.info(f"Successfully fetched {len(posts)} posts from Facebook @{account}")
     except Exception as e:
-        logging.error(f"Playwright FB fetch failed: {e}")
+        logging.error(f"Facebook async fetch failed for @{account}: {e}")
 
     return posts
+
+# Wrapper to keep old function name (sync-style) for easy use
+def fetch_fb_urls(account: str) -> List[Dict[str, Any]]:
+    """Sync wrapper – run the async fetcher"""
+    return asyncio.run(fetch_fb_urls_async(account))
 
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
     account = account.lstrip('@').lower()
