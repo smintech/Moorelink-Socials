@@ -152,7 +152,7 @@ def build_confirm_markup(action: str, obj_id: Optional[int] = None, yes_label="C
     ])
 
 # ================ UTIL: CSV ================
-def users_to_csv_bytes(users: List[Dict[str, Any]) -> bytes:
+def users_to_csv_bytes(users: List[Dict[str, Any]]) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["telegram_id", "first_name", "is_active", "is_banned", "request_count", "last_request_at", "joined_at", "invite_count"])
