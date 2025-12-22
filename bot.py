@@ -769,7 +769,42 @@ Answer in short, engaging Pidgin-mixed English. Use slang where e fit. Max 6 sen
             await update.message.reply_text("🤖 AI unavailable right now. Try again later.")
 
         return  # consume the message
+        
+        # Manual AI Analysis (Admin only, button-driven)
+    if context.user_data.get("awaiting_manual_ai"):
+        if not is_admin(uid):
+            context.user_data.pop("awaiting_manual_ai", None)
+            await update.effective_message.reply_text("❌ Only admins can use Manual AI.")
+            return
 
+        user_text = update.message.text.strip()
+
+        # Optional: If no text sent and recent posts exist, use them — but for manual, better require input
+        if not user_text:
+            await update.effective_message.reply_text("Please send some text, post link, or caption to analyze.\nOr /cancel to abort.")
+            return
+
+        context.user_data.pop("awaiting_manual_ai", None)
+
+        # Create and run the AI task
+        task = asyncio.create_task(
+            run_ai_task(
+                user_id=uid,
+                text=user_text,
+                chat_id=update.effective_chat.id,
+                context=context,
+                source="manual_admin"
+            )
+        )
+        ai_tasks[uid] = task
+        context.user_data["ai_task"] = task  # for cancellation tracking
+
+        await update.effective_message.reply_text(
+            "🚀 Manual AI analysis started...\n"
+            "You can /cancel if needed."
+        )
+        return
+        
     # Admin broadcast
     if context.user_data.get("admin_broadcast"):
         if not is_admin(uid):
