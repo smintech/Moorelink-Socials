@@ -1088,13 +1088,28 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------ Manual AI call / cancel commands ------------------
 # keep track of tasks per admin user
+# Global registry for running AI tasks (put near top of file)
 ai_tasks: Dict[int, asyncio.Task] = {}
 
 async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, source: str = "manual"):
-    """Background worker (creates reply messages itself)."""
+    """
+    Background worker that calls Groq (OpenAI-compatible) with model fallbacks.
+    It sends the final result (or error) to chat_id itself.
+    """
     logging.info("run_ai_task started for user %s (source=%s)", user_id, source)
+
+    # Persona + text to analyze
+    system_msg = "You are a sharp Nigerian social media analyst. Answer short, direct, and use Pidgin-mixed English when appropriate."
+    user_msg = text
+
+    MODEL_CANDIDATES = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "llama-guard-3-8b",
+    ]
+
     try:
-        api_key = os.getenv("GROQ_KEY")
+        api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
             logging.error("GROQ_API_KEY not set")
             await context.bot.send_message(chat_id=chat_id, text="❌ Server misconfigured: missing GROQ_API_KEY.")
@@ -1102,43 +1117,92 @@ async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTyp
 
         client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
 
-        # build prompt - keep it short, use Nigerian analyst persona
-        system_msg = "You are a sharp Nigerian social media analyst. Answer short and direct in Pidgin-mixed English when appropriate."
-        user_msg = f"{text}"
-
-        # optional: send an intermediate "working" message
+        # Optional: send ephemeral working message
+        working_msg = None
         try:
-            working = await context.bot.send_message(chat_id=chat_id, text="⏳ AI is thinking... (this may take a few seconds)")
+            working_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ AI is thinking... (this may take a few seconds)")
         except Exception:
-            working = None
+            working_msg = None
 
-        # call the model
-        response = await client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg}
-            ],
-            temperature=0.7,
-            max_tokens=700
-        )
+        last_exc = None
+        success = False
 
-        content = ""
+        for model_id in MODEL_CANDIDATES:
+            try:
+                logging.info("Attempting model '%s' for user %s", model_id, user_id)
+                response = await client.chat.completions.create(
+                    model=model_id,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg}
+                    ],
+                    temperature=0.7,
+                    max_tokens=700
+                )
+
+                # Extract content defensively
+                content = None
+                try:
+                    content = response.choices[0].message.content.strip()
+                except Exception:
+                    logging.exception("Malformed response structure from model %s", model_id)
+                    content = None
+
+                if content:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🤖 AI Result (model: {model_id}, source: {source}):\n\n{content}"
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🤖 AI returned no content (model: {model_id})."
+                    )
+
+                logging.info("Model %s succeeded for user %s", model_id, user_id)
+                success = True
+                last_exc = None
+                break  # done
+
+            except asyncio.CancelledError:
+                logging.info("AI task cancelled (model loop) for user %s", user_id)
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text="🛑 AI analysis cancelled.")
+                except Exception:
+                    pass
+                raise
+
+            except Exception as e:
+                last_exc = e
+                emsg = str(e).lower()
+                logging.warning("Model %s failed for user %s: %s", model_id, user_id, emsg)
+
+                # If model decommissioned or model-not-found, try next candidate
+                if any(tok in emsg for tok in ("decommissioned", "model_decommissioned", "model not found", "model not found", "not found")):
+                    logging.info("Model %s appears decommissioned or missing; trying next candidate.", model_id)
+                    continue
+
+                # For other errors, still try next candidate (networks/auth may be transient)
+                continue
+
+        # Clean up the working message if present
         try:
-            content = response.choices[0].message.content.strip()
+            if working_msg:
+                await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
         except Exception:
-            logging.exception("Malformed response from Groq/OpenAI client")
-            content = None
+            # not critical if delete fails
+            pass
 
-        if not content:
-            await context.bot.send_message(chat_id=chat_id, text="🤖 AI returned no usable output.")
-        else:
-            # send final result (use parse_mode if needed)
-            await context.bot.send_message(chat_id=chat_id, text=f"🤖 AI Result ({source}):\n\n{content}")
+        if not success:
+            logging.exception("All model candidates failed for user %s", user_id)
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ AI error (all models failed): {last_exc}")
+            except Exception:
+                pass
 
     except asyncio.CancelledError:
-        logging.info("AI task cancelled for user %s", user_id)
-        # notify user about cancellation (if chat still available)
+        # bubbled from outer cancellation
+        logging.info("run_ai_task cancelled for user %s", user_id)
         try:
             await context.bot.send_message(chat_id=chat_id, text="🛑 AI analysis cancelled.")
         except Exception:
@@ -1146,18 +1210,20 @@ async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTyp
         raise
 
     except Exception as e:
-        logging.exception("run_ai_task failed")
+        logging.exception("run_ai_task unexpected failure for user %s: %s", user_id, e)
         try:
-            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ AI error: {e}")
+            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ AI unexpected error: {e}")
         except Exception:
             pass
 
     finally:
-        # cleanup registry
-        ai_tasks.pop(user_id, None)
+        # Ensure registry cleanup
+        try:
+            ai_tasks.pop(user_id, None)
+        except Exception:
+            pass
         # also clear user_data slot if present
         try:
-            # context might not be the same mapping for future calls, but attempt safe pop
             if isinstance(context.user_data, dict):
                 context.user_data.pop("ai_task", None)
         except Exception:
