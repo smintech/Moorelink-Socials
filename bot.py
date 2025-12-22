@@ -108,6 +108,7 @@ def build_main_menu():
     keyboard = [
         [InlineKeyboardButton("X (Twitter)", callback_data="menu_x")],
         [InlineKeyboardButton("Instagram", callback_data="menu_ig")],
+        [InlineKeyboardButton("Facebook", callback_data="menu_fb")],
         [InlineKeyboardButton("Saved usernames", callback_data="saved_menu")],
         [InlineKeyboardButton("👤 Dashboard", callback_data="dashboard")],
         [InlineKeyboardButton("Help / Guide", callback_data="help")],
@@ -216,10 +217,11 @@ async def handle_fetch_and_ai(update: Update, context: ContextTypes.DEFAULT_TYPE
     await message.chat.send_action(ChatAction.TYPING)
 
     # Fetch raw posts
+    # Fetch raw posts
     if platform == "x":
         raw_posts = fetch_latest_urls("x", account)
         post_list = [{"post_id": extract_post_id("x", url), "post_url": url, "caption": ""} for url in raw_posts]
-    else:
+    elif platform == "ig":
         raw_ig = fetch_ig_urls(account)
         post_list = []
         for p in raw_ig:
@@ -231,6 +233,23 @@ async def handle_fetch_and_ai(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "media_url": p.get("media_url"),
                 "is_video": p.get("is_video", False)
             })
+    elif platform == "fb":
+        raw_fb = fetch_fb_urls(account)  # new function from utils.py
+        post_list = []
+        for p in raw_fb:
+            pid = extract_post_id("fb", p['post_url'])  # fallback to post_id if needed
+            if not pid and p.get("post_id"):
+                pid = p["post_id"]
+            post_list.append({
+                "post_id": pid or p['post_url'],
+                "post_url": p['post_url'],
+                "caption": p.get("caption", ""),
+                "media_url": p.get("media_url"),
+                "is_video": p.get("is_video", False)
+            })
+    else:
+        await message.reply_text("Unsupported platform.")
+        return
 
     # Only new posts
     new_posts = [p for p in post_list if is_post_new(uid, platform, account, p['post_id'])]
@@ -528,6 +547,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["platform"] = "x"
         context.user_data["awaiting_username"] = True
         await query.edit_message_text("Send the X username (without @):", reply_markup=build_back_markup("menu_main"))
+        return
+    if data == "menu_fb":
+        context.user_data["platform"] = "fb"
+        context.user_data["awaiting_username"] = True
+        await query.edit_message_text(
+            "Send the Facebook page username or name (e.g. nike, BBCNews, coca-cola):\n\n"
+            "Note: Only public pages work!",
+            reply_markup=build_back_markup("menu_main")
+        )
         return
     if data == "menu_ig":
         context.user_data["platform"] = "ig"
@@ -861,8 +889,10 @@ Answer in short, engaging Pidgin-mixed English. Use slang where e fit. Max 6 sen
             platform = "x"
         if platform in ("instagram",):
             platform = "ig"
-        if platform not in ("x", "ig"):
-            await update.effective_message.reply_text("Platform must be x or ig.")
+        if platform in ("facebook",):
+            platform = "fb"
+        if platform not in ("x", "ig", "fb"):
+            await update.effective_message.reply_text("Platform must be x, fb, or ig.")
             return
         account = parts[1].lstrip('@').lower()
         label = parts[2] if len(parts) == 3 else None
@@ -949,9 +979,11 @@ Answer in short, engaging Pidgin-mixed English. Use slang where e fit. Max 6 sen
         platform = parts[1].lower()
         if platform in ("twitter",):
             platform = "x"
+        if platform in ("facebook",):
+            platform = "fb"
         if platform in ("instagram",):
             platform = "ig"
-        if platform not in ("x", "ig"):
+        if platform not in ("x", "ig", "fb"):
             await update.effective_message.reply_text("Platform must be x or ig.")
             return
         account = parts[2].lstrip('@').lower()
