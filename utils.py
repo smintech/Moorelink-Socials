@@ -10,13 +10,13 @@ import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import instaloader
-
+from openai import AsyncOpenAI, OpenAIError
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
 TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separate TG DB
 CACHE_HOURS = 24
 POST_LIMIT = 5
-
+GROQ_API_KEY=os.getenv("GROQ_KEY")
 # ================ DB CONNECTIONS ============
 def get_db():
     if not DB_URL:
@@ -82,7 +82,26 @@ def init_tg_db():
             day_reset TIMESTAMP
         );
         """)
+                # seen_posts table for deduping new posts (AI gatekeeper)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS seen_posts (
+            id SERIAL PRIMARY KEY,
+            owner_telegram_id BIGINT NOT NULL,
+            platform TEXT NOT NULL CHECK (platform IN ('x', 'ig')),
+            account_name TEXT NOT NULL,
+            post_id TEXT NOT NULL,                  -- X: tweet ID, IG: shortcode
+            post_url TEXT NOT NULL,
+            seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(owner_telegram_id, platform, account_name, post_id)
+        );
+        """)
 
+        # Index for fast lookups
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_seen_user_account 
+        ON seen_posts(owner_telegram_id, platform, account_name);
+        """)
+        
         # Badges table (needed by get_explicit_badge)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS tg_badges (
@@ -750,6 +769,54 @@ def reset_cooldown(telegram_id: int) -> None:
     except Exception:
         logging.debug("reset_cooldown failed", exc_info=True)
 
+# Extract post_id from URL
+def extract_post_id(platform: str, url: str) -> str:
+    if platform == "x":
+        return url.split("/")[-1].split("?")[0]  # tweet ID
+    elif platform == "ig":
+        return url.split("/p/")[1].split("/")[0]  # shortcode
+    return ""
+
+# Check if post is new for user
+def is_post_new(owner_id: int, platform: str, account: str, post_id: str) -> bool:
+    try:
+        conn = get_tg_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM seen_posts
+            WHERE owner_telegram_id = %s
+              AND platform = %s
+              AND account_name = %s
+              AND post_id = %s
+        """, (owner_id, platform, account, post_id))
+        exists = cur.fetchone()
+        cur.close()
+        conn.close()
+        return exists is None
+    except Exception:
+        logging.debug("is_post_new failed", exc_info=True)
+        return True  # safe default
+
+# Mark posts as seen
+def mark_posts_seen(owner_id: int, platform: str, account: str, posts: List[Dict[str, str]]):
+    """posts = [{'post_id': ..., 'post_url': ...}, ...]"""
+    if not posts:
+        return
+    try:
+        conn = get_tg_db()
+        cur = conn.cursor()
+        for p in posts:
+            cur.execute("""
+                INSERT INTO seen_posts (owner_telegram_id, platform, account_name, post_id, post_url)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, (owner_id, platform, account, p['post_id'], p['post_url']))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception:
+        logging.debug("mark_posts_seen failed", exc_info=True)
+
 def check_and_increment_cooldown(telegram_id: int) -> Optional[str]:
     """
     Returns None if allowed, else a block message string.
@@ -818,6 +885,47 @@ def check_and_increment_cooldown(telegram_id: int) -> Optional[str]:
     update_rate_limits(telegram_id, rl)
     increment_tg_request_count(telegram_id)  # Still track general activity
     return None
+
+async def call_social_ai(platform: str, account: str, posts: List[Dict]) -> str:
+    if not posts:
+        return ""
+
+    captions_text = "\n---\n".join([p.get("caption", "No caption") for p in posts if p.get("caption")])
+
+    # Nigerian-style prompt (works great on Llama/Mixtral)
+    prompt = f"""
+You are a sharp Nigerian social media analyst wey sabi X and IG well-well. Analyze these {platform.upper()} post(s) from @{account}.
+
+Post captions:
+{captions_text}
+
+Answer ONLY in short, sweet Pidgin-mixed English:
+
+1. Wetin dey happen? (Main message or event)
+
+2. Tone & intent: Promotion, Drama, Education, Awareness, Campaign, or Joke?
+
+3. Trend signal: One-off post, part of series, or shift in style?
+
+Keep am short – max 5 sentences. Use Naija vibe and slang where e fit!
+"""
+
+    try:
+        client = AsyncOpenAI(
+            api_key=os.getenv("GROQ_API_KEY"),
+            base_url="https://api.groq.com/openai/v1"
+        )
+        response = await client.chat.completions.create(
+            model="llama-3.1-70b-versatile",  # or "mixtral-8x7b-32768" – both fire!
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=300
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.warning(f"Groq failed: {e}")
+        return "🤖 AI analysis unavailable right now. Try again later!"
+
 
 # ================ ADMIN HELPERS ================
 def get_user_stats(telegram_id: int) -> Dict[str, Any]:
