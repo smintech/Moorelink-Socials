@@ -235,8 +235,7 @@ async def handle_fetch_and_ai(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "is_video": p.get("is_video", False)
             })
     elif platform == "fb":
-        raw_fb = fetch_fb_urls(account)  # new function from utils.py
-        post_list = []
+        post_list = fetch_fb_urls(account)  # new function from utils.py
         for p in raw_fb:
             pid = extract_post_id("fb", p['post_url'])  # fallback to post_id if needed
             if not pid and p.get("post_id"):
