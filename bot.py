@@ -235,13 +235,13 @@ async def handle_fetch_and_ai(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "is_video": p.get("is_video", False)
             })
     elif platform == "fb":
-        post_list = fetch_fb_urls(account)  # new function from utils.py
+        # Now it's async – await it!
+        raw_fb = await fetch_fb_urls(account)
+        post_list = []
         for p in raw_fb:
-            pid = extract_post_id("fb", p['post_url'])  # fallback to post_id if needed
-            if not pid and p.get("post_id"):
-                pid = p["post_id"]
+            pid = p.get("post_id") or p.get("post_url", "")
             post_list.append({
-                "post_id": pid or p['post_url'],
+                "post_id": pid,
                 "post_url": p['post_url'],
                 "caption": p.get("caption", ""),
                 "media_url": p.get("media_url"),
