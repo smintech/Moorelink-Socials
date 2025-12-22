@@ -1087,70 +1087,163 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Send username (without @) — default platform X. Use /cancel to abort.", reply_markup=build_back_markup("menu_main"))
 
 # ------------------ Manual AI call / cancel commands ------------------
+# keep track of tasks per admin user
+ai_tasks: Dict[int, asyncio.Task] = {}
+
+async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, source: str = "manual"):
+    """Background worker (creates reply messages itself)."""
+    logging.info("run_ai_task started for user %s (source=%s)", user_id, source)
+    try:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            logging.error("GROQ_API_KEY not set")
+            await context.bot.send_message(chat_id=chat_id, text="❌ Server misconfigured: missing GROQ_API_KEY.")
+            return
+
+        client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+
+        # build prompt - keep it short, use Nigerian analyst persona
+        system_msg = "You are a sharp Nigerian social media analyst. Answer short and direct in Pidgin-mixed English when appropriate."
+        user_msg = f"{text}"
+
+        # optional: send an intermediate "working" message
+        try:
+            working = await context.bot.send_message(chat_id=chat_id, text="⏳ AI is thinking... (this may take a few seconds)")
+        except Exception:
+            working = None
+
+        # call the model
+        response = await client.chat.completions.create(
+            model="llama-3.1-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg}
+            ],
+            temperature=0.7,
+            max_tokens=700
+        )
+
+        content = ""
+        try:
+            content = response.choices[0].message.content.strip()
+        except Exception:
+            logging.exception("Malformed response from Groq/OpenAI client")
+            content = None
+
+        if not content:
+            await context.bot.send_message(chat_id=chat_id, text="🤖 AI returned no usable output.")
+        else:
+            # send final result (use parse_mode if needed)
+            await context.bot.send_message(chat_id=chat_id, text=f"🤖 AI Result ({source}):\n\n{content}")
+
+    except asyncio.CancelledError:
+        logging.info("AI task cancelled for user %s", user_id)
+        # notify user about cancellation (if chat still available)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text="🛑 AI analysis cancelled.")
+        except Exception:
+            pass
+        raise
+
+    except Exception as e:
+        logging.exception("run_ai_task failed")
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ AI error: {e}")
+        except Exception:
+            pass
+
+    finally:
+        # cleanup registry
+        ai_tasks.pop(user_id, None)
+        # also clear user_data slot if present
+        try:
+            # context might not be the same mapping for future calls, but attempt safe pop
+            if isinstance(context.user_data, dict):
+                context.user_data.pop("ai_task", None)
+        except Exception:
+            pass
+
+    logging.info("run_ai_task finished for user %s", user_id)
+
 @admin_only
 async def ai_call_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    """Admin-only: /ai_call <text...>
+       If no text provided, falls back to any stored last_ai_context_* in context.user_data.
+    """
+    allowed = await record_user_and_check_ban(update, context)
+    if not allowed:
+        await update.effective_message.reply_text("🚫 You are banned.")
+        return
 
-    # Join everything after /ai_call
-    user_input = " ".join(context.args).strip()
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
 
-    text_to_analyze = None
-    source = None
+    # flatten args to a single string
+    user_input = " ".join(context.args or []).strip()
 
-    # 1️⃣ If admin typed ANY text → use it
-    if user_input:
-        # Optional: allow "raw" keyword but don't require it
-        if user_input.lower().startswith("raw "):
-            text_to_analyze = user_input[4:].strip()
-            source = "raw"
-        else:
-            text_to_analyze = user_input
-            source = "manual"
+    # if user supplied "raw " prefix, strip it but allow plain text too
+    if user_input.lower().startswith("raw "):
+        user_input = user_input[4:].strip()
 
-    # 2️⃣ Otherwise fallback to stored posts
-    if not text_to_analyze:
-        stored_posts = get_stored_posts_for_user(user_id)  # your existing function
-        if stored_posts:
-            text_to_analyze = "\n\n".join(stored_posts)
+    source = "manual"
+
+    # If user didn't supply text, try to gather stored post captions from context.user_data
+    if not user_input:
+        stored_texts = []
+        for k, v in list(context.user_data.items()):
+            if isinstance(k, str) and k.startswith("last_ai_context_") and isinstance(v, list):
+                for p in v:
+                    c = p.get("caption") if isinstance(p, dict) else None
+                    if c:
+                        stored_texts.append(c)
+        if stored_texts:
+            user_input = "\n---\n".join(stored_texts)
             source = "stored_posts"
 
-    # 3️⃣ Nothing anywhere → show help
-    if not text_to_analyze:
-        await update.message.reply_text(
-            "❌ No text provided.\n\n"
-            "Use:\n"
-            "/ai_call <text>\n"
-            "/ai_call raw <text>\n\n"
-            "Or fetch posts first so they can be analyzed."
+    if not user_input:
+        await update.effective_message.reply_text(
+            "No text provided to analyze.\n\n"
+            "Usage:\n"
+            "/ai_call <text to analyze>\n"
+            "Or fetch posts first so the bot stores them, then run /ai_call\n"
+            "You can also prefix with `raw `: `/ai_call raw some text`"
         )
         return
 
-    # ✅ Run AI
-    await update.message.reply_text(f"🧠 Running AI ({source})…")
-
-    await call_social_ai(
-        user_id=user_id,
-        text=text_to_analyze,
-        update=update,
-        context=context
-    )
-@admin_only
-async def ai_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel the active AI call for this user (if any)."""
-    uid = update.effective_user.id
-    task = context.user_data.get("ai_task")
-    if not task or task.done():
-        await update.effective_message.reply_text("No active AI analysis to cancel.")
-        context.user_data.pop("ai_task", None)
+    # If there's already a running task for this admin, tell them and refuse or cancel previous (choose behavior)
+    existing = ai_tasks.get(uid)
+    if existing and not existing.done():
+        await update.effective_message.reply_text("You already have a running AI job. Use /ai_cancel to stop it first.")
         return
 
+    # create background task (don't await here) — the task will send the final message itself
+    task = asyncio.create_task(run_ai_task(uid, user_input, chat_id, context, source=source))
+    ai_tasks[uid] = task
+    context.user_data["ai_task"] = task
+
+    await update.effective_message.reply_text("🧠 Running AI (manual)… (use /ai_cancel to stop)")
+
+@admin_only
+async def ai_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    task = ai_tasks.get(uid) or context.user_data.get("ai_task")
+    if not task:
+        await update.effective_message.reply_text("No active AI analysis to cancel.")
+        return
+
+    # cancel and respond
     task.cancel()
-    # optionally await it to ensure cancellation finishes
+    # await briefly to let cancellation message be delivered by run_ai_task
     try:
-        await task
+        await asyncio.wait_for(task, timeout=3.0)
+    except asyncio.TimeoutError:
+        pass
     except asyncio.CancelledError:
         pass
-    context.user_data.pop("ai_task", None)
+    finally:
+        ai_tasks.pop(uid, None)
+        context.user_data.pop("ai_task", None)
+
     await update.effective_message.reply_text("Cancellation requested — AI analysis stopped.")
 
 # ================ REGISTER & RUN ================
