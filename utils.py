@@ -11,6 +11,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import instaloader
 from openai import AsyncOpenAI, OpenAIError
+from facebook_scraper import get_posts
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
 TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separate TG DB
@@ -62,7 +63,7 @@ def init_tg_db():
         CREATE TABLE IF NOT EXISTS saved_accounts (
             id SERIAL PRIMARY KEY,
             owner_telegram_id BIGINT NOT NULL,
-            platform TEXT NOT NULL CHECK (platform IN ('x', 'ig')),
+            platform TEXT NOT NULL CHECK (platform IN ('x', 'ig', 'fb')),
             account_name TEXT NOT NULL,
             label TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -87,7 +88,7 @@ def init_tg_db():
         CREATE TABLE IF NOT EXISTS seen_posts (
             id SERIAL PRIMARY KEY,
             owner_telegram_id BIGINT NOT NULL,
-            platform TEXT NOT NULL CHECK (platform IN ('x', 'ig')),
+            platform TEXT NOT NULL CHECK (platform IN ('x', 'ig', 'fb')),
             account_name TEXT NOT NULL,
             post_id TEXT NOT NULL,                  -- X: tweet ID, IG: shortcode
             post_url TEXT NOT NULL,
@@ -268,6 +269,58 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
         logging.debug("fetch_ig_urls failed", exc_info=True)
     return posts
 
+def fetch_fb_urls(account: str) -> List[Dict[str, Any]]:
+    """
+    Fetch latest public posts from a Facebook page (username or page name).
+    Returns list of dicts compatible with IG format for seamless bot use.
+    """
+    if not FB_SCRAPER_AVAILABLE:
+        logging.error("Facebook scraper not available – missing library")
+        return []
+
+    account = account.lstrip('@').lower()
+    posts = []
+    try:
+        # facebook-scraper settings: get up to POST_LIMIT posts
+        for post in get_posts(
+            account,
+            pages=2,  # usually enough for latest 5-10 posts
+            options={
+                "posts_per_page": 5,
+                "timeout": 30,
+                "allow_extra_requests": False,
+            }
+        ):
+            if len(posts) >= POST_LIMIT:
+                break
+
+            media_url = None
+            is_video = False
+
+            # Prefer video if available
+            if post.get('video'):
+                media_url = post['video']
+                is_video = True
+            elif post.get('image'):
+                media_url = post['image']
+            elif post.get('images'):
+                media_url = post['images'][0] if post['images'] else None
+
+            posts.append({
+                "post_id": str(post.get('post_id', '')),
+                "post_url": post.get('post_url') or f"https://facebook.com/{post.get('post_id')}",
+                "caption": post.get('text', '') or post.get('post_text', '') or '',
+                "media_url": media_url,
+                "is_video": is_video,
+            })
+
+        logging.info(f"Fetched {len(posts)} Facebook posts for @{account}")
+    except Exception as e:
+        logging.error(f"Facebook fetch failed for @{account}: {e}")
+        posts = []
+
+    return posts
+
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
     account = account.lstrip('@').lower()
     cached = get_recent_urls(platform, account)
@@ -283,6 +336,13 @@ def fetch_latest_urls(platform: str, account: str) -> List[str]:
         for p in new_ig:
             save_url("ig", account, p["url"])
         return [p["url"] for p in new_ig]
+    elif platform == "fb":
+        if not FB_SCRAPER_AVAILABLE:
+            return []
+        new_fb = fetch_fb_urls(account)
+        for p in new_fb:
+            save_url("fb", account, p["post_url"])
+        return [p["post_url"] for p in new_fb]
     return []
 
 # ================ TG USER HELPERS (tg DB) ============
