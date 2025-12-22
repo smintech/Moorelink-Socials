@@ -1094,7 +1094,7 @@ async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTyp
     """Background worker (creates reply messages itself)."""
     logging.info("run_ai_task started for user %s (source=%s)", user_id, source)
     try:
-        api_key = os.getenv("GROQ_API_KEY")
+        api_key = os.getenv("GROQ_KEY")
         if not api_key:
             logging.error("GROQ_API_KEY not set")
             await context.bot.send_message(chat_id=chat_id, text="❌ Server misconfigured: missing GROQ_API_KEY.")
