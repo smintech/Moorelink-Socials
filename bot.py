@@ -5,6 +5,7 @@ import asyncio
 import io
 import csv
 import math
+import logging
 from typing import Optional, List, Dict, Any
 from functools import wraps
 from datetime import datetime
@@ -27,6 +28,9 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ChatAction
+
+# If you use Groq's OpenAI-compatible client via the openai package:
+from openai import AsyncOpenAI
 
 # utils - import everything we rely on
 from utils import (
@@ -61,6 +65,8 @@ from utils import (
 )
 
 # ================ CONFIG ================
+logging.basicConfig(level=logging.INFO)
+
 TELEGRAM_TOKEN = os.getenv("BOTTOKEN")
 if not TELEGRAM_TOKEN:
     raise ValueError("BOTTOKEN env var not set")
@@ -1081,6 +1087,7 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Send username (without @) — default platform X. Use /cancel to abort.", reply_markup=build_back_markup("menu_main"))
 
 # ------------------ Manual AI call / cancel commands ------------------
+@admin_only
 async def ai_call_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Usage:
        /ai_call <platform> <account>         -> uses context.user_data['last_ai_context_<platform>_<account>']
@@ -1158,6 +1165,7 @@ async def ai_call_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("ai_task", None)
     await update.effective_message.reply_text(f"🤖 AI Result:\n\n{result}")
 
+@admin_only
 async def ai_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the active AI call for this user (if any)."""
     uid = update.effective_user.id
