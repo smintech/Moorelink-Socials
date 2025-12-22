@@ -68,7 +68,7 @@ from utils import (
 )
 
 # ================ CONFIG ================
-logging.basicBasic(level=logging.INFO)
+logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.getenv("BOTTOKEN")
 if not TELEGRAM_TOKEN:
