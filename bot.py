@@ -1089,82 +1089,51 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------ Manual AI call / cancel commands ------------------
 @admin_only
 async def ai_call_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage:
-       /ai_call <platform> <account>         -> uses context.user_data['last_ai_context_<platform>_<account>']
-       /ai_call raw <any text to analyze>    -> analyze raw text provided
-    """
-    allowed = await record_user_and_check_ban(update, context)
-    if not allowed:
-        await update.effective_message.reply_text("🚫 You are banned.")
+    user_id = update.effective_user.id
+
+    # Join everything after /ai_call
+    user_input = " ".join(context.args).strip()
+
+    text_to_analyze = None
+    source = None
+
+    # 1️⃣ If admin typed ANY text → use it
+    if user_input:
+        # Optional: allow "raw" keyword but don't require it
+        if user_input.lower().startswith("raw "):
+            text_to_analyze = user_input[4:].strip()
+            source = "raw"
+        else:
+            text_to_analyze = user_input
+            source = "manual"
+
+    # 2️⃣ Otherwise fallback to stored posts
+    if not text_to_analyze:
+        stored_posts = get_stored_posts_for_user(user_id)  # your existing function
+        if stored_posts:
+            text_to_analyze = "\n\n".join(stored_posts)
+            source = "stored_posts"
+
+    # 3️⃣ Nothing anywhere → show help
+    if not text_to_analyze:
+        await update.message.reply_text(
+            "❌ No text provided.\n\n"
+            "Use:\n"
+            "/ai_call <text>\n"
+            "/ai_call raw <text>\n\n"
+            "Or fetch posts first so they can be analyzed."
+        )
         return
 
-    uid = update.effective_user.id
-    args = context.args or []
-    if not args:
-        await update.effective_message.reply_text("Usage: /ai_call <platform> <account>\nOr: /ai_call raw <text to analyze>")
-        return
+    # ✅ Run AI
+    await update.message.reply_text(f"🧠 Running AI ({source})…")
 
-    # check for concurrent task
-    existing = context.user_data.get("ai_task")
-    if existing and not existing.done():
-        await update.effective_message.reply_text("You already have an AI call running. Use /ai_cancel to stop it.")
-        return
-
-    # form posts list
-    if args[0].lower() == "raw":
-        if len(args) < 2:
-            await update.effective_message.reply_text("Usage: /ai_call raw <text to analyze>")
-            return
-        raw_text = " ".join(args[1:]).strip()
-        posts = [{"caption": raw_text}]
-        platform = "raw"
-        account = "(raw)"
-    else:
-        platform = args[0].lower()
-        if platform in ("twitter",):
-            platform = "x"
-        account = args[1].lstrip("@").lower() if len(args) > 1 else None
-        if not account:
-            await update.effective_message.reply_text("Usage: /ai_call <platform> <account>")
-            return
-        posts = context.user_data.get(f"last_ai_context_{platform}_{account}")
-        if not posts:
-            await update.effective_message.reply_text(
-                "No stored posts found for that platform/account.\n"
-                "Either fetch posts first so they are saved in the bot context, or use raw input:\n"
-                "/ai_call raw <text to analyze>"
-            )
-            return
-
-    # optional: enforce badge / cooldown rules (same as other AI flows)
-    badge = get_user_badge(uid)
-    if badge['name'] not in ('Diamond', 'Admin'):
-        cd_msg = check_and_increment_cooldown(uid)
-        if cd_msg:
-            await update.effective_message.reply_text(cd_msg)
-            return
-
-    # create and store task so user can cancel
-    task = asyncio.create_task(call_social_ai(platform, account, posts))
-    context.user_data["ai_task"] = task
-    await update.effective_message.reply_text("🤖 AI analysis started. Use /ai_cancel to stop it.")
-
-    try:
-        result = await task
-    except asyncio.CancelledError:
-        await update.effective_message.reply_text("⚠️ AI analysis cancelled.")
-        context.user_data.pop("ai_task", None)
-        return
-    except Exception as e:
-        # graceful fallback
-        await update.effective_message.reply_text(f"🤖 AI failed: {e}")
-        context.user_data.pop("ai_task", None)
-        return
-
-    # finished OK
-    context.user_data.pop("ai_task", None)
-    await update.effective_message.reply_text(f"🤖 AI Result:\n\n{result}")
-
+    await run_ai_task(
+        user_id=user_id,
+        text=text_to_analyze,
+        update=update,
+        context=context
+    )
 @admin_only
 async def ai_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the active AI call for this user (if any)."""
