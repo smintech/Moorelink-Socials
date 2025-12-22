@@ -886,13 +886,14 @@ def check_and_increment_cooldown(telegram_id: int) -> Optional[str]:
     increment_tg_request_count(telegram_id)  # Still track general activity
     return None
 
+logging.basicConfig(level=logging.INFO)
+
 async def call_social_ai(platform: str, account: str, posts: List[Dict]) -> str:
     if not posts:
         return ""
 
     captions_text = "\n---\n".join([p.get("caption", "No caption") for p in posts if p.get("caption")])
 
-    # Nigerian-style prompt (works great on Llama/Mixtral)
     prompt = f"""
 You are a sharp Nigerian social media analyst wey sabi X and IG well-well. Analyze these {platform.upper()} post(s) from @{account}.
 
@@ -910,20 +911,25 @@ Answer ONLY in short, sweet Pidgin-mixed English:
 Keep am short – max 5 sentences. Use Naija vibe and slang where e fit!
 """
 
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        logging.warning("GROQ_API_KEY missing — cannot call Groq API.")
+        return "🤖 AI analysis unavailable (server misconfigured)."
+
     try:
         client = AsyncOpenAI(
-            api_key=os.getenv("GROQ_API_KEY"),
+            api_key=api_key,
             base_url="https://api.groq.com/openai/v1"
         )
         response = await client.chat.completions.create(
-            model="llama-3.1-70b-versatile",  # or "mixtral-8x7b-32768" – both fire!
+            model="llama-3.1-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
             max_tokens=300
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logging.warning(f"Groq failed: {e}")
+        logging.warning(f"Groq failed: {e}", exc_info=True)
         return "🤖 AI analysis unavailable right now. Try again later!"
 
 
