@@ -1128,7 +1128,7 @@ async def ai_call_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ✅ Run AI
     await update.message.reply_text(f"🧠 Running AI ({source})…")
 
-    await run_ai_task(
+    await call_social_ai(
         user_id=user_id,
         text=text_to_analyze,
         update=update,
