@@ -754,7 +754,7 @@ Answer in short, engaging Pidgin-mixed English. Use slang where e fit. Max 6 sen
 
         try:
             client = AsyncOpenAI(
-                api_key=os.getenv("GROQ_API_KEY"),
+                api_key=os.getenv("GROQ_KEY"),
                 base_url="https://api.groq.com/openai/v1"
             )
             response = await client.chat.completions.create(
