@@ -890,7 +890,7 @@ logging.basicConfig(level=logging.INFO)
 
 async def call_social_ai(platform: str, account: str, posts: List[Dict]) -> str:
     if not posts:
-        return ""
+        return "No new posts to analyze."
 
     captions_text = "\n---\n".join([p.get("caption", "No caption") for p in posts if p.get("caption")])
 
@@ -911,25 +911,49 @@ Answer ONLY in short, sweet Pidgin-mixed English:
 Keep am short – max 5 sentences. Use Naija vibe and slang where e fit!
 """
 
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GROQ_KEY") or os.getenv("GROQ_KEY")
     if not api_key:
-        logging.warning("GROQ_API_KEY missing — cannot call Groq API.")
-        return "🤖 AI analysis unavailable (server misconfigured)."
+        logging.warning("GROQ API key missing")
+        return "🤖 AI analysis unavailable (missing API key)."
+
+    MODEL_CANDIDATES = [
+        "llama-3.3-70b-versatile",     # Current flagship (Dec 2025)
+        "llama-3.1-70b-versatile",     # Still available fallback
+        "llama-3.1-8b-instant",        # Fast lightweight
+        "gemma2-9b-it",                # Reliable alternative
+    ]
 
     try:
         client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://api.groq.com/openai/v1"
         )
-        response = await client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=300
-        )
-        return response.choices[0].message.content.strip()
+
+        for model in MODEL_CANDIDATES:
+            try:
+                logging.info(f"Trying Groq model: {model}")
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.8,
+                    max_tokens=400
+                )
+                result = response.choices[0].message.content.strip()
+                logging.info(f"AI analysis succeeded with model: {model}")
+                return result
+            except Exception as e:
+                err = str(e).lower()
+                if "not found" in err or "decommissioned" in err:
+                    logging.info(f"Model {model} unavailable – skipping to next")
+                    continue
+                else:
+                    logging.warning(f"Model {model} failed: {e}")
+                    continue
+
+        return "🤖 AI analysis unavailable – all models failed or unavailable right now."
+
     except Exception as e:
-        logging.warning(f"Groq failed: {e}", exc_info=True)
+        logging.exception(f"Groq API unexpected error: {e}")
         return "🤖 AI analysis unavailable right now. Try again later!"
 
 
