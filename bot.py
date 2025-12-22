@@ -1232,8 +1232,8 @@ if __name__ == "__main__":
             BotCommand("user_stats", "View user stats"),
             BotCommand("broadcast", "Start a broadcast (admin only)"),
             BotCommand("export_csv", "Export users CSV (admin only)"),
-            BotCommand("ai_call", "Manually run AI on stored context or raw text")
-            BotCommand("ai_cancel", "Cancel your running AI call")
+            BotCommand("ai_call", "Manually run AI on stored context or raw text"),
+            BotCommand("ai_cancel", "Cancel your running AI call"),
         ]
 
         for admin_id in ADMIN_IDS:
