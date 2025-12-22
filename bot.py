@@ -1080,6 +1080,102 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["platform"] = "x"
     await update.effective_message.reply_text("Send username (without @) — default platform X. Use /cancel to abort.", reply_markup=build_back_markup("menu_main"))
 
+# ------------------ Manual AI call / cancel commands ------------------
+async def ai_call_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage:
+       /ai_call <platform> <account>         -> uses context.user_data['last_ai_context_<platform>_<account>']
+       /ai_call raw <any text to analyze>    -> analyze raw text provided
+    """
+    allowed = await record_user_and_check_ban(update, context)
+    if not allowed:
+        await update.effective_message.reply_text("🚫 You are banned.")
+        return
+
+    uid = update.effective_user.id
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text("Usage: /ai_call <platform> <account>\nOr: /ai_call raw <text to analyze>")
+        return
+
+    # check for concurrent task
+    existing = context.user_data.get("ai_task")
+    if existing and not existing.done():
+        await update.effective_message.reply_text("You already have an AI call running. Use /ai_cancel to stop it.")
+        return
+
+    # form posts list
+    if args[0].lower() == "raw":
+        if len(args) < 2:
+            await update.effective_message.reply_text("Usage: /ai_call raw <text to analyze>")
+            return
+        raw_text = " ".join(args[1:]).strip()
+        posts = [{"caption": raw_text}]
+        platform = "raw"
+        account = "(raw)"
+    else:
+        platform = args[0].lower()
+        if platform in ("twitter",):
+            platform = "x"
+        account = args[1].lstrip("@").lower() if len(args) > 1 else None
+        if not account:
+            await update.effective_message.reply_text("Usage: /ai_call <platform> <account>")
+            return
+        posts = context.user_data.get(f"last_ai_context_{platform}_{account}")
+        if not posts:
+            await update.effective_message.reply_text(
+                "No stored posts found for that platform/account.\n"
+                "Either fetch posts first so they are saved in the bot context, or use raw input:\n"
+                "/ai_call raw <text to analyze>"
+            )
+            return
+
+    # optional: enforce badge / cooldown rules (same as other AI flows)
+    badge = get_user_badge(uid)
+    if badge['name'] not in ('Diamond', 'Admin'):
+        cd_msg = check_and_increment_cooldown(uid)
+        if cd_msg:
+            await update.effective_message.reply_text(cd_msg)
+            return
+
+    # create and store task so user can cancel
+    task = asyncio.create_task(call_social_ai(platform, account, posts))
+    context.user_data["ai_task"] = task
+    await update.effective_message.reply_text("🤖 AI analysis started. Use /ai_cancel to stop it.")
+
+    try:
+        result = await task
+    except asyncio.CancelledError:
+        await update.effective_message.reply_text("⚠️ AI analysis cancelled.")
+        context.user_data.pop("ai_task", None)
+        return
+    except Exception as e:
+        # graceful fallback
+        await update.effective_message.reply_text(f"🤖 AI failed: {e}")
+        context.user_data.pop("ai_task", None)
+        return
+
+    # finished OK
+    context.user_data.pop("ai_task", None)
+    await update.effective_message.reply_text(f"🤖 AI Result:\n\n{result}")
+
+async def ai_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the active AI call for this user (if any)."""
+    uid = update.effective_user.id
+    task = context.user_data.get("ai_task")
+    if not task or task.done():
+        await update.effective_message.reply_text("No active AI analysis to cancel.")
+        context.user_data.pop("ai_task", None)
+        return
+
+    task.cancel()
+    # optionally await it to ensure cancellation finishes
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    context.user_data.pop("ai_task", None)
+    await update.effective_message.reply_text("Cancellation requested — AI analysis stopped.")
+
 # ================ REGISTER & RUN ================
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -1107,6 +1203,9 @@ if __name__ == "__main__":
 
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    app.add_handler(CommandHandler("ai_call", ai_call_command))
+    app.add_handler(CommandHandler("ai_cancel", ai_cancel_command))
 
     async def set_command_visibility(application):
         public_cmds = [
@@ -1133,6 +1232,8 @@ if __name__ == "__main__":
             BotCommand("user_stats", "View user stats"),
             BotCommand("broadcast", "Start a broadcast (admin only)"),
             BotCommand("export_csv", "Export users CSV (admin only)"),
+            BotCommand("ai_call", "Manually run AI on stored context or raw text"))
+            BotCommand("ai_cancel", "Cancel your running AI call"))
         ]
 
         for admin_id in ADMIN_IDS:
