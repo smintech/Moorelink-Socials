@@ -11,7 +11,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import instaloader
 from openai import AsyncOpenAI, OpenAIError
-from facebook_page_scraper import Facebook_scraper
+from playwright.sync_api import sync_playwright
+import json
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
 TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separate TG DB
@@ -269,56 +270,57 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
         logging.debug("fetch_ig_urls failed", exc_info=True)
     return posts
 
-def fetch_fb_urls(account: str) -> List[Dict[str, Any]]:
-    if not FB_PAGE_SCRAPER_AVAILABLE:
-        logging.error("FB page scraper library missing")
-        return []
+FB_STATE_FILE = "fb_state.json"  # Save cookies here
 
+def fetch_fb_urls(account: str) -> List[Dict[str, Any]]:
     account = account.lstrip('@').lower()
     posts = []
     try:
-        # Use chrome or firefox — chrome faster
-        scraper = Facebook_scraper(
-            page_name=account,
-            posts_count=POST_LIMIT,
-            browser="chrome",          # or "firefox"
-            headless=True,             # True = no browser window
-            timeout=120,
-            proxy=None                 # Add proxy later if blocked
-        )
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)  # Change to False first time for manual login
+            context = browser.new_context()
 
-        # Scrape and get JSON
-        json_data = scraper.scrap_to_json()
-        import json
-        data = json.loads(json_data)
+            # Load saved login state if exist
+            if os.path.exists(FB_STATE_FILE):
+                context.add_cookies(json.load(open(FB_STATE_FILE)))
+                logging.info("Loaded saved FB login cookies")
 
-        for post_key in data:
-            p = data[post_key]
-            media_url = None
-            is_video = False
+            page = context.new_page()
+            page.goto(f"https://www.facebook.com/{account}")
 
-            # Handle images/videos
-            if "video_url" in p and p["video_url"]:
-                media_url = p["video_url"]
-                is_video = True
-            elif "image_url" in p and p["image_url"]:
-                media_url = p["image_url"]
+            # First time: Run with headless=False, login manually, then run this to save cookies
+            if not os.path.exists(FB_STATE_FILE):
+                logging.warning("No saved login – run with headless=False to login manually first")
+                json.dump(context.cookies(), open(FB_STATE_FILE, 'w'))
+                return []  # Stop and save next time
 
-            posts.append({
-                "post_id": p.get("post_id", ""),
-                "post_url": f"https://www.facebook.com/{account}/posts/{p.get('post_id')}" if p.get("post_id") else "",
-                "caption": p.get("content", "") or p.get("title", "") or "",
-                "media_url": media_url,
-                "is_video": is_video,
-            })
+            # Scroll to load posts
+            for _ in range(8):  # Load ~10-20 posts
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(3000)
 
-            if len(posts) >= POST_LIMIT:
-                break
+            # Extract posts (selectors may change – update if needed)
+            elements = page.query_selector_all('div[role="article"]')
+            for el in elements[:POST_LIMIT]:
+                text_el = el.query_selector('div[dir="auto"]')
+                caption = text_el.inner_text() if text_el else ""
 
-        logging.info(f"Fetched {len(posts)} FB posts for @{account}")
+                img_els = el.query_selector_all('img')
+                media_url = img_els[0].get_attribute('src') if img_els else None
+                is_video = bool(el.query_selector('video'))
+
+                posts.append({
+                    "post_id": "",  # Hard to get reliably
+                    "post_url": page.url,
+                    "caption": caption[:2000],
+                    "media_url": media_url,
+                    "is_video": is_video,
+                })
+
+            browser.close()
+            logging.info(f"Fetched {len(posts)} FB posts for @{account}")
     except Exception as e:
-        logging.error(f"FB page scraper failed for @{account}: {e}")
-        posts = []
+        logging.error(f"Playwright FB fetch failed: {e}")
 
     return posts
 
