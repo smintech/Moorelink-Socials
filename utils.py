@@ -11,7 +11,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import instaloader
 from openai import AsyncOpenAI, OpenAIError
-from facebook_scraper import get_posts
+from facebook_page_scraper import Facebook_scraper
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
 TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separate TG DB
@@ -270,53 +270,54 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
     return posts
 
 def fetch_fb_urls(account: str) -> List[Dict[str, Any]]:
-    """
-    Fetch latest public posts from a Facebook page (username or page name).
-    Returns list of dicts compatible with IG format for seamless bot use.
-    """
-    if not FB_SCRAPER_AVAILABLE:
-        logging.error("Facebook scraper not available – missing library")
+    if not FB_PAGE_SCRAPER_AVAILABLE:
+        logging.error("FB page scraper library missing")
         return []
 
     account = account.lstrip('@').lower()
     posts = []
     try:
-        # facebook-scraper settings: get up to POST_LIMIT posts
-        for post in get_posts(
-            account,
-            pages=2,  # usually enough for latest 5-10 posts
-            options={
-                "posts_per_page": 5,
-                "timeout": 30,
-                "allow_extra_requests": False,
-            }
-        ):
-            if len(posts) >= POST_LIMIT:
-                break
+        # Use chrome or firefox — chrome faster
+        scraper = Facebook_scraper(
+            page_name=account,
+            posts_count=POST_LIMIT,
+            browser="chrome",          # or "firefox"
+            headless=True,             # True = no browser window
+            timeout=120,
+            proxy=None                 # Add proxy later if blocked
+        )
 
+        # Scrape and get JSON
+        json_data = scraper.scrap_to_json()
+        import json
+        data = json.loads(json_data)
+
+        for post_key in data:
+            p = data[post_key]
             media_url = None
             is_video = False
 
-            # Prefer video if available
-            if post.get('video'):
-                media_url = post['video']
+            # Handle images/videos
+            if "video_url" in p and p["video_url"]:
+                media_url = p["video_url"]
                 is_video = True
-            elif post.get('image'):
-                media_url = post['image']
-            elif post.get('images'):
-                media_url = post['images'][0] if post['images'] else None
+            elif "image_url" in p and p["image_url"]:
+                media_url = p["image_url"]
 
             posts.append({
-                "post_id": str(post.get('post_id', '')),
-                "post_url": post.get('post_url') or f"https://facebook.com/{post.get('post_id')}",
-                "caption": post.get('text', '') or post.get('post_text', '') or '',
+                "post_id": p.get("post_id", ""),
+                "post_url": f"https://www.facebook.com/{account}/posts/{p.get('post_id')}" if p.get("post_id") else "",
+                "caption": p.get("content", "") or p.get("title", "") or "",
                 "media_url": media_url,
                 "is_video": is_video,
             })
 
-        logging.info(f"Fetched {len(posts)} Facebook posts for @{account}")
+            if len(posts) >= POST_LIMIT:
+                break
+
+        logging.info(f"Fetched {len(posts)} FB posts for @{account}")
     except Exception as e:
-        logging.error(f"Facebook fetch failed for @{account}: {e}")
+        logging.error(f"FB page scraper failed for @{account}: {e}")
         posts = []
 
     return posts
