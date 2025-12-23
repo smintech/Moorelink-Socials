@@ -336,50 +336,66 @@ def extract_og_meta(html: str, name: str) -> Optional[str]:
     # fallback: generic content attr
     return None
 
-def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
-    account = account.lstrip("@")
+def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
+    """
+    Improved FB fetch:
+    - Accepts handle (@davido) or full URL (https://www.facebook.com/DavidoMusic)
+    - Dedupes posts (no more same post 5 times)
+    - Better post_url (www.facebook.com – works for most public posts without login wall in 2025)
+    - Falls back to profile URL if no post_id
+    """
+    # Extract clean account name and build correct profile URL
+    if account_or_url.startswith("http"):
+        profile_url = account_or_url.rstrip("/")
+        account = profile_url.split("facebook.com/")[-1].split("?")[0].split("/")[0]
+    else:
+        account = account_or_url.lstrip("@")
+        profile_url = f"https://www.facebook.com/{account}"
+
     path = "get-profile-home-page-details"
-    params = {"urlSupplier": f"https://www.facebook.com/{account}"}
+    params = {"urlSupplier": profile_url}
 
     posts: List[Dict[str, Any]] = []
+    seen_ids = set()  # Prevent duplicates
+
     try:
         data = rapidapi_get(path, params=params, timeout=30)
     except Exception as e:
-        logging.warning("RapidAPI FB fetch failed for %s: %s", account, e)
-        data = {}
+        logging.warning("RapidAPI FB fetch failed for %s: %s", profile_url, e)
+        return []
 
-    # Defensive parsing – the working endpoint returns a "PHOTOS" array
-    photos = []
-    page_id = ""
-    if isinstance(data, dict):
-        photos = data.get("PHOTOS") or data.get("photos") or []
-        intro = data.get("INTRO_CARDS") or data.get("intro_cards") or {}
-        page_id = intro.get("PAGE_ID") or ""
+    if not isinstance(data, dict):
+        return []
 
-    # Normalize each photo/video item
-    for it in photos[:limit]:
+    photos = data.get("PHOTOS") or data.get("photos") or []
+
+    for it in photos:
+        if len(posts) >= limit:
+            break
+
+        post_id = it.get("id") or ""
+        if post_id in seen_ids:
+            continue
+        seen_ids.add(post_id)
+
         media_type = it.get("media", "Photo")
         is_video = bool(it.get("is_playable")) or media_type.lower() == "video"
         
-        # Prefer full-resolution uri, fallback to thumb
-        media_url = it.get("uri") or it.get("thumb") or it.get("image") or it.get("src") or ""
+        # Full quality first
+        media_url = it.get("uri") or it.get("thumb") or ""
         if not media_url:
             continue
 
-        post_id = it.get("id") or ""
-
-        # Build the cleanest possible mbasic link (no login wall)
-        if post_id:
-            post_url = f"https://mbasic.facebook.com/{account}/posts/{post_id}"
-        elif page_id:
-            post_url = f"https://mbasic.facebook.com/profile.php?id={page_id}"
+        # Best post_url: normal www (public posts often open without login)
+        if post_id and account:
+            post_url = f"https://www.facebook.com/{account}/posts/{post_id}"
         else:
-            post_url = f"https://mbasic.facebook.com/{account}"
+            post_url = profile_url  # Fallback to profile
 
         posts.append({
             "post_id": post_id,
             "post_url": post_url,
-            "caption": "",  # This endpoint does not provide captions/text
+            "caption": "",  # This endpoint doesn't give captions
             "media_url": media_url,
             "is_video": is_video,
             "likes": it.get("likes", 0),
@@ -387,8 +403,8 @@ def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]
             "shares": it.get("shares", 0),
         })
 
-    logging.info("fetch_fb_urls -> returned %d posts for @%s", len(posts), account)
-    return posts[:limit]
+    logging.info("fetch_fb_urls -> returned %d unique posts for %s", len(posts), profile_url)
+    return posts
 
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
     account = account.lstrip('@').lower()
