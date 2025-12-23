@@ -311,18 +311,42 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
 
     # Send new posts
     for post in new_posts:
+                # Determine correct "View on" text
         if platform == "x":
-            await message.reply_text(post['post_url'].replace("x.com", "fixupx.com"))
+            view_text = "View on X🐦"
+        elif platform == "fb":
+            view_text = "View on Facebook 🌐"
+        elif platform == "ig":
+            view_text = "View on Instagram 📸"
         else:
-            caption = post.get("caption", "")[:1024]
-            msg = f"<a href='{post['post_url']}'>View on IG</a>\n\n{caption}"
-            try:
-                if post.get("is_video"):
-                    await message.reply_video(post["media_url"], caption=msg, parse_mode="HTML")
-                else:
-                    await message.reply_photo(post["media_url"], caption=msg, parse_mode="HTML")
-            except:
-                await message.reply_text(msg, parse_mode="HTML")
+            view_text = "View Post 🔗"
+
+        # Build HTML link
+        link_html = f"<a href='{post['post_url']}'>{view_text}</a>" if post['post_url'] else ""
+
+        caption = post.get("caption", "")[:1024]
+        full_caption = f"{link_html}\n\n{caption}" if link_html else caption
+
+        try:
+            if post.get("is_video"):
+                await message.reply_video(
+                    video=post["media_url"],
+                    caption=full_caption,
+                    parse_mode="HTML"
+                )
+            else:
+                await message.reply_photo(
+                    photo=post["media_url"],
+                    caption=full_caption,
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            logging.warning("Failed to send media: %s", e)
+            await message.reply_text(
+                f"{full_caption}\n\nMedia: {post['media_url']}",
+                parse_mode="HTML",
+                disable_web_page_preview=False
+            )
         await asyncio.sleep(0.3)
 
     # AI Button
@@ -882,6 +906,19 @@ Answer in short, engaging Pidgin-mixed English. Use slang where e fit. Max 6 sen
         )
         return
         
+    text = update.message.text.strip().lower()
+
+    # Detect Facebook single post share links
+    if ("facebook.com/share/" in text or "mibextid=" in text or 
+        text.startswith("https://www.facebook.com/") or text.startswith("https://fb.watch/")):
+        # Clean the link (remove tracking)
+        clean_link = update.message.text.split("?")[0].rstrip("/")
+        await update.message.reply_text(
+            f"🌐 Single Facebook post:\n{clean_link}",
+            disable_web_page_preview=False
+        )
+        return
+
     # Admin broadcast
     if context.user_data.get("admin_broadcast"):
         if not is_admin(uid):
