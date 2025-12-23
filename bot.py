@@ -143,6 +143,39 @@ async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_message.reply_text("Unknown arg. Use: on|off|toggle|status")
 
+async def send_ai_button(message, count, platform, account, badge, context=None, auto_delete_after: int | None = None):
+    """
+    Send the AI analyze button. If `auto_delete_after` (seconds) provided and `context` job_queue
+    is available, schedule deletion after that many seconds. Otherwise do not delete.
+    """
+    button_text = f"Analyze {count} new post(s) with AI 🤖"
+    if badge['name'] in ('Diamond', 'Admin'):
+        button_text += " (Unlimited)"
+
+    analyze_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(button_text, callback_data=f"ai_analyze_{platform}_{account}")
+    ]])
+
+    final_msg = await message.reply_text(
+        f"✨ {count} new post(s) processed!\nTap below for sharp AI breakdown:",
+        reply_markup=analyze_kb
+    )
+
+    # optional: schedule deletion via job queue if requested
+    if auto_delete_after and context and getattr(context, "job_queue", None):
+        try:
+            # schedule a job that will delete the message
+            context.job_queue.run_once(
+                lambda c: c.bot.delete_message(chat_id=final_msg.chat.id, message_id=final_msg.message_id),
+                when=auto_delete_after,
+                data=None
+            )
+        except Exception as e:
+            # fallback: log only
+            logging.debug("Failed to schedule AI button deletion: %s", e)
+
+    return final_msg
+
 async def send_next_post_with_confirmation(update_or_query, context: ContextTypes.DEFAULT_TYPE, platform: str, account: str):
     """Send the next pending post with Continue/Cancel buttons."""
     user_data_key = f"pending_posts_{platform}_{account}"
@@ -172,8 +205,9 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
             uid = None
 
     # If no pending or index done -> show AI button summary and clear pending
+    # If no pending or index done -> show AI button summary and clear pending
     if not pending or pending.get("index", 0) >= pending.get("total", 0):
-        # If we don't have a user id, try to extract from message
+        # determine uid/message as before...
         if not uid and message and message.from_user:
             uid = message.from_user.id
 
@@ -184,23 +218,37 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
 
         badge = get_user_badge(uid)
 
+        # === NEW: store last_ai_context so ai_analyze callback sees the posts ===
+        # Prefer storing the posts that were processed (pending['posts'])
+        posts_to_store = []
+        if pending and isinstance(pending, dict):
+            posts_to_store = pending.get("posts", [])[:]  # copy
+        else:
+            # fallback: try previously stored context if any
+            posts_to_store = context.user_data.get(f"last_ai_context_{platform}_{account}", [])
+
+        # Save into context.user_data using the same key ai handler expects
+        context.user_data[f"last_ai_context_{platform}_{account}"] = posts_to_store
+
         # Compose a target message object to reply to
         target_msg = message or update_or_query  # fallback
 
         # Count: processed vs total (defensive)
         processed_count = pending.get("index", 0) if pending else 0
-        total_count = pending.get("total", processed_count) if pending else len(context.user_data.get(f"last_ai_context_{platform}_{account}", []))
+        total_count = pending.get("total", processed_count) if pending else len(posts_to_store)
 
-        # Show AI button (re-use your helper)
+        # Show AI button (re-use your helper). Do NOT auto-delete the AI button.
         await send_ai_button(
             target_msg,
             max(processed_count, total_count),
             platform,
             account,
-            badge
+            badge,
+            context=context,
+            auto_delete_after=None
         )
 
-        # Clear pending context
+        # Clear pending context AFTER we stored last_ai_context
         context.user_data.pop(user_data_key, None)
         return
 
@@ -294,20 +342,6 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
             logging.debug("schedule_delete not available or failed for preview message cleanup.")
 
     return
-async def send_ai_button(message, count, platform, account, badge):
-    button_text = f"Analyze {count} new post(s) with AI 🤖"
-    if badge['name'] in ('Diamond', 'Admin'):
-        button_text += " (Unlimited)"
-
-    analyze_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(button_text, callback_data=f"ai_analyze_{platform}_{account}")
-    ]])
-
-    final_msg = await message.reply_text(
-        f"✨ {count} new post(s) processed!\nTap below for sharp AI breakdown:",
-        reply_markup=analyze_kb
-    )
-    await schedule_delete(message.chat.id, final_msg.message_id)
 
 async def download_media(url: str) -> bytes:
     """Download media using urllib (no external deps) – async compatible"""
@@ -723,130 +757,82 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     if data.startswith("confirm_post_"):
-        # data format: confirm_post_<platform>_<account>_<idx>
         query = update.callback_query
-        await query.answer()  # acknowledge button press ASAP
+        await query.answer()  # acknowledge immediately
 
         parts = data.split("_")
         if len(parts) < 5:
             await query.answer("Error.", show_alert=True)
             return
+
         platform = parts[2]
         account = parts[3]
         try:
             idx = int(parts[4])
-        except Exception:
+        except:
             await query.answer("Invalid index.", show_alert=True)
             return
 
         user_data_key = f"pending_posts_{platform}_{account}"
         pending = context.user_data.get(user_data_key)
-        if not pending:
-            await query.answer("No pending posts found.", show_alert=True)
-            return
-
-        # ensure index matches expected pending index
-        expected_index = int(pending.get("index", 0))
-        if idx != expected_index:
-            await query.answer("This post expired or is out of sync.", show_alert=True)
-            # optionally refresh UI by calling send_next...
+        if not pending or pending.get("index", 0) != idx:
+            await query.answer("Post expired or out of order.", show_alert=True)
+            # Refresh current state
             await send_next_post_with_confirmation(query, context, platform, account)
             return
 
-        posts = pending.get("posts") or []
-        if idx < 0 or idx >= len(posts):
-            await query.answer("Post not found.", show_alert=True)
-            context.user_data.pop(user_data_key, None)
-            return
+        post = pending["posts"][idx]
 
-        post = posts[idx]
-
-        # Download media (safe way) — assumes download_media returns bytes or None
-        try:
-            media_bytes = await download_media(post.get("media_url"))
-        except Exception as e:
-            logging.exception("download_media raised: %s", e)
-            media_bytes = None
-
+        # Download and send clean post
+        media_bytes = await download_media(post.get("media_url"))
         if not media_bytes:
-            # Try to edit the confirmation message to indicate failure (if it had a caption)
-            try:
-                new_caption = (query.message.caption or "") + "\n\n❌ Failed to load media."
-                await query.edit_message_caption(caption=new_caption, reply_markup=None)
-            except Exception:
-                # If edit_caption fails (maybe it was a text message), fallback to editing text
-                try:
-                    await query.edit_message_text((query.message.text or "") + "\n\n❌ Failed to load media.", reply_markup=None)
-                except Exception:
-                    # ignore if we cannot edit
-                    pass
-
-            # Move pointer forward and continue
-            pending["index"] = expected_index + 1
-            context.user_data[user_data_key] = pending
+            await query.edit_message_caption(
+                caption=(query.message.caption or "") + "\n\n❌ Media failed to load",
+                reply_markup=None
+            )
+            pending["index"] += 1
             await send_next_post_with_confirmation(query, context, platform, account)
             return
 
-        # Build final post caption (with link if available)
-        view_text = {
-            "x": "View on X🐦",
-            "fb": "View on Facebook 🌐",
-            "ig": "View on Instagram 📸"
-        }.get(platform, "View Post 🔗")
+        view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
         link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
-        caption = (post.get("caption") or "")[:1024]
+        caption = (post.get("caption", "") or "")[:1024]
         full_caption = f"{link_html}\n\n{caption}" if link_html else caption
 
-        # Send the cleaned post (upload from bytes)
-        sent = None
+        bio = io.BytesIO(media_bytes)
+        if post.get("is_video"):
+            bio.name = "video.mp4"
+            sent = await query.message.reply_video(video=bio, caption=full_caption, parse_mode="HTML")
+        else:
+            bio.name = "photo.jpg"
+            sent = await query.message.reply_photo(photo=bio, caption=full_caption, parse_mode="HTML")
+
+        # Schedule auto-delete for sent post
+        await schedule_delete(context, sent.chat.id, sent.message_id)
+
+        # Edit old preview to "Sent!" and REMOVE buttons
         try:
-            bio = io.BytesIO(media_bytes)
-            # name helps Telegram infer type; choose mp4 for videos
-            if post.get("is_video"):
-                bio.name = "video.mp4"
-                sent = await query.message.reply_video(video=bio, caption=full_caption, parse_mode="HTML")
-            else:
-                bio.name = "photo.jpg"
-                sent = await query.message.reply_photo(photo=bio, caption=full_caption, parse_mode="HTML")
-        except Exception as e:
-            logging.exception("Failed to send cleaned media: %s", e)
-            # notify user and advance
+            old_caption = query.message.caption or query.message.text or ""
+            new_caption = old_caption.rstrip()  # remove any trailing buttons text
+            await query.edit_message_caption(
+                caption=new_caption + "\n\n✅ <b>Sent!</b>",
+                parse_mode="HTML",
+                reply_markup=None  # THIS REMOVES THE BUTTONS
+            )
+        except Exception:
             try:
-                await query.message.reply_text("Sent failed — cannot upload media.", parse_mode="HTML")
-            except Exception:
-                pass
-            # move to next
-            pending["index"] = expected_index + 1
-            context.user_data[user_data_key] = pending
-            await send_next_post_with_confirmation(query, context, platform, account)
-            return
+                await query.edit_message_text(
+                    text=new_caption + "\n\n✅ <b>Sent!</b>",
+                    reply_markup=None
+                )
+            except Exception as e:
+                logging.warning(f"Could not edit confirmation: {e}")
 
-        # Schedule deletion of the sent post preview (use callback message chat id)
-        try:
-            chat_id = query.message.chat.id
-            await schedule_delete(context, chat_id, sent.message_id)
-        except Exception as e:
-            logging.debug("schedule_delete failed or not awaitable: %s", e)
-            try:
-                schedule_delete(context, query.message.chat.id, sent.message_id)
-            except Exception:
-                pass
-
-        # Edit the old confirmation message to show it was sent
-        try:
-            old_caption = (query.message.caption or query.message.text or "")
-            new_caption = old_caption + "\n\n✅ <b>Sent!</b>"
-            # Prefer editing caption if that message had a caption
-            if query.message.caption is not None:
-                await query.edit_message_caption(caption=new_caption, parse_mode="HTML", reply_markup=None)
-            else:
-                await query.edit_message_text(text=new_caption, parse_mode="HTML", reply_markup=None)
-        except Exception as e:
-            logging.warning("Could not edit confirmation message: %s", e)
-
-        # Advance index and send next pending
-        pending["index"] = expected_index + 1
+        # Advance and send next
+        pending["index"] += 1
         context.user_data[user_data_key] = pending
+
+        # THIS IS THE KEY LINE — pass query (CallbackQuery) so it can get message context
         await send_next_post_with_confirmation(query, context, platform, account)
         return
 
