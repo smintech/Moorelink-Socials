@@ -1,4 +1,4 @@
-l# bot.py - FULL COMPLETE UPDATED FILE - NO EXCLUSIONS WHATSOEVER (December 22, 2025)
+# bot.py - FULL COMPLETE UPDATED FILE - NO EXCLUSIONS WHATSOEVER (December 22, 2025)
 # All original features preserved + Manual AI now fully button-driven (no /ai_call command)
 # Updated Groq models to current best: llama-3.3-70b-versatile (latest flagship)
 # Every single line from the original is included or appropriately modified – nothing omitted 😏
