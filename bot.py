@@ -771,18 +771,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data_key = f"pending_posts_{platform}_{account}"
         pending = context.user_data.get(user_data_key)
         if not pending or pending.get("index", 0) != idx:
+            logging.info(f"Stale click detected: expected index {pending.get('index', 'None')}, got {idx} for @{account}")
             await query.answer("Post expired or out of order.", show_alert=True)
-            # Refresh current state (pass the CallbackQuery so helper can find message)
             await send_next_post_with_confirmation(query, context, platform, account)
             return
 
         post = pending["posts"][idx]
 
+        # Download and send clean post
         media_bytes = await download_media(post.get("media_url"))
         if not media_bytes:
             await query.answer("Media failed to load.", show_alert=True)
             return
-            
+
         view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
         link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
         caption = (post.get("caption", "") or "")[:1024]
@@ -792,24 +793,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if post.get("is_video"):
             bio.name = "video.mp4"
-            sent = await context.bot.send_video(
-                chat_id=query.message.chat.id,
+            sent = await query.message.reply_video(
                 video=bio,
                 caption=full_caption,
                 parse_mode="HTML"
             )
         else:
             bio.name = "photo.jpg"
-            sent = await context.bot.send_photo(
-                chat_id=query.message.chat.id,
+            sent = await query.message.reply_photo(
                 photo=bio,
                 caption=full_caption,
                 parse_mode="HTML"
             )
 
-        # Schedule auto-delete for sent post (use sent's ids)
+        # Schedule auto-delete for sent post
         await schedule_delete(context, sent.chat.id, sent.message_id)
         
+        # Edit old preview to "Sent!" and remove buttons
         try:
             await context.bot.edit_message_caption(
                 chat_id=query.message.chat.id,
@@ -819,20 +819,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=None
             )
         except Exception:
-            await context.bot.edit_message_text(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                text=(query.message.text or "") + "\n\n✅ Sent!",
-                reply_markup=None
-            )
-        except Exception as e:
-            logging.warning(f"Could not edit confirmation: {e}")
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=query.message.chat.id,
+                    message_id=query.message.message_id,
+                    text=(query.message.text or "") + "\n\n✅ <b>Sent!</b>",
+                    parse_mode="HTML",
+                    reply_markup=None
+                )
+            except Exception as e:
+                logging.warning(f"Could not edit confirmation: {e}")
 
-        # Advance and persist before showing next preview
+        # Advance index and persist
         pending["index"] += 1
         context.user_data[user_data_key] = pending
 
-        # Show next preview (pass CallbackQuery so helper can locate the message)
+        # Show next preview
         await send_next_post_with_confirmation(query, context, platform, account)
         return
     # Cancel remaining posts
