@@ -13,6 +13,8 @@ import instaloader
 from openai import AsyncOpenAI, OpenAIError
 import json
 import urllib.parse
+import re
+from html import unescape
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
 TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separate TG DB
@@ -21,7 +23,8 @@ POST_LIMIT = 5
 GROQ_API_KEY=os.getenv("GROQ_KEY")
 RAPIDAPI_KEY = os.getenv("RAPID_API")
 RAPIDAPI_HOST = 'facebook-pages-scraper3.p.rapidapi.com'
-Base = "https://facebook-pages-scraper3.p.rapidapi.com"
+Base = f"https://{RAPIDAPI_HOST}"
+APIFY_FALLBACK_TIMEOUT = 8
 # ================ DB CONNECTIONS ============
 def get_db():
     if not DB_URL:
@@ -273,61 +276,130 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
         logging.debug("fetch_ig_urls failed", exc_info=True)
     return posts
 
-def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
-    account = account.lstrip("@")
+def rapidapi_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20, retries: int = 2) -> Dict[str, Any]:
+    """
+    Call RapidAPI product at the specified host.
+    path: e.g. "get-profile-home-page-details"
+    """
+    if not RAPIDAPI_KEY:
+        raise RuntimeError("RAPIDAPI_KEY not set in environment")
 
-    path = "get-profile-home-page-details"  # confirmed working
-    params = {
-        "urlSupplier": f"https://www.facebook.com/{account}",
+    url = f"{RAPIDAPI_BASE.rstrip('/')}/{path.lstrip('/')}"
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; Bot/1.0; +https://example.com/bot)"
     }
 
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, headers=headers, params=params or {}, timeout=timeout)
+            # helpful debug on non-200
+            if resp.status_code != 200:
+                logging.warning("rapidapi_get non-200 status %s for %s (attempt %d). Body: %.500s",
+                                resp.status_code, url, attempt+1, resp.text[:500])
+            resp.raise_for_status()
+            data = resp.json()
+            return data
+        except requests.HTTPError as e:
+            last_exc = e
+            # if rate limited (429) or server error, back off a bit
+            status = getattr(e.response, "status_code", None)
+            if status in (429, 502, 503, 504):
+                backoff = 1.5 * (attempt + 1)
+                logging.warning("RapidAPI temporary error %s for %s — backing off %.1fs", status, url, backoff)
+                time.sleep(backoff)
+                continue
+            # otherwise break and re-raise after logging
+            logging.exception("RapidAPI HTTP error for %s: %s", url, e)
+            raise
+        except Exception as e:
+            last_exc = e
+            logging.exception("RapidAPI request failed for %s (attempt %d): %s", url, attempt+1, e)
+            time.sleep(1.0 * (attempt + 1))
+            continue
+
+    # all retries failed
+    raise RuntimeError(f"RapidAPI call failed after {retries+1} 
+
+def extract_og_meta(html: str, name: str) -> Optional[str]:
+    """Extract content of og:name or name meta tags. Returns first match or None."""
+    # look for property="og:image" or name="twitter:image"
+    m = re.search(r'<meta[^>]+(?:property|name)=["\'](?:og:|twitter:)?' + re.escape(name) + r'["\'][^>]*content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+    if m:
+        return unescape(m.group(1))
+    # fallback: generic content attr
+    return None
+
+def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
+    account = account.lstrip("@")
+    path = "get-profile-home-page-details"
+    params = {"urlSupplier": f"https://www.facebook.com/{account}"}
+
+    posts: List[Dict[str, Any]] = []
     try:
         data = rapidapi_get(path, params=params, timeout=30)
     except Exception as e:
-        logging.error("RapidAPI FB fetch failed: %s", e)
-        return []
+        logging.warning("RapidAPI FB fetch failed for %s: %s", account, e)
+        data = {}
 
-    posts: List[Dict[str, Any]] = []
+    # Defensive parsing (your working actor returns PHOTOS)
+    photos = []
+    if isinstance(data, dict):
+        photos = data.get("PHOTOS") or data.get("photos") or []
 
-    photos = data.get("PHOTOS", [])[:limit]
-    page_id = data.get("INTRO_CARDS", {}).get("PAGE_ID", "")
-
-    for it in photos:
+    # Normalize items from the PHOTOS block
+    for it in photos[:limit]:
         media_type = it.get("media", "Photo")
-        is_video = bool(it.get("is_playable")) or media_type == "Video"
-
-        media_url = (
-            it.get("uri")
-            or it.get("thumb")
-            or it.get("image")
-            or ""
-        )
-
-        # skip empty media
+        is_video = bool(it.get("is_playable")) or media_type.lower() == "video"
+        media_url = it.get("uri") or it.get("thumb") or it.get("image") or it.get("src") or ""
         if not media_url:
             continue
-
-        post_id = it.get("id", "")
-
-        # mbasic avoids login wall better than www
+        post_id = it.get("id") or ""
+        # use mbasic link (more likely to avoid login redirect)
         if post_id:
             post_url = f"https://mbasic.facebook.com/{account}/posts/{post_id}"
         else:
             post_url = f"https://mbasic.facebook.com/{account}"
-
         posts.append({
             "post_id": post_id,
             "post_url": post_url,
-            "caption": "",      # endpoint doesn’t return text yet
+            "caption": (it.get("text") or it.get("caption") or "")[:1024],
             "media_url": media_url,
             "is_video": is_video,
-            "likes": 0,
-            "comments": 0,
-            "shares": 0,
+            "likes": it.get("likes", 0),
+            "comments": it.get("comments", 0),
+            "shares": it.get("shares", 0),
         })
 
-    logging.info("Fetched %d media posts via RapidAPI for @%s", len(posts), account)
-    return posts
+    # If RapidAPI returned nothing useful, attempt a quick mbasic fallback (scrape OG tags)
+    if not posts:
+        try:
+            mbasic = f"https://mbasic.facebook.com/{account}"
+            logging.info("RapidAPI empty for %s — trying mbasic fallback: %s", account, mbasic)
+            r = requests.get(mbasic, headers={"User-Agent":"Mozilla/5.0"}, timeout=APIFY_FALLBACK_TIMEOUT)
+            if r.status_code == 200 and r.text:
+                html = r.text
+                og_img = extract_og_meta(html, "image") or extract_og_meta(html, "image:url")
+                og_desc = extract_og_meta(html, "description") or extract_og_meta(html, "title")
+                if og_img:
+                    posts.append({
+                        "post_id": "",
+                        "post_url": mbasic,
+                        "caption": (og_desc or "")[:1024],
+                        "media_url": og_img,
+                        "is_video": False,
+                        "likes": 0,
+                        "comments": 0,
+                        "shares": 0,
+                    })
+        except Exception as e:
+            logging.debug("mbasic fallback failed for %s: %s", account, e)
+
+    logging.info("fetch_fb_urls -> returned %d posts for @%s", len(posts), account)
+    return posts[:limit]
 
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
     account = account.lstrip('@').lower()
