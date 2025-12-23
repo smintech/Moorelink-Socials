@@ -278,8 +278,8 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
 
 def rapidapi_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20, retries: int = 2) -> Dict[str, Any]:
     """
-    Call RapidAPI product at the specified host.
-    path: e.g. "get-profile-home-page-details"
+    Call a RapidAPI product endpoint hosted at RAPIDAPI_HOST.
+    Example: rapidapi_get("get-profile-home-page-details", params={"urlSupplier": "..."})
     """
     if not RAPIDAPI_KEY:
         raise RuntimeError("RAPIDAPI_KEY not set in environment")
@@ -296,33 +296,36 @@ def rapidapi_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: in
     for attempt in range(retries + 1):
         try:
             resp = requests.get(url, headers=headers, params=params or {}, timeout=timeout)
-            # helpful debug on non-200
             if resp.status_code != 200:
-                logging.warning("rapidapi_get non-200 status %s for %s (attempt %d). Body: %.500s",
-                                resp.status_code, url, attempt+1, resp.text[:500])
+                logging.warning(
+                    "rapidapi_get non-200 status %s for %s (attempt %d). Body: %.500s",
+                    resp.status_code, url, attempt + 1, resp.text[:500]
+                )
             resp.raise_for_status()
-            data = resp.json()
-            return data
+            # return parsed json
+            return resp.json()
         except requests.HTTPError as e:
             last_exc = e
-            # if rate limited (429) or server error, back off a bit
             status = getattr(e.response, "status_code", None)
             if status in (429, 502, 503, 504):
                 backoff = 1.5 * (attempt + 1)
-                logging.warning("RapidAPI temporary error %s for %s — backing off %.1fs", status, url, backoff)
+                logging.warning(
+                    "RapidAPI temporary error %s for %s — backing off %.1fs",
+                    status, url, backoff
+                )
                 time.sleep(backoff)
                 continue
-            # otherwise break and re-raise after logging
             logging.exception("RapidAPI HTTP error for %s: %s", url, e)
             raise
         except Exception as e:
             last_exc = e
-            logging.exception("RapidAPI request failed for %s (attempt %d): %s", url, attempt+1, e)
+            logging.exception("RapidAPI request failed for %s (attempt %d): %s", url, attempt + 1, e)
+            # jittered backoff
             time.sleep(1.0 * (attempt + 1))
             continue
 
-    # all retries failed
-    raise RuntimeError(f"RapidAPI call failed after {retries+1} 
+    # all retries failed -> raise a clear error
+    raise RuntimeError(f"RapidAPI call failed after {retries + 1}
 
 def extract_og_meta(html: str, name: str) -> Optional[str]:
     """Extract content of og:name or name meta tags. Returns first match or None."""
