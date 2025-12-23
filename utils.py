@@ -11,7 +11,6 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import instaloader
 from openai import AsyncOpenAI, OpenAIError
-from playwright.async_api import async_playwright
 import json
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
@@ -270,74 +269,49 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
         logging.debug("fetch_ig_urls failed", exc_info=True)
     return posts
 
-FB_STATE_FILE = "fb_state.json"  # Cookies saved here
+APIFY_API_TOKEN = os.getenv("APIFY")  # Put in env vars on Railway
 
-async def fetch_fb_urls(account: str) -> List[Dict[str, Any]]:
-    """
-    Async Facebook fetcher using Playwright with saved login cookies.
-    Works perfectly inside async Telegram bot.
-    """
-    account = account.lstrip('@').lower()
+async def fetch_fb_urls(account: str, limit: int = 10) -> List[Dict]:
+    account = account.lstrip('@')
+    actor_id = "apify/facebook-posts-scraper"  # Or check exact ID on the page
+    
+    url = "https://api.apify.com/v2/acts/apify~facebook-posts-scraper/runs"
+    payload = {
+        "startUrls": [{"url": f"https://www.facebook.com/{account}"}],
+        "resultsLimit": limit
+    }
+    headers = {"Authorization": f"Bearer {APIFY_API_TOKEN}"}
+    
     posts = []
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)  # First time: set False to login manually
-            context = await browser.new_context()
-
-            # Load saved cookies if exist
-            if os.path.exists(FB_STATE_FILE):
-                try:
-                    cookies = json.load(open(FB_STATE_FILE))
-                    await context.add_cookies(cookies)
-                    logging.info("Loaded saved Facebook login cookies")
-                except Exception as e:
-                    logging.warning(f"Failed to load cookies: {e}")
-
-            page = await context.new_page()
-            await page.goto(f"https://www.facebook.com/{account}", wait_until="networkidle")
-
-            # First-time login reminder
-            if not os.path.exists(FB_STATE_FILE):
-                logging.warning("No FB login cookies found. Set headless=False once, login manually, then restart.")
-                # Save cookies after manual login (next run will have them)
-                cookies = await context.cookies()
-                json.dump(cookies, open(FB_STATE_FILE, 'w'), indent=2)
-                await browser.close()
-                return []  # Empty this time, works next restart
-
-            # Scroll to load posts
-            for _ in range(10):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(3000)
-
-            # Extract posts – updated selectors for late 2025 FB layout
-            articles = await page.query_selector_all('div[role="article"]')
-            for article in articles[:POST_LIMIT]:
-                # Caption
-                caption_elem = await article.query_selector('div[dir="auto"] > div > span')
-                caption = await caption_elem.inner_text() if caption_elem else ""
-
-                # Media
-                img_elem = await article.query_selector('img')
-                media_url = await img_elem.get_attribute('src') if img_elem else None
-
-                video_elem = await article.query_selector('video')
-                is_video = bool(video_elem)
-
-                if media_url or caption:
-                    posts.append({
-                        "post_id": "",  # Not easily available
-                        "post_url": f"https://www.facebook.com/{account}",
-                        "caption": caption.strip()[:2000],
-                        "media_url": media_url,
-                        "is_video": is_video,
-                    })
-
-            await browser.close()
-            logging.info(f"Fetched {len(posts)} Facebook posts for @{account}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status == 201:
+                    data = await resp.json()
+                    run_id = data['data']['id']
+                    
+                    # Wait for run to finish & get results (poll or webhook for production)
+                    dataset_id = data['data']['defaultDatasetId']
+                    results_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+                    async with session.get(results_url, headers=headers) as result_resp:
+                        if result_resp.status == 200:
+                            items = await result_resp.json()
+                            for item in items:
+                                posts.append({
+                                    "caption": item.get('text', ''),
+                                    "media_url": item.get('thumb') or item.get('image'),
+                                    "is_video": 'video' in item.get('text', '').lower(),  # or check fields
+                                    "post_url": item.get('url'),
+                                    "likes": item.get('likes'),
+                                    "comments": item.get('comments'),
+                                    "shares": item.get('shares'),
+                                })
+                            logging.info(f"Fetched {len(posts)} FB posts via Apify from @{account}")
+                else:
+                    logging.error(f"Apify run failed: {resp.status}")
     except Exception as e:
-        logging.error(f"Facebook fetch failed for @{account}: {e}")
-
+        logging.error(f"Apify FB fetch error: {e}")
+    
     return posts
 
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
@@ -356,8 +330,6 @@ def fetch_latest_urls(platform: str, account: str) -> List[str]:
             save_url("ig", account, p["url"])
         return [p["url"] for p in new_ig]
     elif platform == "fb":
-        if not FB_SCRAPER_AVAILABLE:
-            return []
         new_fb = fetch_fb_urls(account)
         for p in new_fb:
             save_url("fb", account, p["post_url"])
