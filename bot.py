@@ -86,6 +86,24 @@ ai_tasks: Dict[int, asyncio.Task] = {}
 def is_admin(user_id: Optional[int]) -> bool:
     return bool(user_id and user_id in ADMIN_IDS)
 
+def admin_only(handler_func):
+    """Decorator for async handlers — blocks non-admins early and sends an error."""
+    @wraps(handler_func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        user_id = user.id if user else None
+        if not is_admin(user_id):
+            if update.callback_query:
+                await update.callback_query.answer("❌ You are not authorized.", show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text("❌ You are not authorized to use this command.")
+            return
+        return await handler_func(update, context, *args, **kwargs)
+    return wrapper
+
+def get_invite_link(bot_username: str, user_id: int) -> str:
+    return f"https://t.me/{bot_username}?start={user_id}"
+
 @admin_only
 async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -122,24 +140,6 @@ async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.effective_message.reply_text("Unknown arg. Use: on|off|toggle|status")
-
-def admin_only(handler_func):
-    """Decorator for async handlers — blocks non-admins early and sends an error."""
-    @wraps(handler_func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user = update.effective_user
-        user_id = user.id if user else None
-        if not is_admin(user_id):
-            if update.callback_query:
-                await update.callback_query.answer("❌ You are not authorized.", show_alert=True)
-            elif update.effective_message:
-                await update.effective_message.reply_text("❌ You are not authorized to use this command.")
-            return
-        return await handler_func(update, context, *args, **kwargs)
-    return wrapper
-
-def get_invite_link(bot_username: str, user_id: int) -> str:
-    return f"https://t.me/{bot_username}?start={user_id}"
 
 # ================ UI BUILDERS ================
 def build_main_menu():
