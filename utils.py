@@ -258,73 +258,57 @@ def fetch_x_urls(account: str) -> List[str]:
 
 def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
     """
-    Reliable Instagram scraper 2025 – uses public dummy API (no login, fast, works well)
-    Returns up to POST_LIMIT posts with direct media URLs that Telegram accepts.
+    Reliable Instagram scraper Dec 2025 – uses i.instagram.com/api/v1/users/web_profile_info/
+    No login needed, direct media URLs wey Telegram go accept.
     """
     account = account.lstrip('@').lower()
     posts = []
-    
-    # Public Instagram JSON endpoint (unofficial but very stable)
-    query_hash = "58b6785bea111c67129decbe6a448951"  # edge_owner_to_timeline_media (current Dec 2025)
-    end_cursor = ""
-    url = f"https://www.instagram.com/{account}/?__a=1&__d=dis"
-    
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "User-Agent": "Instagram 219.0.0.12.119 Android (30/11; 480dpi; 1080x1920; samsung; SM-G998B; beyond2; exynos990; en_US)",
+        "Accept": "*/*",
+        "Accept-Language": "en-US",
         "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
+        "X-IG-App-ID": "936619743392459",   # Current App ID (Dec 2025)
+        "X-IG-WWW-Claim": "0",              # Optional but helps
+        "Connection": "keep-alive"
     }
 
+    url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={account}"
+
     try:
-        # First request – get user ID and initial posts
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=20)
         if resp.status_code != 200:
-            logging.warning(f"IG initial fetch failed {account}: {resp.status_code}")
+            logging.warning(f"IG fetch failed for @{account}: status {resp.status_code}")
             return []
 
-        try:
-            data = resp.json()
-        except:
-            # Fallback: try graphql endpoint
-            graphql_url = f"https://www.instagram.com/graphql/query/?query_hash={query_hash}&variables=%7B%22id%22%3A%22%7Buser_id%7D%22%2C%22first%22%3A12%2C%22after%22%3A%22%7Bend_cursor%7D%22%7D"
-            # We go use a known working public proxy endpoint
-            proxy_url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={account}"
-            proxy_headers = {
-                "User-Agent": "Instagram 219.0.0.12.119 Android",
-                "X-IG-App-ID": "936619743392459"
-            }
-            resp2 = requests.get(proxy_url, headers=proxy_headers, timeout=15)
-            if resp2.status_code != 200:
-                logging.warning(f"IG proxy fetch failed {account}: {resp2.status_code}")
-                return []
-            data2 = resp2.json()
-            user_data = data2.get("data", {}).get("user", {})
-            edge = user_data.get("edge_owner_to_timeline_media", {})
-        else:
-            user_data = data.get("graphql", {}).get("user", {})
-            edge = user_data.get("edge_owner_to_timeline_media", {})
+        data = resp.json()
+        user_data = data.get("data", {}).get("user", {})
+        if not user_data:
+            logging.warning(f"No user data for @{account}")
+            return []
 
-        edges = edge.get("edges", [])
-        for node in edges:
-            if len(posts) >= POST_LIMIT:
-                break
-            item = node["node"]
-            shortcode = item["shortcode"]
+        edges = user_data.get("edge_owner_to_timeline_media", {}).get("edges", [])
+        for edge in edges[:POST_LIMIT]:
+            node = edge.get("node", {})
+            shortcode = node.get("shortcode")
+            if not shortcode:
+                continue
+
             post_url = f"https://www.instagram.com/p/{shortcode}/"
-            is_video = item.get("is_video", False)
+            is_video = node.get("is_video", False)
             caption = ""
-            if item.get("edge_media_to_caption", {}).get("edges"):
-                caption = item["edge_media_to_caption"]["edges"][0]["node"]["text"]
+            if node.get("edge_media_to_caption", {}).get("edges"):
+                caption_edges = node["edge_media_to_caption"]["edges"]
+                if caption_edges:
+                    caption = caption_edges[0]["node"].get("text", "")
 
-            # Get best media URL
+            # Best media URL
             if is_video:
-                media_url = item.get("video_url")  # direct mp4 – usually works!
+                media_url = node.get("video_url", "")
             else:
-                candidates = item.get("display_resources", [])
-                media_url = candidates[-1]["src"] if candidates else item.get("display_url", "")
+                resources = node.get("display_resources", [])
+                media_url = resources[-1]["src"] if resources else node.get("display_url", "")
 
             if media_url:
                 posts.append({
@@ -337,7 +321,7 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
         logging.info(f"Successfully fetched {len(posts)} IG posts for @{account}")
 
     except Exception as e:
-        logging.warning(f"fetch_ig_urls failed for @{account}: {e}")
+        logging.warning(f"fetch_ig_urls exception for @{account}: {e}")
 
     return posts
 
