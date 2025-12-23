@@ -144,79 +144,156 @@ async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Unknown arg. Use: on|off|toggle|status")
 
 async def send_next_post_with_confirmation(update_or_query, context: ContextTypes.DEFAULT_TYPE, platform: str, account: str):
-    """Send the next pending post with Continue/Cancel buttons"""
+    """Send the next pending post with Continue/Cancel buttons."""
     user_data_key = f"pending_posts_{platform}_{account}"
     pending = context.user_data.get(user_data_key)
 
-    if not pending or pending["index"] >= pending["total"]:
-        if hasattr(update_or_query, 'effective_user'):
-            uid = update_or_query.effective_user.id
-        elif hasattr(update_or_query, 'from_user'):
-            uid = update_or_query.from_user.id
-        elif hasattr(update_or_query, 'chat'):
-            uid = update_or_query.chat.id  # Fallback for chat/job contexts
-        else:
-            logging.warning("Could not extract uid – skipping AI button")
+    # Helper: extract message and uid from either Update / CallbackQuery / Message-like objects
+    message = None
+    uid = None
+    # If this is an Update with a callback_query
+    if hasattr(update_or_query, "callback_query") and getattr(update_or_query, "callback_query"):
+        cq = update_or_query.callback_query
+        message = cq.message
+        uid = cq.from_user.id if cq.from_user else (cq.message.from_user.id if cq.message and cq.message.from_user else None)
+    # If this is a regular Update with an effective_message/user
+    elif hasattr(update_or_query, "effective_message") and update_or_query.effective_message:
+        message = update_or_query.effective_message
+        uid = update_or_query.effective_user.id if update_or_query.effective_user else None
+    # If this is directly a Message-like object (rare)
+    elif hasattr(update_or_query, "chat") and hasattr(update_or_query, "from_user"):
+        message = update_or_query
+        uid = update_or_query.from_user.id
+    else:
+        # last resort: try attributes
+        try:
+            uid = getattr(update_or_query, "from_user", None).id
+        except Exception:
+            uid = None
+
+    # If no pending or index done -> show AI button summary and clear pending
+    if not pending or pending.get("index", 0) >= pending.get("total", 0):
+        # If we don't have a user id, try to extract from message
+        if not uid and message and message.from_user:
+            uid = message.from_user.id
+
+        if not uid:
+            logging.warning("send_next_post_with_confirmation: could not determine uid; clearing pending and exiting.")
             context.user_data.pop(user_data_key, None)
             return
 
-    badge = get_user_badge(uid)
+        badge = get_user_badge(uid)
 
-    # Safely get message to reply to
-    if hasattr(update_or_query, 'effective_message'):
-        msg = update_or_query.effective_message
-    elif hasattr(update_or_query, 'message'):
-        msg = update_or_query.message
-    else:
-        msg = update_or_query  # Assume Message
+        # Compose a target message object to reply to
+        target_msg = message or update_or_query  # fallback
 
-    # Count: prefer processed, fallback to total or stored context
-    processed_count = pending.get("index", 0) if pending else 0
-    total_count = pending.get("total", processed_count) if pending else len(context.user_data.get(f"last_ai_context_{platform}_{account}", []))
+        # Count: processed vs total (defensive)
+        processed_count = pending.get("index", 0) if pending else 0
+        total_count = pending.get("total", processed_count) if pending else len(context.user_data.get(f"last_ai_context_{platform}_{account}", []))
 
-    await send_ai_button(
-        msg,
-        max(processed_count, total_count),  # Use max to ensure correct count
-        platform,
-        account,
-        badge
-    )
+        # Show AI button (re-use your helper)
+        await send_ai_button(
+            target_msg,
+            max(processed_count, total_count),
+            platform,
+            account,
+            badge
+        )
 
-    context.user_data.pop(user_data_key, None)
-    return
-current_idx = pending["index"]
-post = pending["posts"][current_idx]
+        # Clear pending context
+        context.user_data.pop(user_data_key, None)
+        return
 
-    # Build caption
-    view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
-    link_html = f"<a href='{post['post_url']}'>{view_text}</a>" if post['post_url'] else ""
-    caption = post.get("caption", "")[:1024]
+    # At this point we have pending posts and an index to send
+    # Ensure message and uid exist
+    if not message:
+        logging.warning("send_next_post_with_confirmation: no message object to reply to; aborting.")
+        return
+    if not uid and message.from_user:
+        uid = message.from_user.id
+
+    # Defensive pending shape
+    posts = pending.get("posts") or []
+    current_idx = int(pending.get("index", 0))
+    total = int(pending.get("total", len(posts)))
+
+    if current_idx < 0 or current_idx >= len(posts):
+        logging.warning("send_next_post_with_confirmation: index out of range (%s) for @%s", current_idx, account)
+        # Clear pending to avoid loops
+        context.user_data.pop(user_data_key, None)
+        await message.reply_text("No more pending posts.")
+        return
+
+    post = posts[current_idx]
+
+    # Build caption + link
+    view_text = {
+        "x": "View on X🐦",
+        "fb": "View on Facebook 🌐",
+        "ig": "View on Instagram 📸"
+    }.get(platform, "View Post 🔗")
+
+    link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get("post_url") else ""
+    caption = (post.get("caption") or "")[:1024]
     full_caption = f"{link_html}\n\n{caption}" if link_html else caption
 
     # Confirmation keyboard
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"✅ Send this post ({current_idx + 1}/{pending['total']})", callback_data=f"confirm_post_{platform}_{account}_{current_idx}"),
-        InlineKeyboardButton("❌ Cancel remaining", callback_data=f"cancel_posts_{platform}_{account}")
+        InlineKeyboardButton(
+            f"✅ Send this post ({current_idx + 1}/{total})",
+            callback_data=f"confirm_post_{platform}_{account}_{current_idx}"
+        ),
+        InlineKeyboardButton(
+            "❌ Cancel remaining",
+            callback_data=f"cancel_posts_{platform}_{account}"
+        )
     ]])
 
-    # Send preview (photo/video)
-    if post.get("is_video"):
-        preview_msg = await update_or_query.effective_message.reply_video(
-            video=post["media_url"],
-            caption=full_caption + "\n\n Move to next post⏭️?",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
-    else:
-        preview_msg = await update_or_query.effective_message.reply_photo(
-            photo=post["media_url"],
-            caption=full_caption + "\n\n Move to next post⏭️?",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
+    # Send preview (photo/video) with graceful error handling
+    preview_msg = None
+    try:
+        if post.get("is_video"):
+            preview_msg = await message.reply_video(
+                video=post.get("media_url"),
+                caption=(full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        else:
+            preview_msg = await message.reply_photo(
+                photo=post.get("media_url"),
+                caption=(full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+    except Exception as e:
+        logging.exception("Failed to send preview media for %s/%s idx=%s: %s", platform, account, current_idx, e)
+        # Fallback: send as text with link + caption and the keyboard
+        try:
+            preview_msg = await message.reply_text(
+                (full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        except Exception as e2:
+            logging.exception("Fallback text send also failed: %s", e2)
+            # give up and clear pending to avoid stuck state
+            context.user_data.pop(user_data_key, None)
+            return
 
-    await schedule_delete(context, update.message.chat.id, sent.message_id)
+    # Schedule deletion of the preview if you have a helper that handles it.
+    # Use the actual chat id and the message id we just sent.
+    try:
+        # schedule_delete(context, chat_id, message_id) — keep your existing helper signature
+        await schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
+    except Exception:
+        # If schedule_delete is not awaitable or has different signature, try non-await fallback
+        try:
+            schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
+        except Exception:
+            logging.debug("schedule_delete not available or failed for preview message cleanup.")
 
+    return
 async def send_ai_button(message, count, platform, account, badge):
     button_text = f"Analyze {count} new post(s) with AI 🤖"
     if badge['name'] in ('Diamond', 'Admin'):
