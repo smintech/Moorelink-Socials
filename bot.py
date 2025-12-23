@@ -149,39 +149,43 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
     pending = context.user_data.get(user_data_key)
 
     if not pending or pending["index"] >= pending["total"]:
-        # All posts processed (or cancelled early) → show AI analyze button
-        badge = get_user_badge(uid)  # uid already available from outer scope
-
-        # Safely get the message object to reply to
-        if hasattr(update_or_query, 'effective_message'):
-            msg = update_or_query.effective_message
-        elif hasattr(update_or_query, 'message'):
-            msg = update_or_query.message
+        if hasattr(update_or_query, 'effective_user'):
+            uid = update_or_query.effective_user.id
+        elif hasattr(update_or_query, 'from_user'):
+            uid = update_or_query.from_user.id
+        elif hasattr(update_or_query, 'chat'):
+            uid = update_or_query.chat.id  # Fallback for chat/job contexts
         else:
-            msg = update_or_query  # already a Message object
+            logging.warning("Could not extract uid – skipping AI button")
+            context.user_data.pop(user_data_key, None)
+            return
 
-        # Determine how many posts were actually processed/sent
-        processed_count = pending["index"] if pending else 0
-        total_count = pending["total"] if pending else 0
+    badge = get_user_badge(uid)
 
-        # Fallback to stored context if pending cleared early
-        if processed_count == 0:
-            stored_posts = context.user_data.get(f"last_ai_context_{platform}_{account}", [])
-            processed_count = len(stored_posts)
+    # Safely get message to reply to
+    if hasattr(update_or_query, 'effective_message'):
+        msg = update_or_query.effective_message
+    elif hasattr(update_or_query, 'message'):
+        msg = update_or_query.message
+    else:
+        msg = update_or_query  # Assume Message
 
-        await send_ai_button(
-            msg,
-            processed_count,
-            platform,
-            account,
-            badge
-        )
+    # Count: prefer processed, fallback to total or stored context
+    processed_count = pending.get("index", 0) if pending else 0
+    total_count = pending.get("total", processed_count) if pending else len(context.user_data.get(f"last_ai_context_{platform}_{account}", []))
 
-        # Clean up pending session
-        context.user_data.pop(user_data_key, None)
-        return
-    current_idx = pending["index"]
-    post = pending["posts"][current_idx]
+    await send_ai_button(
+        msg,
+        max(processed_count, total_count),  # Use max to ensure correct count
+        platform,
+        account,
+        badge
+    )
+
+    context.user_data.pop(user_data_key, None)
+    return
+current_idx = pending["index"]
+post = pending["posts"][current_idx]
 
     # Build caption
     view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
@@ -211,7 +215,7 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
             reply_markup=keyboard
         )
 
-    await schedule_delete(update_or_query.effective_message.chat.id, preview_msg.message_id)
+    await schedule_delete(context, update.message.chat.id, sent.message_id)
 
 async def send_ai_button(message, count, platform, account, badge):
     button_text = f"Analyze {count} new post(s) with AI 🤖"
@@ -352,14 +356,14 @@ async def delete_message(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
     except Exception:
         pass
-async def schedule_delete(chat_id: int, message_id: int, delay_seconds: int = 86400):
-    context = ContextTypes.DEFAULT_TYPE()
-    context.job_queue.run_once(
-        delete_message,
-        when=delay_seconds,
-        data={"chat_id": chat_id, "message_id": message_id},
-        name=f"delete_{message_id}"
-    )
+async def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_seconds: int = 86400):
+    if context.job_queue:
+        context.job_queue.run_once(
+            delete_message,
+            when=delay_seconds,
+            data={"chat_id": chat_id, "message_id": message_id},
+            name=f"delete_{message_id}"
+        )
 
 # ================ UNIFIED FETCH & AI BUTTON ================
 async def handle_fetch_and_ai(update, context, platform, account, query=None, force: bool = False):
@@ -500,7 +504,7 @@ async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTyp
                         chat_id=chat_id,
                         text=f"🤖 AI Result (model: {model_id}, source: {source}):\n\n{content}"
                     )
-                    await schedule_delete(query.message.chat.id, query.message.message_id)
+                    await schedule_delete(context, update.message.chat.id, sent.message_id)
                 else:
                     await context.bot.send_message(
                         chat_id=chat_id,
@@ -536,7 +540,7 @@ async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTyp
         # Clean up the working message if present
         try:
             if working_msg:
-                await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
+                await schedule_delete(context, update.message.chat.id, sent.message_id)
         except Exception:
             # not critical if delete fails
             pass
@@ -605,7 +609,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         await query.edit_message_text("🤖 Analyzing with Nigerian fire...")
-        await schedule_delete(query.message.chat.id, query.message.message_id)
+        await schedule_delete(context, update.message.chat.id, sent.message_id)
         
         posts = context.user_data.get(f"last_ai_context_{platform}_{account}", [])
 
@@ -692,7 +696,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=full_caption,
                 parse_mode="HTML"
             )
-        await schedule_delete(query.message.chat.id, sent.message_id)
+        await schedule_delete(context, update.message.chat.id, sent.message_id)
 
         # Edit the old confirmation message to show it was sent
         try:
