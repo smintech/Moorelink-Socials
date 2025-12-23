@@ -337,8 +337,39 @@ def extract_og_meta(html: str, name: str) -> Optional[str]:
     return None
 
 def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
-    # Remove @ if present, and build clean profile URL
-    clean_account = account_or_url.lstrip("@").split("/")[-1].split("?")[0]  # Handle both @davido and full URL
+    """
+    Final version for Facebook fetching using RapidAPI (facebook-pages-scraper3).
+    - Accepts @handle, plain handle, or full profile URL
+    - Strips @ completely, uses clean name in URL for accuracy
+    - Dedupes posts by post_id
+    - Uses www.facebook.com links (best for public posts in 2025)
+    - Handles videos properly
+    - Direct high-quality media URLs (no login needed for images/videos)
+    """
+    input_str = account_or_url.strip()
+
+    # Handle single post share links separately
+    if ("share/" in input_str or "mibextid=" in input_str or 
+        "/posts/" in input_str or "/photo.php" in input_str or "/reel/" in input_str):
+        # Clean the share link (remove tracking params)
+        clean_url = input_str.split("?")[0].rstrip("/")
+        return [{
+            "post_id": "",
+            "post_url": clean_url,
+            "caption": "Single shared Facebook post",
+            "media_url": "",
+            "is_video": False,
+            "likes": 0,
+            "comments": 0,
+            "shares": 0,
+        }]
+
+    # Normal profile fetch
+    # Extract clean account name (no @, no path)
+    clean_account = input_str.lstrip("@").split("/")[-1].split("?")[0]
+    if not clean_account:
+        return []
+
     profile_url = f"https://www.facebook.com/{clean_account}"
 
     path = "get-profile-home-page-details"
@@ -369,11 +400,12 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
 
         media_type = it.get("media", "Photo")
         is_video = bool(it.get("is_playable")) or media_type.lower() == "video"
+        
         media_url = it.get("uri") or it.get("thumb") or ""
         if not media_url:
             continue
 
-        # Clean post link using the clean_account (no @)
+        # Clean post_url without @
         if post_id:
             post_url = f"https://www.facebook.com/{clean_account}/posts/{post_id}"
         else:
@@ -382,7 +414,7 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
         posts.append({
             "post_id": post_id,
             "post_url": post_url,
-            "caption": "",
+            "caption": "",  # Endpoint doesn't provide text/caption
             "media_url": media_url,
             "is_video": is_video,
             "likes": it.get("likes", 0),
