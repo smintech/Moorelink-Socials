@@ -80,11 +80,48 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 POSTS_PER_PAGE = 5
 PAGE_SIZE_USERS = 10
 LEADERBOARD_LIMIT = 10
-
+TEST_MODE = {"enabled": False}
 # ================ HELPERS ================
 ai_tasks: Dict[int, asyncio.Task] = {}
 def is_admin(user_id: Optional[int]) -> bool:
     return bool(user_id and user_id in ADMIN_IDS)
+
+@admin_only
+async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only toggle for test mode.
+    Usage: /testmode            -> shows status and help
+           /testmode on|off|toggle|status
+    """
+    args = context.args or []
+    if not args:
+        status = "ON" if TEST_MODE["enabled"] else "OFF"
+        await update.effective_message.reply_text(
+            f"Test mode is currently: {status}\n\nUsage: /testmode on|off|toggle|status"
+        )
+        return
+
+    cmd = args[0].lower()
+    if cmd in ("on", "enable", "1"):
+        TEST_MODE["enabled"] = True
+        # save_testmode()  # uncomment if using persistence
+        await update.effective_message.reply_text("✅ Test mode ENABLED — bot will force-send posts and skip rate limits.")
+        return
+    if cmd in ("off", "disable", "0"):
+        TEST_MODE["enabled"] = False
+        # save_testmode()
+        await update.effective_message.reply_text("❌ Test mode DISABLED — normal behavior restored.")
+        return
+    if cmd in ("toggle", "switch"):
+        TEST_MODE["enabled"] = not TEST_MODE["enabled"]
+        # save_testmode()
+        await update.effective_message.reply_text(f"Test mode now: {'ON' if TEST_MODE['enabled'] else 'OFF'}")
+        return
+    if cmd == "status":
+        await update.effective_message.reply_text(f"Test mode is {'ON' if TEST_MODE['enabled'] else 'OFF'}")
+        return
+
+    await update.effective_message.reply_text("Unknown arg. Use: on|off|toggle|status")
 
 def admin_only(handler_func):
     """Decorator for async handlers — blocks non-admins early and sends an error."""
@@ -205,15 +242,18 @@ async def delete_message(context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # ================ UNIFIED FETCH & AI BUTTON ================
-async def handle_fetch_and_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, platform: str, account: str, query=None):
+async def handle_fetch_and_ai(update, context, platform, account, query=None, force: bool = False):
     uid = update.effective_user.id
     message = query.message if query else update.effective_message
-
-    # Base cooldown for fetch
-    cooldown_msg = check_and_increment_cooldown(uid)
-    if cooldown_msg:
-        await message.reply_text(cooldown_msg)
-        return
+    
+    if TEST_MODE.get("enabled"):
+        force = True
+        
+    if not force:
+        cooldown_msg = check_and_increment_cooldown(uid)
+        if cooldown_msg:
+            await message.reply_text(cooldown_msg)
+            return
 
     await message.chat.send_action(ChatAction.TYPING)
 
@@ -1179,7 +1219,12 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     bot_username = context.bot.username or ""
     lines.append(f"\nYour invite link: {get_invite_link(bot_username, tid)}")
-
+    
+    if TEST_MODE.get("enabled"):
+        lines.append("🧪 Test Mode: ON (force fetch, no cooldown)")
+    else:
+        lines.append("🧪 Test Mode: OFF (normal behavior)")
+    
     await update.effective_message.reply_text("\n".join(lines))
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
