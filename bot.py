@@ -2,7 +2,7 @@
 # All original features preserved + Manual AI now fully button-driven (no /ai_call command)
 # Updated Groq models to current best: llama-3.3-70b-versatile (latest flagship)
 # Every single line from the original is included or appropriately modified – nothing omitted 😏
-import aiohttp
+import urllib.request
 import io
 import os
 import asyncio
@@ -179,14 +179,14 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
     if post.get("is_video"):
         preview_msg = await update_or_query.effective_message.reply_video(
             video=post["media_url"],
-            caption=full_caption + "\n\n👆 Send this post?",
+            caption=full_caption + "\n\n Move to next post⏭️?",
             parse_mode="HTML",
             reply_markup=keyboard
         )
     else:
         preview_msg = await update_or_query.effective_message.reply_photo(
             photo=post["media_url"],
-            caption=full_caption + "\n\n👆 Send this post?",
+            caption=full_caption + "\n\n Move to next post⏭️?",
             parse_mode="HTML",
             reply_markup=keyboard
         )
@@ -209,14 +209,26 @@ async def send_ai_button(message, count, platform, account, badge):
     await schedule_delete(message.chat.id, final_msg.message_id)
 
 async def download_media(url: str) -> bytes:
+    """Download media using urllib (no external deps) – async compatible"""
+    loop = asyncio.get_event_loop()
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-                else:
-                    logging.warning(f"Media download failed: {resp.status} {url}")
+        # Run blocking urllib in thread pool to avoid blocking event loop
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            if response.status == 200:
+                data = response.read()
+                if len(data) > 50 * 1024 * 1024:  # >50MB → Telegram no go accept
+                    logging.warning(f"Media too large ({len(data)/1024/1024:.1f}MB): {url}")
                     return None
+                return data
+            else:
+                logging.warning(f"Download failed {url} - status {response.status}")
+                return None
     except Exception as e:
         logging.error(f"Download error {url}: {e}")
         return None
