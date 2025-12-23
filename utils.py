@@ -19,13 +19,9 @@ TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separa
 CACHE_HOURS = 24
 POST_LIMIT = 5
 GROQ_API_KEY=os.getenv("GROQ_KEY")
-APIFY_TOKEN = os.getenv("APIFY_API_TOKEN") or os.getenv("APIFY") or os.getenv("APIFY_TOKEN")
-APIFY_ACTOR = "apify/facebook-posts-scraper"  # verify on Apify store; change if needed
-APIFY_RUN_URL = f"https://api.apify.com/v2/acts/apify~facebook-posts-scraper/runs"
-APIFY_DATASET_URL_TEMPLATE = "https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true&format=json&limit={limit}"
-APIFY_POLL_TIMEOUT = 25  # seconds total to wait
-APIFY_POLL_INTERVAL = 1.5  
-HTTP_CHECK_TIMEOUT = 6.0
+RAPIDAPI_KEY = os.getenv("RAPID_API")
+RAPIDAPI_HOST = 'facebook-pages-scraper3.p.rapidapi.com'
+Base = "https://facebook-pages-scraper3.p.rapidapi.com"
 # ================ DB CONNECTIONS ============
 def get_db():
     if not DB_URL:
@@ -277,169 +273,49 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
         logging.debug("fetch_ig_urls failed", exc_info=True)
     return posts
 
-def looks_like_login_wall_html(text: str) -> bool:
-    low = (text or "").lower()
-    # simple heuristics
-    return ("log in to continue" in low) or ("login" in low and "facebook" in low) or ("sign in" in low and "facebook" in low)
-
-def url_looks_bad(url: str) -> bool:
-    if not url:
-        return True
-    u = url.lower()
-    # skip instagram links or share dialogs that are not direct permalinks
-    if "instagram.com" in u and "facebook.com" not in u:
-        return True
-    if "sharer.php" in u or "facebook.com/plugins" in u:
-        return True
-    return False
-
-def head_check_url_ok(url: str) -> bool:
-    """Do a HEAD/GET check to see if URL returns login wall or valid content."""
-    try:
-        # prefer HEAD then GET fallback
-        r = requests.head(url, allow_redirects=True, timeout=HTTP_CHECK_TIMEOUT)
-        if r.status_code >= 400:
-            # try GET — sometimes HEAD blocked
-            r = requests.get(url, allow_redirects=True, timeout=HTTP_CHECK_TIMEOUT)
-        content = r.text[:1000] if hasattr(r, "text") else ""
-        if looks_like_login_wall_html(content):
-            return False
-        # 200-ish and not login wall -> OK
-        return 200 <= r.status_code < 400
-    except Exception as e:
-        logging.debug("head_check_url_ok failed for %s: %s", url, e)
-        return False
-
-def construct_fb_permalink(page_name: str, post_fbid: str, page_id: Optional[str] = None) -> str:
-    """Build best possible permalink."""
-    page_name = page_name.lstrip("@")
-    if not post_fbid:
-        return ""
-    # Try /page/posts/post_fbid (common for pages)
-    p1 = f"https://www.facebook.com/{page_name}/posts/{post_fbid}"
-    # Alternate mobile/story format
-    p2 = f"https://m.facebook.com/story.php?story_fbid={post_fbid}&id={page_id or page_name}"
-    # Prefer p1
-    return p1
-
-def normalize_apify_item_to_post(item: Dict[str, Any], page: str) -> Dict[str, Any]:
-    caption = item.get("text") or item.get("caption") or ""
-    media_url = item.get("thumb") or item.get("image") or item.get("fullPicture") or ""
-    is_video = bool(item.get("isVideo") or item.get("video") or "video" in str(item.get("type", "")).lower())
-
-    # Priority order for best permalink (2025 working)
-    post_url = (
-        item.get("topLevelUrl") or      # BEST: Clean /posts/ID format, no login wall
-        item.get("permalinkUrl") or
-        item.get("url") or
-        item.get("postUrl") or
-        item.get("link")
-    )
-
-    # Extract post_id if needed for fallback
-    post_id = item.get("postId") or item.get("id") or ""
-    page_id = item.get("pageId") or ""
-
-    # If still no good URL, build from IDs
-    if not post_url or url_looks_bad(post_url):
-        if post_id:
-            # postId often "PAGEID_POSTID" – split
-            parts = str(post_id).split("_")
-            clean_fbid = parts[-1] if len(parts) > 1 else post_id
-            post_url = f"https://www.facebook.com/{page}/posts/{clean_fbid}"
-
-    # Final check: if head_check fail, try mobile format as last resort
-    if post_url and not head_check_url_ok(post_url):
-        if post_id:
-            parts = str(post_id).split("_")
-            clean_fbid = parts[-1] if len(parts) > 1 else post_id
-            alt_mobile = f"https://m.facebook.com/story.php?story_fbid={clean_fbid}&id={page_id or page}"
-            if head_check_url_ok(alt_mobile):
-                post_url = alt_mobile
-            else:
-                post_url = ""  # Drop bad link
-
-    return {
-        "post_id": post_id,
-        "post_url": post_url or "",
-        "caption": caption,
-        "media_url": media_url,
-        "is_video": is_video,
-        "likes": item.get("likes", 0),
-        "comments": item.get("comments", 0),
-        "shares": item.get("shares", 0),
-        "time": item.get("time")
+def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
+    account = account.lstrip("@")
+    path = "get-profile-home-page-details"  # This one working!
+    params = {
+        "urlSupplier": f"https://www.facebook.com/{account}",  # Exact param name from your curl
+        # "show_verified_badge": "false"  # Optional
     }
 
-def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
-    """
-    Synchronous Apify run with robust permalink selection and login-wall avoidance.
-    """
-    account = account.lstrip("@")
-    posts: List[Dict[str, Any]] = []
-    if not APIFY_TOKEN:
-        logging.error("Apify token not set (APIFY_API_TOKEN/APIFY/APIFY_TOKEN).")
-        return posts
-
-    payload = {
-    "startUrls": [{"url": f"https://www.facebook.com/{account}"}],
-    "resultsLimit": limit,
-    "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}  # Better for FB
-}
-    headers = {"Authorization": f"Bearer {APIFY_TOKEN}", "Content-Type": "application/json"}
-
     try:
-        r = requests.post(APIFY_RUN_URL, json=payload, headers=headers, timeout=15)
-        if r.status_code not in (200, 201):
-            logging.error("Apify run start failed for %s: %s %s", account, r.status_code, r.text[:200])
-            return posts
-        data = r.json()
-        run_info = data.get("data") or data
-        dataset_id = run_info.get("defaultDatasetId") or run_info.get("defaultDataset") or run_info.get("defaultDatasetId")
-        run_id = run_info.get("id")
-
-        if not dataset_id:
-            # fallback to run dataset endpoint
-            if run_id:
-                results_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?clean=true&format=json&limit={limit}&token={APIFY_TOKEN}"
-            else:
-                logging.error("No dataset id/run id for apify run: %s", run_info)
-                return posts
-        else:
-            results_url = APIFY_DATASET_URL_TEMPLATE.format(dataset_id=dataset_id, limit=limit) + f"&token={APIFY_TOKEN}"
-
-        # poll
-        start = time.time()
-        items = []
-        while time.time() - start < APIFY_POLL_TIMEOUT:
-            rr = requests.get(results_url, headers=headers, timeout=10)
-            if rr.status_code == 200:
-                items = rr.json()
-                if isinstance(items, dict) and "items" in items:
-                    items = items["items"]
-                if items:
-                    break
-            time.sleep(APIFY_POLL_INTERVAL)
-
-        if not items:
-            logging.warning("Apify returned no items or timed out for %s. results_url=%s", account, results_url)
-            return posts
-
-        # Normalize each item defensively
-        for it in items[:limit]:
-            normalized = normalize_apify_item_to_post(it, account)
-            # skip items with no safe post_url (avoids sending login-wall links)
-            if not normalized.get("post_url"):
-                logging.debug("Skipping item (no safe permalink): %s", it.get("url") or it)
-                continue
-            posts.append(normalized)
-
-        logging.info("Fetched %d safe posts via Apify for @%s", len(posts), account)
-        return posts
-
+        data = rapidapi_get(path, params=params, timeout=30)
     except Exception as e:
-        logging.exception("Apify FB fetch error for %s: %s", account, e)
-        return posts
+        logging.error("RapidAPI FB fetch failed: %s", e)
+        return []
+
+    # Normalization from your JSON response
+    photos = data.get("PHOTOS", [])[:limit]
+    posts = []
+    page_id = data.get("INTRO_CARDS", {}).get("PAGE_ID", "")
+
+    for it in photos:
+        media_type = it.get("media", "Photo")
+        is_video = it.get("is_playable", False) or media_type == "Video"
+        media_url = it.get("uri") or it.get("thumb") or ""  # For video, uri fit be video link
+
+    if not media_url:
+        continue
+
+    post_id = it.get("id", "")
+    post_url = f"https://mbasic.facebook.com/{account}/posts/{post_id}" if post_id else f"https://mbasic.facebook.com/{account}"
+
+    posts.append({
+        "post_id": post_id,
+        "post_url": post_url,
+        "caption": "",  # If API add "text" later, use am
+        "media_url": media_url,
+        "is_video": is_video,
+        "likes": 0,
+        "comments": 0,
+        "shares": 0
+    })
+
+    logging.info(f"Fetched {len(posts)} media posts via RapidAPI for @{account}")
+    return posts
 
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
     account = account.lstrip('@').lower()
