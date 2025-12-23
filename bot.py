@@ -22,6 +22,8 @@ from telegram import (
     BotCommand,
     BotCommandScopeDefault,
     BotCommandScopeChat,
+    InputMediaPhoto,
+    InputMediaVideo,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -178,11 +180,14 @@ async def send_ai_button(message, count, platform, account, badge, context=None,
 
 # --- slight adjustments to your send_next_post_with_confirmation (only small safe edits) ---
 async def send_next_post_with_confirmation(update_or_query, context: ContextTypes.DEFAULT_TYPE, platform: str, account: str):
-    """Send the next pending post with Continue/Cancel buttons."""
+    """
+    Robustly replace the preview message with the next pending post and attach a new keyboard.
+    This attempts to EDIT the same message (recommended). Falls back to delete+send if needed.
+    """
     user_data_key = f"pending_posts_{platform}_{account}"
     pending = context.user_data.get(user_data_key)
 
-    # determine message & uid from the several possible inputs
+    # --- Resolve message & uid like your original function ---
     message = None
     uid = None
     if hasattr(update_or_query, "callback_query") and getattr(update_or_query, "callback_query"):
@@ -201,46 +206,31 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
         except Exception:
             uid = None
 
-    # If no pending or done -> store last_ai_context and show AI button, then clear pending
-    if not pending or pending.get("index", 0) >= pending.get("total", 0):
+    # Defensive: if no pending or finished -> store last_ai_context, show AI button, clear pending
+    if not pending or int(pending.get("index", 0)) >= int(pending.get("total", 0)):
         if not uid and message and message.from_user:
             uid = message.from_user.id
-
         if not uid:
-            logging.warning("send_next_post_with_confirmation: could not determine uid; clearing pending and exiting.")
+            logging.warning("send_next_post_with_confirmation: cannot determine uid; clearing pending.")
             context.user_data.pop(user_data_key, None)
             return
 
         badge = get_user_badge(uid)
-
-        posts_to_store = []
-        if pending and isinstance(pending, dict):
-            posts_to_store = pending.get("posts", [])[:]
-        else:
-            posts_to_store = context.user_data.get(f"last_ai_context_{platform}_{account}", [])
-
+        posts_to_store = pending.get("posts", [])[:] if pending else context.user_data.get(f"last_ai_context_{platform}_{account}", [])
         context.user_data[f"last_ai_context_{platform}_{account}"] = posts_to_store
 
-        target_msg = message or update_or_query
         processed_count = pending.get("index", 0) if pending else 0
         total_count = pending.get("total", processed_count) if pending else len(posts_to_store)
 
-        await send_ai_button(
-            target_msg,
-            max(processed_count, total_count),
-            platform,
-            account,
-            badge,
-            context=context,
-            auto_delete_after=None
-        )
+        target_msg = message or update_or_query
+        await send_ai_button(target_msg, max(processed_count, total_count), platform, account, badge, context=context, auto_delete_after=None)
 
         context.user_data.pop(user_data_key, None)
         return
 
-    # Ensure message exists
+    # Ensure message object exists
     if not message:
-        logging.warning("send_next_post_with_confirmation: no message object to reply to; aborting.")
+        logging.warning("send_next_post_with_confirmation: no message object to reply/edit; aborting.")
         return
     if not uid and message.from_user:
         uid = message.from_user.id
@@ -250,74 +240,88 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
     total = int(pending.get("total", len(posts)))
 
     if current_idx < 0 or current_idx >= len(posts):
-        logging.warning("send_next_post_with_confirmation: index out of range (%s) for @%s", current_idx, account)
+        logging.warning("send_next_post_with_confirmation: index out of range (%s) for %s/%s", current_idx, platform, account)
         context.user_data.pop(user_data_key, None)
-        await message.reply_text("No more pending posts.")
+        try:
+            await message.reply_text("No more pending posts.")
+        except Exception:
+            pass
         return
 
     post = posts[current_idx]
 
-    view_text = {
-        "x": "View on X🐦",
-        "fb": "View on Facebook 🌐",
-        "ig": "View on Instagram 📸"
-    }.get(platform, "View Post 🔗")
-
+    view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
     link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
     caption = (post.get("caption") or "")[:1024]
     full_caption = f"{link_html}\n\n{caption}" if link_html else caption
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            f"✅ Send this post ({current_idx + 1}/{total})",
-            callback_data=f"confirm_post_{platform}_{account}_{current_idx}"
-        ),
-        InlineKeyboardButton(
-            "❌ Cancel remaining",
-            callback_data=f"cancel_posts_{platform}_{account}"
-        )
+        InlineKeyboardButton(f"✅ Send this post ({current_idx + 1}/{total})", callback_data=f"confirm_post_{platform}_{account}_{current_idx}"),
+        InlineKeyboardButton("❌ Cancel remaining", callback_data=f"cancel_posts_{platform}_{account}")
     ]])
 
-    # Send preview (photo/video) with graceful error handling
-    preview_msg = None
+    # Persist pending *before* we attempt edits / sends to avoid race with callback handling
+    context.user_data[user_data_key] = pending
+
+    # Try to EDIT the existing message (best for preserving chat state & keyboard reliability)
     try:
         if post.get("is_video"):
-            preview_msg = await message.reply_video(
-                video=post.get("media_url"),
-                caption=(full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?",
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
+            # Use edit_message_media with InputMediaVideo (caption allowed in media)
+            media = InputMediaVideo(media=post.get("media_url"), caption=(full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?")
+            await context.bot.edit_message_media(chat_id=message.chat.id, message_id=message.message_id, media=media, reply_markup=keyboard)
         else:
-            preview_msg = await message.reply_photo(
-                photo=post.get("media_url"),
-                caption=(full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?",
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
-    except Exception as e:
-        logging.exception("Failed to send preview media for %s/%s idx=%s: %s", platform, account, current_idx, e)
+            # Photo: edit_media with InputMediaPhoto OR if original message had a caption we can edit caption
+            media = InputMediaPhoto(media=post.get("media_url"), caption=(full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?")
+            await context.bot.edit_message_media(chat_id=message.chat.id, message_id=message.message_id, media=media, reply_markup=keyboard)
+        # schedule deletion for the (now edited) preview message
         try:
-            preview_msg = await message.reply_text(
-                (full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?",
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
-        except Exception as e2:
-            logging.exception("Fallback text send also failed: %s", e2)
-            context.user_data.pop(user_data_key, None)
-            return
-
-    # Schedule deletion of the preview (use preview_msg ids)
-    try:
-        await schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
-    except Exception:
-        try:
-            schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
+            await schedule_delete(context, message.chat.id, message.message_id)
         except Exception:
-            logging.debug("schedule_delete not available or failed for preview message cleanup.")
+            try:
+                schedule_delete(context, message.chat.id, message.message_id)
+            except Exception:
+                logging.debug("schedule_delete not available or failed for edited preview message.")
+        return
+    except Exception as edit_exc:
+        logging.info("edit_message_media failed (will fallback to delete+send): %s", edit_exc)
 
-    return
+    # If editing media failed (different message type / API restriction), fall back to delete + send a fresh preview
+    try:
+        # delete the old preview message (so we don't keep stale buttons)
+        try:
+            await context.bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+        except Exception as e:
+            logging.debug("Could not delete old preview message (may be already deleted): %s", e)
+
+        # Send a new preview message with the keyboard (photo or text fallback)
+        if post.get("is_video"):
+            new_preview = await context.bot.send_video(chat_id=message.chat.id, video=post.get("media_url"),
+                                                      caption=(full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?",
+                                                      parse_mode="HTML", reply_markup=keyboard)
+        else:
+            try:
+                new_preview = await context.bot.send_photo(chat_id=message.chat.id, photo=post.get("media_url"),
+                                                           caption=(full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?",
+                                                           parse_mode="HTML", reply_markup=keyboard)
+            except Exception:
+                # last fallback: plain text with link+caption
+                new_preview = await context.bot.send_message(chat_id=message.chat.id,
+                                                             text=(full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?",
+                                                             parse_mode="HTML", reply_markup=keyboard)
+        # schedule deletion for the new preview message
+        try:
+            await schedule_delete(context, new_preview.chat.id, new_preview.message_id)
+        except Exception:
+            try:
+                schedule_delete(context, new_preview.chat.id, new_preview.message_id)
+            except Exception:
+                logging.debug("schedule_delete not available or failed for new preview message.")
+        return
+    except Exception as send_exc:
+        logging.exception("Failed to send fallback preview for %s/%s idx=%s: %s", platform, account, current_idx, send_exc)
+        # as a last resort clear pending to avoid stuck UI
+        context.user_data.pop(user_data_key, None)
+        return
 
 async def download_media(url: str) -> bytes:
     """Download media using urllib (no external deps) – async compatible"""
@@ -752,21 +756,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Confirm (send) single post
     if data.startswith("confirm_post_"):
+        query = update.callback_query
         await query.answer()  # acknowledge immediately
 
         parts = data.split("_")
         if len(parts) < 5:
-            await query.answer("Error.", show_alert=True)
+            await query.answer("Invalid callback.", show_alert=True)
             return
 
         platform = parts[2]
-        account = parts[3]
-        try:
-            idx = int(parts[4])
-        except:
-            await query.answer("Invalid index.", show_alert=True)
-            return
-
+        idx = int(parts[-1])
+        account = "_".join(parts[3:-1])
+        
         user_data_key = f"pending_posts_{platform}_{account}"
         pending = context.user_data.get(user_data_key)
         if not pending or pending.get("index", 0) != idx:
@@ -777,72 +778,55 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         post = pending["posts"][idx]
 
-        # Download and send clean post
         media_bytes = await download_media(post.get("media_url"))
         if not media_bytes:
-            # edit the preview to indicate media failed and remove buttons (explicit chat/message)
-            try:
-                await context.bot.edit_message_caption(
-                    chat_id=query.message.chat.id,
-                    message_id=query.message.message_id,
-                    caption=(query.message.caption or "") + "\n\n❌ Media failed to load",
-                    reply_markup=None
-                )
-            except Exception:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=query.message.chat.id,
-                        message_id=query.message.message_id,
-                        text=(query.message.text or "") + "\n\n❌ Media failed to load",
-                        reply_markup=None
-                    )
-                except Exception as e:
-                    logging.warning("Failed to mark preview as failed: %s", e)
-
-            # advance and persist, then show next
-            pending["index"] += 1
-            context.user_data[user_data_key] = pending
-            await send_next_post_with_confirmation(query, context, platform, account)
+            await query.answer("Media failed to load.", show_alert=True)
             return
-
+            
         view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
         link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
         caption = (post.get("caption", "") or "")[:1024]
         full_caption = f"{link_html}\n\n{caption}" if link_html else caption
 
         bio = io.BytesIO(media_bytes)
+
         if post.get("is_video"):
             bio.name = "video.mp4"
-            sent = await query.message.reply_video(video=bio, caption=full_caption, parse_mode="HTML")
+            sent = await context.bot.send_video(
+                chat_id=query.message.chat.id,
+                video=bio,
+                caption=full_caption,
+                parse_mode="HTML"
+            )
         else:
             bio.name = "photo.jpg"
-            sent = await query.message.reply_photo(photo=bio, caption=full_caption, parse_mode="HTML")
+            sent = await context.bot.send_photo(
+                chat_id=query.message.chat.id,
+                photo=bio,
+                caption=full_caption,
+                parse_mode="HTML"
+            )
 
         # Schedule auto-delete for sent post (use sent's ids)
         await schedule_delete(context, sent.chat.id, sent.message_id)
-
-        # Edit old preview to "Sent!" and REMOVE buttons using explicit edit
+        
         try:
-            old_caption = query.message.caption or query.message.text or ""
-            new_caption = old_caption.rstrip()
             await context.bot.edit_message_caption(
                 chat_id=query.message.chat.id,
                 message_id=query.message.message_id,
-                caption=new_caption + "\n\n✅ <b>Sent!</b>",
+                caption=(query.message.caption or "") + "\n\n✅ <b>Sent!</b>",
                 parse_mode="HTML",
                 reply_markup=None
             )
         except Exception:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=query.message.chat.id,
-                    message_id=query.message.message_id,
-                    text=new_caption + "\n\n✅ <b>Sent!</b>",
-                    parse_mode="HTML",
-                    reply_markup=None
-                )
-            except Exception as e:
-                logging.warning(f"Could not edit confirmation: {e}")
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat.id,
+                message_id=query.message.message_id,
+                text=(query.message.text or "") + "\n\n✅ Sent!",
+                reply_markup=None
+            )
+        except Exception as e:
+            logging.warning(f"Could not edit confirmation: {e}")
 
         # Advance and persist before showing next preview
         pending["index"] += 1
@@ -851,7 +835,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Show next preview (pass CallbackQuery so helper can locate the message)
         await send_next_post_with_confirmation(query, context, platform, account)
         return
-
     # Cancel remaining posts
     if data.startswith("cancel_posts_"):
         _, _, plat_acc = data.partition("cancel_posts_")
