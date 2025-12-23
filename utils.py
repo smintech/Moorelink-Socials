@@ -275,10 +275,10 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
 
 def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
     account = account.lstrip("@")
-    path = "get-profile-home-page-details"  # This one working!
+
+    path = "get-profile-home-page-details"  # confirmed working
     params = {
-        "urlSupplier": f"https://www.facebook.com/{account}",  # Exact param name from your curl
-        # "show_verified_badge": "false"  # Optional
+        "urlSupplier": f"https://www.facebook.com/{account}",
     }
 
     try:
@@ -287,34 +287,46 @@ def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]
         logging.error("RapidAPI FB fetch failed: %s", e)
         return []
 
-    # Normalization from your JSON response
+    posts: List[Dict[str, Any]] = []
+
     photos = data.get("PHOTOS", [])[:limit]
-    posts = []
     page_id = data.get("INTRO_CARDS", {}).get("PAGE_ID", "")
 
     for it in photos:
         media_type = it.get("media", "Photo")
-        is_video = it.get("is_playable", False) or media_type == "Video"
-        media_url = it.get("uri") or it.get("thumb") or ""  # For video, uri fit be video link
+        is_video = bool(it.get("is_playable")) or media_type == "Video"
 
-    if not media_url:
-        continue
+        media_url = (
+            it.get("uri")
+            or it.get("thumb")
+            or it.get("image")
+            or ""
+        )
 
-    post_id = it.get("id", "")
-    post_url = f"https://mbasic.facebook.com/{account}/posts/{post_id}" if post_id else f"https://mbasic.facebook.com/{account}"
+        # skip empty media
+        if not media_url:
+            continue
 
-    posts.append({
-        "post_id": post_id,
-        "post_url": post_url,
-        "caption": "",  # If API add "text" later, use am
-        "media_url": media_url,
-        "is_video": is_video,
-        "likes": 0,
-        "comments": 0,
-        "shares": 0
-    })
+        post_id = it.get("id", "")
 
-    logging.info(f"Fetched {len(posts)} media posts via RapidAPI for @{account}")
+        # mbasic avoids login wall better than www
+        if post_id:
+            post_url = f"https://mbasic.facebook.com/{account}/posts/{post_id}"
+        else:
+            post_url = f"https://mbasic.facebook.com/{account}"
+
+        posts.append({
+            "post_id": post_id,
+            "post_url": post_url,
+            "caption": "",      # endpoint doesn’t return text yet
+            "media_url": media_url,
+            "is_video": is_video,
+            "likes": 0,
+            "comments": 0,
+            "shares": 0,
+        })
+
+    logging.info("Fetched %d media posts via RapidAPI for @%s", len(posts), account)
     return posts
 
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
