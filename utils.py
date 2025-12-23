@@ -323,36 +323,45 @@ def construct_fb_permalink(page_name: str, post_fbid: str, page_id: Optional[str
     return p1
 
 def normalize_apify_item_to_post(item: Dict[str, Any], page: str) -> Dict[str, Any]:
-    caption = item.get("text") or ""
-    media_url = item.get("thumb") or ""
-    is_video = "video" in str(item.get("type", "")).lower() or item.get("video")  # Apify sometimes has 'video' field
+    caption = item.get("text") or item.get("caption") or ""
+    media_url = item.get("thumb") or item.get("image") or item.get("fullPicture") or ""
+    is_video = bool(item.get("isVideo") or item.get("video") or "video" in str(item.get("type", "")).lower())
 
-    # Priority: topLevelUrl (best stable permalink) > url > build from IDs
-    post_url = item.get("topLevelUrl") or item.get("url") or ""
+    # Priority order for best permalink (2025 working)
+    post_url = (
+        item.get("topLevelUrl") or      # BEST: Clean /posts/ID format, no login wall
+        item.get("permalinkUrl") or
+        item.get("url") or
+        item.get("postUrl") or
+        item.get("link")
+    )
 
-    # Extract IDs
-    post_id = item.get("postId") or item.get("postFacebookId") or ""
-    page_id = item.get("pageId") or item.get("facebookId") or ""
+    # Extract post_id if needed for fallback
+    post_id = item.get("postId") or item.get("id") or ""
+    page_id = item.get("pageId") or ""
 
-    # If no good post_url or it looks bad, build one
+    # If still no good URL, build from IDs
     if not post_url or url_looks_bad(post_url):
         if post_id:
-            # Apify postId is often "PAGEID_POSTID" combined – split if possible
-            parts = post_id.split("_")
-            if len(parts) == 2:
-                clean_fbid = parts[1]
-            else:
-                clean_fbid = post_id
-            post_url = construct_fb_permalink(page, clean_fbid, page_id)
+            # postId often "PAGEID_POSTID" – split
+            parts = str(post_id).split("_")
+            clean_fbid = parts[-1] if len(parts) > 1 else post_id
+            post_url = f"https://www.facebook.com/{page}/posts/{clean_fbid}"
 
-    # Final head check – if still bad, drop it
+    # Final check: if head_check fail, try mobile format as last resort
     if post_url and not head_check_url_ok(post_url):
-        logging.debug("All permalink attempts failed for post_id %s", post_id)
-        post_url = ""
+        if post_id:
+            parts = str(post_id).split("_")
+            clean_fbid = parts[-1] if len(parts) > 1 else post_id
+            alt_mobile = f"https://m.facebook.com/story.php?story_fbid={clean_fbid}&id={page_id or page}"
+            if head_check_url_ok(alt_mobile):
+                post_url = alt_mobile
+            else:
+                post_url = ""  # Drop bad link
 
     return {
         "post_id": post_id,
-        "post_url": post_url,
+        "post_url": post_url or "",
         "caption": caption,
         "media_url": media_url,
         "is_video": is_video,
