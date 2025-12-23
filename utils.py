@@ -23,7 +23,7 @@ POST_LIMIT = 5
 GROQ_API_KEY=os.getenv("GROQ_KEY")
 RAPIDAPI_KEY = os.getenv("RAPID_API")
 RAPIDAPI_HOST = 'facebook-pages-scraper3.p.rapidapi.com'
-Base = f"https://{RAPIDAPI_HOST}"
+RAPIDAPI_BASE = f"https://{RAPIDAPI_HOST}"
 APIFY_FALLBACK_TIMEOUT = 8
 # ================ DB CONNECTIONS ============
 def get_db():
@@ -348,58 +348,44 @@ def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]
         logging.warning("RapidAPI FB fetch failed for %s: %s", account, e)
         data = {}
 
-    # Defensive parsing (your working actor returns PHOTOS)
+    # Defensive parsing – the working endpoint returns a "PHOTOS" array
     photos = []
+    page_id = ""
     if isinstance(data, dict):
         photos = data.get("PHOTOS") or data.get("photos") or []
+        intro = data.get("INTRO_CARDS") or data.get("intro_cards") or {}
+        page_id = intro.get("PAGE_ID") or ""
 
-    # Normalize items from the PHOTOS block
+    # Normalize each photo/video item
     for it in photos[:limit]:
         media_type = it.get("media", "Photo")
         is_video = bool(it.get("is_playable")) or media_type.lower() == "video"
+        
+        # Prefer full-resolution uri, fallback to thumb
         media_url = it.get("uri") or it.get("thumb") or it.get("image") or it.get("src") or ""
         if not media_url:
             continue
+
         post_id = it.get("id") or ""
-        # use mbasic link (more likely to avoid login redirect)
+
+        # Build the cleanest possible mbasic link (no login wall)
         if post_id:
             post_url = f"https://mbasic.facebook.com/{account}/posts/{post_id}"
+        elif page_id:
+            post_url = f"https://mbasic.facebook.com/profile.php?id={page_id}"
         else:
             post_url = f"https://mbasic.facebook.com/{account}"
+
         posts.append({
             "post_id": post_id,
             "post_url": post_url,
-            "caption": (it.get("text") or it.get("caption") or "")[:1024],
+            "caption": "",  # This endpoint does not provide captions/text
             "media_url": media_url,
             "is_video": is_video,
             "likes": it.get("likes", 0),
             "comments": it.get("comments", 0),
             "shares": it.get("shares", 0),
         })
-
-    # If RapidAPI returned nothing useful, attempt a quick mbasic fallback (scrape OG tags)
-    if not posts:
-        try:
-            mbasic = f"https://mbasic.facebook.com/{account}"
-            logging.info("RapidAPI empty for %s — trying mbasic fallback: %s", account, mbasic)
-            r = requests.get(mbasic, headers={"User-Agent":"Mozilla/5.0"}, timeout=APIFY_FALLBACK_TIMEOUT)
-            if r.status_code == 200 and r.text:
-                html = r.text
-                og_img = extract_og_meta(html, "image") or extract_og_meta(html, "image:url")
-                og_desc = extract_og_meta(html, "description") or extract_og_meta(html, "title")
-                if og_img:
-                    posts.append({
-                        "post_id": "",
-                        "post_url": mbasic,
-                        "caption": (og_desc or "")[:1024],
-                        "media_url": og_img,
-                        "is_video": False,
-                        "likes": 0,
-                        "comments": 0,
-                        "shares": 0,
-                    })
-        except Exception as e:
-            logging.debug("mbasic fallback failed for %s: %s", account, e)
 
     logging.info("fetch_fb_urls -> returned %d posts for @%s", len(posts), account)
     return posts[:limit]
