@@ -392,19 +392,20 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
         return
 
     # Only new posts
+    # Only new posts (normal mode)
     new_posts = [p for p in post_list if is_post_new(uid, platform, account, p['post_id'])]
 
-    if not new_posts:
-        if TEST_MODE.get("enabled") and fetched_posts:
-            logging.info("Test mode active — forcing send of last fetched posts")
-            new_posts = fetched_posts[:POST_LIMIT]
-        else:
-            await message.reply_text(
-            f"No new posts from @{account} since your last check."
-        )
-            return
-    # Mark as seen early
-    mark_posts_seen(uid, platform, account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
+    # TEST MODE: If enabled, ignore "seen" status and force send latest fetched posts
+    if TEST_MODE.get("enabled"):
+        logging.info("🧪 Test mode ACTIVE — forcing send of latest posts (ignoring seen status)")
+        new_posts = post_list[:POST_LIMIT]  # Send all fetched, even if previously seen
+        # Still mark as seen so next normal run no repeat
+        mark_posts_seen(uid, platform, account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
+    elif not new_posts:
+        await message.reply_text(f"No new posts from @{account} since your last check.")
+        return
+    else:
+        mark_posts_seen(uid, platform, account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
 
     # Store posts for sequential sending and AI context
     context.user_data[f"pending_posts_{platform}_{account}"] = {
