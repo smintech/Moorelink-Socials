@@ -337,26 +337,15 @@ def extract_og_meta(html: str, name: str) -> Optional[str]:
     return None
 
 def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
-    """
-    Improved FB fetch:
-    - Accepts handle (@davido) or full URL (https://www.facebook.com/DavidoMusic)
-    - Dedupes posts (no more same post 5 times)
-    - Better post_url (www.facebook.com – works for most public posts without login wall in 2025)
-    - Falls back to profile URL if no post_id
-    """
-    # Extract clean account name and build correct profile URL
-    if account_or_url.startswith("http"):
-        profile_url = account_or_url.rstrip("/")
-        account = profile_url.split("facebook.com/")[-1].split("?")[0].split("/")[0]
-    else:
-        account = account_or_url.lstrip("@")
-        profile_url = f"https://www.facebook.com/{account}"
+    # Remove @ if present, and build clean profile URL
+    clean_account = account_or_url.lstrip("@").split("/")[-1].split("?")[0]  # Handle both @davido and full URL
+    profile_url = f"https://www.facebook.com/{clean_account}"
 
     path = "get-profile-home-page-details"
     params = {"urlSupplier": profile_url}
 
     posts: List[Dict[str, Any]] = []
-    seen_ids = set()  # Prevent duplicates
+    seen_ids = set()
 
     try:
         data = rapidapi_get(path, params=params, timeout=30)
@@ -380,22 +369,20 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
 
         media_type = it.get("media", "Photo")
         is_video = bool(it.get("is_playable")) or media_type.lower() == "video"
-        
-        # Full quality first
         media_url = it.get("uri") or it.get("thumb") or ""
         if not media_url:
             continue
 
-        # Best post_url: normal www (public posts often open without login)
-        if post_id and account:
-            post_url = f"https://www.facebook.com/{account}/posts/{post_id}"
+        # Clean post link using the clean_account (no @)
+        if post_id:
+            post_url = f"https://www.facebook.com/{clean_account}/posts/{post_id}"
         else:
-            post_url = profile_url  # Fallback to profile
+            post_url = profile_url
 
         posts.append({
             "post_id": post_id,
             "post_url": post_url,
-            "caption": "",  # This endpoint doesn't give captions
+            "caption": "",
             "media_url": media_url,
             "is_video": is_video,
             "likes": it.get("likes", 0),
@@ -403,7 +390,7 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
             "shares": it.get("shares", 0),
         })
 
-    logging.info("fetch_fb_urls -> returned %d unique posts for %s", len(posts), profile_url)
+    logging.info("fetch_fb_urls -> returned %d unique posts for facebook.com/%s", len(posts), clean_account)
     return posts
 
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
