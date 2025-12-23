@@ -295,9 +295,14 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
     new_posts = [p for p in post_list if is_post_new(uid, platform, account, p['post_id'])]
 
     if not new_posts:
-        await message.reply_text(f"No new posts from @{account} since your last check.")
-        return
-
+        if TEST_MODE.get("enabled") and fetched_posts:
+            logging.info("Test mode active — forcing send of last fetched posts")
+            new_posts = fetched_posts[:POST_LIMIT]
+        else:
+            await message.reply_text(
+            f"No new posts from @{account} since your last check."
+        )
+            return
     # Mark as seen
     mark_posts_seen(uid, platform, account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
 
