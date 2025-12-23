@@ -18,6 +18,12 @@ TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separa
 CACHE_HOURS = 24
 POST_LIMIT = 5
 GROQ_API_KEY=os.getenv("GROQ_KEY")
+APIFY_TOKEN = os.getenv("APIFY_API_TOKEN") or os.getenv("APIFY") or os.getenv("APIFY_TOKEN")
+APIFY_ACTOR = "apify/facebook-posts-scraper"  # verify on Apify store; change if needed
+APIFY_RUN_URL = f"https://api.apify.com/v2/acts/apify~facebook-posts-scraper/runs"
+APIFY_DATASET_URL_TEMPLATE = "https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true&format=json&limit={limit}"
+APIFY_POLL_TIMEOUT = 25  # seconds total to wait
+APIFY_POLL_INTERVAL = 1.5  
 # ================ DB CONNECTIONS ============
 def get_db():
     if not DB_URL:
@@ -269,49 +275,113 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
         logging.debug("fetch_ig_urls failed", exc_info=True)
     return posts
 
-APIFY_API_TOKEN = os.getenv("APIFY")  # Put in env vars on Railway
+def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
+    """
+    Synchronous fetch via Apify actor.
+    Returns a list of dicts: {post_id, post_url, caption, media_url, is_video}
+    """
+    account = account.lstrip("@")
+    posts: List[Dict[str, Any]] = []
 
-async def fetch_fb_urls(account: str, limit: int = 10) -> List[Dict]:
-    account = account.lstrip('@')
-    actor_id = "apify/facebook-posts-scraper"  # Or check exact ID on the page
-    
-    url = "https://api.apify.com/v2/acts/apify~facebook-posts-scraper/runs"
+    if not APIFY_TOKEN:
+        logging.error("Apify token not set (APIFY_API_TOKEN / APIFY / APIFY_TOKEN).")
+        return []
+
     payload = {
-        "startUrls": [{"url": f"https://www.facebook.com/{account}"}],
+        "startUrls": [{"url": f"https://m.facebook.com/{account}"}],  # mobile often easier
         "resultsLimit": limit
     }
-    headers = {"Authorization": f"Bearer {APIFY_API_TOKEN}"}
-    
-    posts = []
+    headers = {"Authorization": f"Bearer {APIFY_TOKEN}", "Content-Type": "application/json"}
+
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers) as resp:
-                if resp.status == 201:
-                    data = await resp.json()
-                    run_id = data['data']['id']
-                    
-                    # Wait for run to finish & get results (poll or webhook for production)
-                    dataset_id = data['data']['defaultDatasetId']
-                    results_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-                    async with session.get(results_url, headers=headers) as result_resp:
-                        if result_resp.status == 200:
-                            items = await result_resp.json()
-                            for item in items:
-                                posts.append({
-                                    "caption": item.get('text', ''),
-                                    "media_url": item.get('thumb') or item.get('image'),
-                                    "is_video": 'video' in item.get('text', '').lower(),  # or check fields
-                                    "post_url": item.get('url'),
-                                    "likes": item.get('likes'),
-                                    "comments": item.get('comments'),
-                                    "shares": item.get('shares'),
-                                })
-                            logging.info(f"Fetched {len(posts)} FB posts via Apify from @{account}")
-                else:
-                    logging.error(f"Apify run failed: {resp.status}")
+        r = requests.post(APIFY_RUN_URL, json=payload, headers=headers, timeout=15)
     except Exception as e:
-        logging.error(f"Apify FB fetch error: {e}")
-    
+        logging.exception("Failed to start Apify run for %s: %s", account, e)
+        return []
+
+    if r.status_code not in (200, 201):
+        logging.error("Apify run start failed for %s: status=%s body=%s", account, r.status_code, r.text)
+        return []
+
+    data = r.json()
+    # Depending on Apify version, run id and dataset id might live in data['data'] or directly in data
+    run_info = data.get("data") or data
+    run_id = run_info.get("id")
+    dataset_id = run_info.get("defaultDatasetId") or run_info.get("defaultDataset") or run_info.get("defaultDatasetId")
+
+    if not dataset_id and run_id:
+        # older endpoint: dataset id may be part of run details endpoint — try to fetch run details
+        try:
+            run_details = requests.get(f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}", timeout=10)
+            if run_details.status_code == 200:
+                rd = run_details.json()
+                ds = rd.get("data", {}).get("defaultDatasetId")
+                if ds:
+                    dataset_id = ds
+        except Exception:
+            pass
+
+    if not dataset_id:
+        logging.warning("No dataset id returned for Apify run (account=%s). Run info: %s", account, run_info)
+        # still try to poll the run items endpoint by run id
+        if run_id:
+            results_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?clean=true&format=json&limit={limit}&token={APIFY_TOKEN}"
+        else:
+            logging.error("No run_id/dataset_id to fetch results for %s", account)
+            return []
+    else:
+        results_url = APIFY_DATASET_URL_TEMPLATE.format(dataset_id=dataset_id, limit=limit) + f"&token={APIFY_TOKEN}"
+
+    # poll for results (short timeout)
+    start = time.time()
+    items = []
+    while time.time() - start < APIFY_POLL_TIMEOUT:
+        try:
+            rr = requests.get(results_url, headers=headers, timeout=10)
+            if rr.status_code == 200:
+                items = rr.json()
+                # sometimes Apify returns an object, sometimes a list
+                if isinstance(items, dict) and "items" in items:
+                    items = items["items"]
+                if items:
+                    break
+            else:
+                # 204 / 202 maybe means not ready
+                logging.debug("Apify results not ready yet: status=%s body=%s", rr.status_code, rr.text[:200])
+        except Exception as e:
+            logging.debug("Error polling Apify results: %s", e)
+        time.sleep(APIFY_POLL_INTERVAL)
+
+    if not items:
+        logging.warning("Apify returned no items for %s (ran but dataset empty or timed out). results_url=%s", account, results_url)
+        return []
+
+    # Normalize items -- actor field names vary; be defensive
+    for it in items[:limit]:
+        # actor often yields fields like: url, text, thumb, image, isVideo, media, id
+        caption = it.get("text") or it.get("caption") or it.get("title") or it.get("description") or ""
+        media_url = it.get("thumb") or it.get("image") or it.get("media") or it.get("fullPicture")
+        is_video = bool(it.get("isVideo") or it.get("is_video") or ("video" in (it.get("type") or "").lower()))
+        post_url = it.get("url") or it.get("permalinkUrl") or it.get("postUrl") or ""
+
+        # try to extract post_id from url or id fields
+        post_id = it.get("id") or ""
+        if not post_id and post_url:
+            # crude extraction of last path segment
+            try:
+                post_id = post_url.rstrip("/").split("/")[-1]
+            except Exception:
+                post_id = ""
+
+        posts.append({
+            "post_id": post_id,
+            "post_url": post_url,
+            "caption": caption,
+            "media_url": media_url,
+            "is_video": is_video,
+        })
+
+    logging.info("Fetched %d posts via Apify for @%s", len(posts), account)
     return posts
 
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
