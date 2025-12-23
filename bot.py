@@ -723,6 +723,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     if data.startswith("confirm_post_"):
+        # data format: confirm_post_<platform>_<account>_<idx>
+        query = update.callback_query
+        await query.answer()  # acknowledge button press ASAP
+
         parts = data.split("_")
         if len(parts) < 5:
             await query.answer("Error.", show_alert=True)
@@ -731,66 +735,119 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         account = parts[3]
         try:
             idx = int(parts[4])
-        except:
-            await query.answer("Invalid.", show_alert=True)
+        except Exception:
+            await query.answer("Invalid index.", show_alert=True)
             return
 
         user_data_key = f"pending_posts_{platform}_{account}"
         pending = context.user_data.get(user_data_key)
-        if not pending or idx != pending["index"]:
-            await query.answer("This post expired.", show_alert=True)
+        if not pending:
+            await query.answer("No pending posts found.", show_alert=True)
             return
 
-        post = pending["posts"][idx]
-
-        # Download media (safe way)
-        media_bytes = await download_media(post["media_url"])
-        if not media_bytes:
-            await query.edit_message_caption(
-                caption=query.message.caption + "\n\n❌ Failed to load media.",
-                reply_markup=None
-            )
-            # Still move to next
-            pending["index"] += 1
+        # ensure index matches expected pending index
+        expected_index = int(pending.get("index", 0))
+        if idx != expected_index:
+            await query.answer("This post expired or is out of sync.", show_alert=True)
+            # optionally refresh UI by calling send_next...
             await send_next_post_with_confirmation(query, context, platform, account)
             return
 
-        # Send the clean post
-        view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
-        link_html = f"<a href='{post['post_url']}'>{view_text}</a>" if post['post_url'] else ""
-        caption = post.get("caption", "")[:1024]
+        posts = pending.get("posts") or []
+        if idx < 0 or idx >= len(posts):
+            await query.answer("Post not found.", show_alert=True)
+            context.user_data.pop(user_data_key, None)
+            return
+
+        post = posts[idx]
+
+        # Download media (safe way) — assumes download_media returns bytes or None
+        try:
+            media_bytes = await download_media(post.get("media_url"))
+        except Exception as e:
+            logging.exception("download_media raised: %s", e)
+            media_bytes = None
+
+        if not media_bytes:
+            # Try to edit the confirmation message to indicate failure (if it had a caption)
+            try:
+                new_caption = (query.message.caption or "") + "\n\n❌ Failed to load media."
+                await query.edit_message_caption(caption=new_caption, reply_markup=None)
+            except Exception:
+                # If edit_caption fails (maybe it was a text message), fallback to editing text
+                try:
+                    await query.edit_message_text((query.message.text or "") + "\n\n❌ Failed to load media.", reply_markup=None)
+                except Exception:
+                    # ignore if we cannot edit
+                    pass
+
+            # Move pointer forward and continue
+            pending["index"] = expected_index + 1
+            context.user_data[user_data_key] = pending
+            await send_next_post_with_confirmation(query, context, platform, account)
+            return
+
+        # Build final post caption (with link if available)
+        view_text = {
+            "x": "View on X🐦",
+            "fb": "View on Facebook 🌐",
+            "ig": "View on Instagram 📸"
+        }.get(platform, "View Post 🔗")
+        link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
+        caption = (post.get("caption") or "")[:1024]
         full_caption = f"{link_html}\n\n{caption}" if link_html else caption
 
-        if post.get("is_video"):
-            sent = await query.message.reply_video(
-                video=io.BytesIO(media_bytes),
-                caption=full_caption,
-                parse_mode="HTML"
-            )
-        else:
-            sent = await query.message.reply_photo(
-                photo=io.BytesIO(media_bytes),
-                caption=full_caption,
-                parse_mode="HTML"
-            )
-        await schedule_delete(context, update.message.chat.id, sent.message_id)
+        # Send the cleaned post (upload from bytes)
+        sent = None
+        try:
+            bio = io.BytesIO(media_bytes)
+            # name helps Telegram infer type; choose mp4 for videos
+            if post.get("is_video"):
+                bio.name = "video.mp4"
+                sent = await query.message.reply_video(video=bio, caption=full_caption, parse_mode="HTML")
+            else:
+                bio.name = "photo.jpg"
+                sent = await query.message.reply_photo(photo=bio, caption=full_caption, parse_mode="HTML")
+        except Exception as e:
+            logging.exception("Failed to send cleaned media: %s", e)
+            # notify user and advance
+            try:
+                await query.message.reply_text("Sent failed — cannot upload media.", parse_mode="HTML")
+            except Exception:
+                pass
+            # move to next
+            pending["index"] = expected_index + 1
+            context.user_data[user_data_key] = pending
+            await send_next_post_with_confirmation(query, context, platform, account)
+            return
+
+        # Schedule deletion of the sent post preview (use callback message chat id)
+        try:
+            chat_id = query.message.chat.id
+            await schedule_delete(context, chat_id, sent.message_id)
+        except Exception as e:
+            logging.debug("schedule_delete failed or not awaitable: %s", e)
+            try:
+                schedule_delete(context, query.message.chat.id, sent.message_id)
+            except Exception:
+                pass
 
         # Edit the old confirmation message to show it was sent
         try:
-            new_caption = query.message.caption_html or query.message.caption or ""
-            new_caption += "\n\n✅ <b>Sent!</b>"
-            await query.edit_message_caption(
-                caption=new_caption,
-                parse_mode="HTML",
-                reply_markup=None
-            )
+            old_caption = (query.message.caption or query.message.text or "")
+            new_caption = old_caption + "\n\n✅ <b>Sent!</b>"
+            # Prefer editing caption if that message had a caption
+            if query.message.caption is not None:
+                await query.edit_message_caption(caption=new_caption, parse_mode="HTML", reply_markup=None)
+            else:
+                await query.edit_message_text(text=new_caption, parse_mode="HTML", reply_markup=None)
         except Exception as e:
-            logging.warning(f"Could not edit confirmation message: {e}")
-            # If edit fails (e.g. no caption), just ignore – not critical
+            logging.warning("Could not edit confirmation message: %s", e)
 
-        # Move to next post
-        pending["index"] += 1
-        await send_next_post_with_confirmation(query.message, context, platform, account)
+        # Advance index and send next pending
+        pending["index"] = expected_index + 1
+        context.user_data[user_data_key] = pending
+        await send_next_post_with_confirmation(query, context, platform, account)
         return
 
     if data.startswith("cancel_posts_"):
