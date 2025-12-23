@@ -310,71 +310,56 @@ def head_check_url_ok(url: str) -> bool:
         logging.debug("head_check_url_ok failed for %s: %s", url, e)
         return False
 
-def construct_fb_permalink(page: str, post_id: str) -> str:
-    """Try a couple permalink forms."""
-    page = page.lstrip("@")
-    post_id = str(post_id or "")
-    if not post_id:
+def construct_fb_permalink(page_name: str, post_fbid: str, page_id: Optional[str] = None) -> str:
+    """Build best possible permalink."""
+    page_name = page_name.lstrip("@")
+    if not post_fbid:
         return ""
-    # prefer /posts/{id}
-    p1 = f"https://www.facebook.com/{page}/posts/{post_id}"
-    p2 = f"https://m.facebook.com/story.php?story_fbid={post_id}&id={page}"
-    # return p1 (caller can head_check)
+    # Try /page/posts/post_fbid (common for pages)
+    p1 = f"https://www.facebook.com/{page_name}/posts/{post_fbid}"
+    # Alternate mobile/story format
+    p2 = f"https://m.facebook.com/story.php?story_fbid={post_fbid}&id={page_id or page_name}"
+    # Prefer p1
     return p1
 
 def normalize_apify_item_to_post(item: Dict[str, Any], page: str) -> Dict[str, Any]:
-    """
-    Extract best post_url + other fields from an Apify item defensively.
-    """
-    # fields Apify actors may contain:
-    # 'url', 'permalinkUrl', 'permalink', 'postUrl', 'post_url', 'id', 'text', 'caption', 'thumb', 'image'
-    caption = item.get("text") or item.get("caption") or item.get("title") or item.get("description") or ""
-    media_url = item.get("thumb") or item.get("image") or item.get("media") or item.get("fullPicture")
-    is_video = bool(item.get("isVideo") or item.get("is_video") or ("video" in (item.get("type") or "").lower()))
-    # prefer explicit permalink fields
-    candidates = [
-        item.get("permalinkUrl"),
-        item.get("permalink"),
-        item.get("postUrl"),
-        item.get("post_url"),
-        item.get("url"),
-        item.get("link"),
-    ]
-    # cleanup candidates
-    candidates = [c for c in (candidates or []) if c and isinstance(c, str)]
-    post_url = ""
-    for c in candidates:
-        if url_looks_bad(c):
-            continue
-        post_url = c
-        break
+    caption = item.get("text") or ""
+    media_url = item.get("thumb") or ""
+    is_video = "video" in str(item.get("type", "")).lower() or item.get("video")  # Apify sometimes has 'video' field
 
-    post_id = item.get("id") or item.get("postId") or item.get("post_id") or ""
-    # If post_url seems absent or bad, try to build one
-    if (not post_url or url_looks_bad(post_url)) and post_id:
-        built = construct_fb_permalink(page, post_id)
-        if built:
-            post_url = built
+    # Priority: topLevelUrl (best stable permalink) > url > build from IDs
+    post_url = item.get("topLevelUrl") or item.get("url") or ""
 
-    # Final safety: if we have a post_url but it appears to be a login wall or problematic, try alternate
-    if post_url:
-        ok = head_check_url_ok(post_url)
-        if not ok:
-            logging.debug("Post URL %s failed head check; trying to reconstruct.", post_url)
-            if post_id:
-                alt = construct_fb_permalink(page, post_id)
-                if alt and head_check_url_ok(alt):
-                    post_url = alt
-                else:
-                    # give up - clear to avoid giving login-wall link
-                    post_url = ""
+    # Extract IDs
+    post_id = item.get("postId") or item.get("postFacebookId") or ""
+    page_id = item.get("pageId") or item.get("facebookId") or ""
+
+    # If no good post_url or it looks bad, build one
+    if not post_url or url_looks_bad(post_url):
+        if post_id:
+            # Apify postId is often "PAGEID_POSTID" combined – split if possible
+            parts = post_id.split("_")
+            if len(parts) == 2:
+                clean_fbid = parts[1]
+            else:
+                clean_fbid = post_id
+            post_url = construct_fb_permalink(page, clean_fbid, page_id)
+
+    # Final head check – if still bad, drop it
+    if post_url and not head_check_url_ok(post_url):
+        logging.debug("All permalink attempts failed for post_id %s", post_id)
+        post_url = ""
 
     return {
         "post_id": post_id,
-        "post_url": post_url or "",
+        "post_url": post_url,
         "caption": caption,
         "media_url": media_url,
-        "is_video": is_video
+        "is_video": is_video,
+        "likes": item.get("likes", 0),
+        "comments": item.get("comments", 0),
+        "shares": item.get("shares", 0),
+        "time": item.get("time")
     }
 
 def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
@@ -388,11 +373,10 @@ def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]
         return posts
 
     payload = {
-        "startUrls": [{"url": f"https://www.facebook.com/{account}"}],
-        "resultsLimit": limit,
-        # optional actor-specific flags - use apify proxy for better success
-        "proxy": {"useApifyProxy": True}
-    }
+    "startUrls": [{"url": f"https://www.facebook.com/{account}"}],
+    "resultsLimit": limit,
+    "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}  # Better for FB
+}
     headers = {"Authorization": f"Bearer {APIFY_TOKEN}", "Content-Type": "application/json"}
 
     try:
