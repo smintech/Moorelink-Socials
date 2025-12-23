@@ -325,7 +325,7 @@ def rapidapi_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: in
             continue
 
     # all retries failed -> raise a clear error
-    raise RuntimeError(f"RapidAPI call failed after {retries + 1}
+    raise RuntimeError(f"RapidAPI call failed after {retries + 1} attempts")
 
 def extract_og_meta(html: str, name: str) -> Optional[str]:
     """Extract content of og:name or name meta tags. Returns first match or None."""
