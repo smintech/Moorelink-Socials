@@ -67,6 +67,7 @@ from utils import (
     mark_posts_seen,
     call_social_ai,
     fetch_fb_urls,
+    POST_LIMIT,
 )
 
 # ================ CONFIG ================
