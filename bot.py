@@ -1401,7 +1401,8 @@ if __name__ == "__main__":
 
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    
+    app.add_handler(CommandHandler("testmode", testmode_command))
+
     async def set_command_visibility(application):
         public_cmds = [
             BotCommand("start", "Show welcome / menu"),
