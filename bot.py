@@ -141,6 +141,72 @@ async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_message.reply_text("Unknown arg. Use: on|off|toggle|status")
 
+async def send_next_post_with_confirmation(update_or_query, context: ContextTypes.DEFAULT_TYPE, platform: str, account: str):
+    """Send the next pending post with Continue/Cancel buttons"""
+    user_data_key = f"pending_posts_{platform}_{account}"
+    pending = context.user_data.get(user_data_key)
+
+    if not pending or pending["index"] >= pending["total"]:
+        # All done → show AI button
+        badge = get_user_badge(update_or_query.effective_user.id)
+        await send_ai_button(
+            update_or_query.effective_message if hasattr(update_or_query, 'effective_message') else update_or_query.message,
+            pending["total"] if pending else len(context.user_data.get(f"last_ai_context_{platform}_{account}", [])),
+            platform,
+            account,
+            badge
+        )
+        context.user_data.pop(user_data_key, None)
+        return
+
+    current_idx = pending["index"]
+    post = pending["posts"][current_idx]
+
+    # Build caption
+    view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
+    link_html = f"<a href='{post['post_url']}'>{view_text}</a>" if post['post_url'] else ""
+    caption = post.get("caption", "")[:1024]
+    full_caption = f"{link_html}\n\n{caption}" if link_html else caption
+
+    # Confirmation keyboard
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ Send this post ({current_idx + 1}/{pending['total']})", callback_data=f"confirm_post_{platform}_{account}_{current_idx}"),
+        InlineKeyboardButton("❌ Cancel remaining", callback_data=f"cancel_posts_{platform}_{account}")
+    ]])
+
+    # Send preview (photo/video)
+    if post.get("is_video"):
+        preview_msg = await update_or_query.effective_message.reply_video(
+            video=post["media_url"],
+            caption=full_caption + "\n\n👆 Send this post?",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+    else:
+        preview_msg = await update_or_query.effective_message.reply_photo(
+            photo=post["media_url"],
+            caption=full_caption + "\n\n👆 Send this post?",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+
+    await schedule_delete(update_or_query.effective_message.chat.id, preview_msg.message_id)
+
+async def send_ai_button(message, count, platform, account, badge):
+    button_text = f"Analyze {count} new post(s) with AI 🤖"
+    if badge['name'] in ('Diamond', 'Admin'):
+        button_text += " (Unlimited)"
+
+    analyze_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(button_text, callback_data=f"ai_analyze_{platform}_{account}")
+    ]])
+
+    final_msg = await message.reply_text(
+        f"✨ {count} new post(s) processed!\nTap below for sharp AI breakdown:",
+        reply_markup=analyze_kb
+    )
+    await schedule_delete(message.chat.id, final_msg.message_id)
+
 # ================ UI BUILDERS ================
 def build_main_menu():
     keyboard = [
@@ -240,6 +306,14 @@ async def delete_message(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
     except Exception:
         pass
+async def schedule_delete(chat_id: int, message_id: int, delay_seconds: int = 86400):
+    context = ContextTypes.DEFAULT_TYPE()
+    context.job_queue.run_once(
+        delete_message,
+        when=delay_seconds,
+        data={"chat_id": chat_id, "message_id": message_id},
+        name=f"delete_{message_id}"
+    )
 
 # ================ UNIFIED FETCH & AI BUTTON ================
 async def handle_fetch_and_ai(update, context, platform, account, query=None, force: bool = False):
@@ -303,67 +377,23 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
             f"No new posts from @{account} since your last check."
         )
             return
-    # Mark as seen
+    # Mark as seen early
     mark_posts_seen(uid, platform, account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
 
-    # Store for AI context
+    # Store posts for sequential sending and AI context
+    context.user_data[f"pending_posts_{platform}_{account}"] = {
+        "posts": new_posts,
+        "index": 0,
+        "total": len(new_posts)
+    }
     context.user_data[f"last_ai_context_{platform}_{account}"] = new_posts
 
-    # Send new posts
-    for post in new_posts:
-                # Determine correct "View on" text
-        if platform == "x":
-            view_text = "View on X🐦"
-        elif platform == "fb":
-            view_text = "View on Facebook 🌐"
-        elif platform == "ig":
-            view_text = "View on Instagram 📸"
-        else:
-            view_text = "View Post 🔗"
+    if not new_posts:
+        # existing no new posts handling remains
+        return "I'm done 😁"
 
-        # Build HTML link
-        link_html = f"<a href='{post['post_url']}'>{view_text}</a>" if post['post_url'] else ""
-
-        caption = post.get("caption", "")[:1024]
-        full_caption = f"{link_html}\n\n{caption}" if link_html else caption
-
-        try:
-            if post.get("is_video"):
-                await message.reply_video(
-                    video=post["media_url"],
-                    caption=full_caption,
-                    parse_mode="HTML"
-                )
-            else:
-                await message.reply_photo(
-                    photo=post["media_url"],
-                    caption=full_caption,
-                    parse_mode="HTML"
-                )
-        except Exception as e:
-            logging.warning("Failed to send media: %s", e)
-            await message.reply_text(
-                f"{full_caption}\n\nMedia: {post['media_url']}",
-                parse_mode="HTML",
-                disable_web_page_preview=False
-            )
-        await asyncio.sleep(0.3)
-
-    # AI Button
-    badge = get_user_badge(uid)
-    button_text = f"Analyze {len(new_posts)} new post(s) with AI 🤖"
-    if badge['name'] in ('Diamond', 'Admin'):
-        button_text += " (Unlimited)"
-
-    analyze_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(button_text, callback_data=f"ai_analyze_{platform}_{account}")
-    ]])
-
-    await message.reply_text(
-        f"✨ {len(new_posts)} new post(s) found!\nTap below for sharp AI breakdown:",
-        reply_markup=analyze_kb
-    )
-
+    # Start sending the first post with confirmation
+    await send_next_post_with_confirmation(update, context, platform, account)
 # ================ IMPROVED MANUAL AI TASK ================
 async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, source: str = "manual"):
     logging.info("run_ai_task started for user %s (source=%s)", user_id, source)
@@ -423,6 +453,7 @@ async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTyp
                         chat_id=chat_id,
                         text=f"🤖 AI Result (model: {model_id}, source: {source}):\n\n{content}"
                     )
+                    await schedule_delete(query.message.chat.id, query.message.message_id)
                 else:
                     await context.bot.send_message(
                         chat_id=chat_id,
@@ -527,7 +558,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         await query.edit_message_text("🤖 Analyzing with Nigerian fire...")
-
+        await schedule_delete(query.message.chat.id, query.message.message_id)
+        
         posts = context.user_data.get(f"last_ai_context_{platform}_{account}", [])
 
         analysis = await call_social_ai(platform, account, posts)
@@ -561,7 +593,70 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await handle_fetch_and_ai(update, context, saved["platform"], saved["account_name"], query)
         return
+        
+    if data.startswith("confirm_post_"):
+        parts = data.split("_")
+        if len(parts) < 5:
+            await query.edit_message_text("Error.")
+            return
+        platform = parts[2]
+        account = parts[3]
+        try:
+            idx = int(parts[4])
+        except:
+            await query.edit_message_text("Invalid index.")
+            return
 
+        user_data_key = f"pending_posts_{platform}_{account}"
+        pending = context.user_data.get(user_data_key)
+        if not pending or idx != pending["index"]:
+            await query.edit_message_text("This post is cancelled.")
+            return
+
+        post = pending["posts"][idx]
+
+        # Actually send the post (without buttons)
+        view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
+        link_html = f"<a href='{post['post_url']}'>{view_text}</a>" if post['post_url'] else ""
+        caption = post.get("caption", "")[:1024]
+        full_caption = f"{link_html}\n\n{caption}" if link_html else caption
+
+        if post.get("is_video"):
+            sent = await query.message.reply_video(video=post["media_url"], caption=full_caption, parse_mode="HTML")
+        else:
+            sent = await query.message.reply_photo(photo=post["media_url"], caption=full_caption, parse_mode="HTML")
+        await schedule_delete(query.message.chat.id, sent.message_id)
+
+        # Delete the preview confirmation message
+        try:
+            await query.message.delete()
+        except:
+            pass
+
+        # Move to next
+        pending["index"] += 1
+        await send_next_post_with_confirmation(query, context, platform, account)
+        return
+
+    if data.startswith("cancel_posts_"):
+        _, _, plat_acc = data.partition("cancel_posts_")
+        platform, _, account = plat_acc.partition("_")
+
+        user_data_key = f"pending_posts_{platform}_{account}"
+        pending = context.user_data.pop(user_data_key, None)
+
+        count = pending["total"] if pending else 0
+        sent_count = pending["index"] if pending else 0
+
+        await query.edit_message_text(
+            f"❌ Sending cancelled.\nSent {sent_count}/{count} posts."
+        )
+        # Still show AI button if at least one post was seen
+        if pending and pending["index"] > 0:
+            badge = get_user_badge(uid)
+            await send_ai_button(query.message, pending["index"], platform, account, badge)
+        return
+        
     if data.startswith("confirm_ban_"):
         if not is_admin(uid):
             await query.edit_message_text("❌ Admins only.")
@@ -642,29 +737,52 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_save"] = True
         await query.edit_message_text("Send: <platform> <username> [label]\nExample: `x vdm fav`", reply_markup=build_back_markup("saved_menu"))
         return
-    if data == "saved_list":
-        owner = uid
-        items = list_saved_accounts(owner)
+    if data == "saved_list" or data.startswith("saved_page_"):
+        page = 0
+        if data.startswith("saved_page_"):
+            page = int(data[len("saved_page_"):])
+
+        items = list_saved_accounts(uid)
         if not items:
-            await query.edit_message_text("You have no saved accounts.", reply_markup=build_saved_menu())
+            await query.edit_message_text("You no get any saved account.", reply_markup=build_saved_menu())
             return
-        text = "Your saved accounts:\n\n"
+
+        per_page = 4
+        start = page * per_page
+        end = start + per_page
+        page_items = items[start:end]
+        total_pages = (len(items) + per_page - 1) // per_page
+
+        text = f"Your saved accounts ({page+1}/{total_pages}):\n\n"
         rows = []
-        for it in items:
+        for it in page_items:
             sid = it["id"]
-            plat = it["platform"]
+            plat = it["platform"].upper()
             acc = it["account_name"]
             lbl = it.get("label") or ""
-            text += f"{sid}. [{plat}] @{acc} {('- '+lbl) if lbl else ''}\n"
+            display = f"{sid}. [{plat}] @{acc}"
+            if lbl:
+                display += f" — {lbl}"
+            text += display + "\n"
+
             rows.append([
-                InlineKeyboardButton(f"Send {sid}", callback_data=f"saved_sendcb_{sid}"),
+                InlineKeyboardButton("Send", callback_data=f"saved_sendcb_{sid}"),
                 InlineKeyboardButton("Rename", callback_data=f"saved_rename_start_{sid}"),
                 InlineKeyboardButton("Remove", callback_data=f"saved_removecb_{sid}")
             ])
+
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"saved_page_{page-1}"))
+        if end < len(items):
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"saved_page_{page+1}"))
+        if nav:
+            rows.append(nav)
+
         rows.append([InlineKeyboardButton("↩️ Back", callback_data="saved_menu")])
+
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
         return
-
     if data.startswith("saved_removecb_"):
         _, _, sid_s = data.partition("saved_removecb_")
         try:
@@ -831,23 +949,29 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     badge = get_user_badge(uid)
 
     # AI Follow-up Chat (ONLY Diamond & Admin)
+        # AI Follow-up Chat (ONLY Diamond & Admin) – FIXED & ROBUST
     if context.user_data.get("ai_chat_active") and badge['name'] in ('Diamond', 'Admin'):
         chat_context = context.user_data["ai_chat_active"]
         posts = chat_context["posts"]
-        question = update.message.text
+        question = update.message.text.strip()
 
-        captions_text = "\n---\n".join([p.get("caption", "No caption") for p in posts if p.get("caption")])
+        captions_text = "\n---\n".join([
+            p.get("caption", "No caption") or ""
+            for p in posts
+        ])
 
         prompt = f"""
-You are a sharp Nigerian social media analyst.
+You are a sharp Nigerian social media analyst. Use Pidgin-mixed English, short and direct.
 
 Previous posts from @{chat_context['account']} ({chat_context['platform'].upper()}):
 {captions_text}
 
-User question: {question}
+User follow-up question: {question}
 
-Answer in short, engaging Pidgin-mixed English. Use slang where e fit. Max 6 sentences.
+Answer in max 6 sentences. Keep it engaging.
 """
+
+        await update.message.chat.send_action(ChatAction.TYPING)
 
         try:
             client = AsyncOpenAI(
@@ -855,19 +979,21 @@ Answer in short, engaging Pidgin-mixed English. Use slang where e fit. Max 6 sen
                 base_url="https://api.groq.com/openai/v1"
             )
             response = await client.chat.completions.create(
-                model="llama-3.1-70b-versatile",
+                model="llama-3.3-70b-versatile",  # updated flagship
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.8,
-                max_tokens=400
+                max_tokens=500
             )
             answer = response.choices[0].message.content.strip()
-            await update.message.reply_text(f"🤖 <b>AI Answer</b>:\n\n{answer}", parse_mode="HTML")
-        except Exception:
-            await update.message.reply_text("🤖 AI unavailable right now. Try again later.")
+            await update.message.reply_text(
+                f"🤖 <b>AI Follow-up</b>:\n\n{answer}\n\n<i>Reply again for more questions!</i>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.error(f"AI follow-up failed: {e}")
+            await update.message.reply_text("🤖 AI temporary unavailable. Try again later.")
 
-        return  # consume the message
-        
-        # Manual AI Analysis (Admin only, button-driven)
+        return  # message consumed – keep ai_chat_active flag alive!  # consume the message
     # Manual AI Analysis (Admin only, button-driven - NOW MULTI-TURN!)
     if context.user_data.get("awaiting_manual_ai"):
         if not is_admin(uid):
