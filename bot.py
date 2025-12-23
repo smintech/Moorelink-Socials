@@ -1,4 +1,4 @@
-# bot.py - FULL COMPLETE UPDATED FILE - NO EXCLUSIONS WHATSOEVER (December 22, 2025)
+l# bot.py - FULL COMPLETE UPDATED FILE - NO EXCLUSIONS WHATSOEVER (December 22, 2025)
 # All original features preserved + Manual AI now fully button-driven (no /ai_call command)
 # Updated Groq models to current best: llama-3.3-70b-versatile (latest flagship)
 # Every single line from the original is included or appropriately modified – nothing omitted 😏
@@ -176,38 +176,33 @@ async def send_ai_button(message, count, platform, account, badge, context=None,
 
     return final_msg
 
+# --- slight adjustments to your send_next_post_with_confirmation (only small safe edits) ---
 async def send_next_post_with_confirmation(update_or_query, context: ContextTypes.DEFAULT_TYPE, platform: str, account: str):
     """Send the next pending post with Continue/Cancel buttons."""
     user_data_key = f"pending_posts_{platform}_{account}"
     pending = context.user_data.get(user_data_key)
 
-    # Helper: extract message and uid from either Update / CallbackQuery / Message-like objects
+    # determine message & uid from the several possible inputs
     message = None
     uid = None
-    # If this is an Update with a callback_query
     if hasattr(update_or_query, "callback_query") and getattr(update_or_query, "callback_query"):
         cq = update_or_query.callback_query
         message = cq.message
         uid = cq.from_user.id if cq.from_user else (cq.message.from_user.id if cq.message and cq.message.from_user else None)
-    # If this is a regular Update with an effective_message/user
     elif hasattr(update_or_query, "effective_message") and update_or_query.effective_message:
         message = update_or_query.effective_message
         uid = update_or_query.effective_user.id if update_or_query.effective_user else None
-    # If this is directly a Message-like object (rare)
     elif hasattr(update_or_query, "chat") and hasattr(update_or_query, "from_user"):
         message = update_or_query
         uid = update_or_query.from_user.id
     else:
-        # last resort: try attributes
         try:
             uid = getattr(update_or_query, "from_user", None).id
         except Exception:
             uid = None
 
-    # If no pending or index done -> show AI button summary and clear pending
-    # If no pending or index done -> show AI button summary and clear pending
+    # If no pending or done -> store last_ai_context and show AI button, then clear pending
     if not pending or pending.get("index", 0) >= pending.get("total", 0):
-        # determine uid/message as before...
         if not uid and message and message.from_user:
             uid = message.from_user.id
 
@@ -218,26 +213,18 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
 
         badge = get_user_badge(uid)
 
-        # === NEW: store last_ai_context so ai_analyze callback sees the posts ===
-        # Prefer storing the posts that were processed (pending['posts'])
         posts_to_store = []
         if pending and isinstance(pending, dict):
-            posts_to_store = pending.get("posts", [])[:]  # copy
+            posts_to_store = pending.get("posts", [])[:]
         else:
-            # fallback: try previously stored context if any
             posts_to_store = context.user_data.get(f"last_ai_context_{platform}_{account}", [])
 
-        # Save into context.user_data using the same key ai handler expects
         context.user_data[f"last_ai_context_{platform}_{account}"] = posts_to_store
 
-        # Compose a target message object to reply to
-        target_msg = message or update_or_query  # fallback
-
-        # Count: processed vs total (defensive)
+        target_msg = message or update_or_query
         processed_count = pending.get("index", 0) if pending else 0
         total_count = pending.get("total", processed_count) if pending else len(posts_to_store)
 
-        # Show AI button (re-use your helper). Do NOT auto-delete the AI button.
         await send_ai_button(
             target_msg,
             max(processed_count, total_count),
@@ -248,44 +235,38 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
             auto_delete_after=None
         )
 
-        # Clear pending context AFTER we stored last_ai_context
         context.user_data.pop(user_data_key, None)
         return
 
-    # At this point we have pending posts and an index to send
-    # Ensure message and uid exist
+    # Ensure message exists
     if not message:
         logging.warning("send_next_post_with_confirmation: no message object to reply to; aborting.")
         return
     if not uid and message.from_user:
         uid = message.from_user.id
 
-    # Defensive pending shape
     posts = pending.get("posts") or []
     current_idx = int(pending.get("index", 0))
     total = int(pending.get("total", len(posts)))
 
     if current_idx < 0 or current_idx >= len(posts):
         logging.warning("send_next_post_with_confirmation: index out of range (%s) for @%s", current_idx, account)
-        # Clear pending to avoid loops
         context.user_data.pop(user_data_key, None)
         await message.reply_text("No more pending posts.")
         return
 
     post = posts[current_idx]
 
-    # Build caption + link
     view_text = {
         "x": "View on X🐦",
         "fb": "View on Facebook 🌐",
         "ig": "View on Instagram 📸"
     }.get(platform, "View Post 🔗")
 
-    link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get("post_url") else ""
+    link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
     caption = (post.get("caption") or "")[:1024]
     full_caption = f"{link_html}\n\n{caption}" if link_html else caption
 
-    # Confirmation keyboard
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(
             f"✅ Send this post ({current_idx + 1}/{total})",
@@ -316,7 +297,6 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
             )
     except Exception as e:
         logging.exception("Failed to send preview media for %s/%s idx=%s: %s", platform, account, current_idx, e)
-        # Fallback: send as text with link + caption and the keyboard
         try:
             preview_msg = await message.reply_text(
                 (full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?",
@@ -325,17 +305,13 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
             )
         except Exception as e2:
             logging.exception("Fallback text send also failed: %s", e2)
-            # give up and clear pending to avoid stuck state
             context.user_data.pop(user_data_key, None)
             return
 
-    # Schedule deletion of the preview if you have a helper that handles it.
-    # Use the actual chat id and the message id we just sent.
+    # Schedule deletion of the preview (use preview_msg ids)
     try:
-        # schedule_delete(context, chat_id, message_id) — keep your existing helper signature
         await schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
     except Exception:
-        # If schedule_delete is not awaitable or has different signature, try non-await fallback
         try:
             schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
         except Exception:
@@ -695,6 +671,7 @@ async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTyp
     logging.info("run_ai_task finished for user %s", user_id)
 
 # ================ CALLBACK HANDLER ================
+# --- patched callback handler (replace your existing one) ---
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -702,7 +679,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user.id if user else None
 
     await record_user_and_check_ban(update, context)
-
     data = query.data or ""
 
     # AI Analysis Button
@@ -719,11 +695,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("AI limit reached! Invite friends to upgrade.", show_alert=True)
                 return
 
-        await query.edit_message_text("🤖 Analyzing with Nigerian fire...")
-        await schedule_delete(context, update.message.chat.id, sent.message_id)
-        
-        posts = context.user_data.get(f"last_ai_context_{platform}_{account}", [])
+        # Inform user we are analyzing
+        await context.bot.edit_message_text(
+            chat_id=query.message.chat.id,
+            message_id=query.message.message_id,
+            text="🤖 Analyzing with Nigerian fire..."
+        )
 
+        # Collect posts context and call AI
+        posts = context.user_data.get(f"last_ai_context_{platform}_{account}", [])
         analysis = await call_social_ai(platform, account, posts)
 
         final_text = f"🤖 <b>AI Insight</b>:\n\n{analysis}"
@@ -736,7 +716,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "posts": posts
             }
 
-        await query.edit_message_text(final_text, parse_mode="HTML")
+        # Replace the analyzing message with final analysis
+        await context.bot.edit_message_text(
+            chat_id=query.message.chat.id,
+            message_id=query.message.message_id,
+            text=final_text,
+            parse_mode="HTML"
+        )
         return
 
     # Saved quick send
@@ -745,19 +731,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             sid = int(sid_s)
         except:
-            await query.edit_message_text("Invalid saved id.")
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat.id,
+                message_id=query.message.message_id,
+                text="Invalid saved id."
+            )
             return
 
         saved = get_saved_account(uid, sid)
         if not saved:
-            await query.edit_message_text("Saved account not found.")
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat.id,
+                message_id=query.message.message_id,
+                text="Saved account not found."
+            )
             return
 
         await handle_fetch_and_ai(update, context, saved["platform"], saved["account_name"], query)
         return
-        
+
+    # Confirm (send) single post
     if data.startswith("confirm_post_"):
-        query = update.callback_query
         await query.answer()  # acknowledge immediately
 
         parts = data.split("_")
@@ -777,7 +771,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending = context.user_data.get(user_data_key)
         if not pending or pending.get("index", 0) != idx:
             await query.answer("Post expired or out of order.", show_alert=True)
-            # Refresh current state
+            # Refresh current state (pass the CallbackQuery so helper can find message)
             await send_next_post_with_confirmation(query, context, platform, account)
             return
 
@@ -786,11 +780,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Download and send clean post
         media_bytes = await download_media(post.get("media_url"))
         if not media_bytes:
-            await query.edit_message_caption(
-                caption=(query.message.caption or "") + "\n\n❌ Media failed to load",
-                reply_markup=None
-            )
+            # edit the preview to indicate media failed and remove buttons (explicit chat/message)
+            try:
+                await context.bot.edit_message_caption(
+                    chat_id=query.message.chat.id,
+                    message_id=query.message.message_id,
+                    caption=(query.message.caption or "") + "\n\n❌ Media failed to load",
+                    reply_markup=None
+                )
+            except Exception:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=query.message.chat.id,
+                        message_id=query.message.message_id,
+                        text=(query.message.text or "") + "\n\n❌ Media failed to load",
+                        reply_markup=None
+                    )
+                except Exception as e:
+                    logging.warning("Failed to mark preview as failed: %s", e)
+
+            # advance and persist, then show next
             pending["index"] += 1
+            context.user_data[user_data_key] = pending
             await send_next_post_with_confirmation(query, context, platform, account)
             return
 
@@ -807,35 +818,41 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bio.name = "photo.jpg"
             sent = await query.message.reply_photo(photo=bio, caption=full_caption, parse_mode="HTML")
 
-        # Schedule auto-delete for sent post
+        # Schedule auto-delete for sent post (use sent's ids)
         await schedule_delete(context, sent.chat.id, sent.message_id)
 
-        # Edit old preview to "Sent!" and REMOVE buttons
+        # Edit old preview to "Sent!" and REMOVE buttons using explicit edit
         try:
             old_caption = query.message.caption or query.message.text or ""
-            new_caption = old_caption.rstrip()  # remove any trailing buttons text
-            await query.edit_message_caption(
+            new_caption = old_caption.rstrip()
+            await context.bot.edit_message_caption(
+                chat_id=query.message.chat.id,
+                message_id=query.message.message_id,
                 caption=new_caption + "\n\n✅ <b>Sent!</b>",
                 parse_mode="HTML",
-                reply_markup=None  # THIS REMOVES THE BUTTONS
+                reply_markup=None
             )
         except Exception:
             try:
-                await query.edit_message_text(
+                await context.bot.edit_message_text(
+                    chat_id=query.message.chat.id,
+                    message_id=query.message.message_id,
                     text=new_caption + "\n\n✅ <b>Sent!</b>",
+                    parse_mode="HTML",
                     reply_markup=None
                 )
             except Exception as e:
                 logging.warning(f"Could not edit confirmation: {e}")
 
-        # Advance and send next
+        # Advance and persist before showing next preview
         pending["index"] += 1
         context.user_data[user_data_key] = pending
 
-        # THIS IS THE KEY LINE — pass query (CallbackQuery) so it can get message context
+        # Show next preview (pass CallbackQuery so helper can locate the message)
         await send_next_post_with_confirmation(query, context, platform, account)
         return
 
+    # Cancel remaining posts
     if data.startswith("cancel_posts_"):
         _, _, plat_acc = data.partition("cancel_posts_")
         platform, _, account = plat_acc.partition("_")
@@ -847,7 +864,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = pending["total"] if pending else 0
 
         try:
-            await query.edit_message_caption(
+            await context.bot.edit_message_caption(
+                chat_id=query.message.chat.id,
+                message_id=query.message.message_id,
                 caption=(query.message.caption or "") + f"\n\n❌ Cancelled. Sent {sent_count}/{total} posts.",
                 reply_markup=None
             )
@@ -859,7 +878,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             badge = get_user_badge(uid)
             await send_ai_button(query.message, pending["index"], platform, account, badge)
         return
-
+    # ... rest of callbacks (confirm_unban_, confirm_export_csv, etc.) unchanged ...
     if data.startswith("confirm_unban_"):
         if not is_admin(uid):
             await query.edit_message_text("❌ Admins only.")
