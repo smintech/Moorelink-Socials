@@ -149,18 +149,37 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
     pending = context.user_data.get(user_data_key)
 
     if not pending or pending["index"] >= pending["total"]:
-        # All done → show AI button
-        badge = get_user_badge(update_or_query.effective_user.id)
+        # All posts processed (or cancelled early) → show AI analyze button
+        badge = get_user_badge(uid)  # uid already available from outer scope
+
+        # Safely get the message object to reply to
+        if hasattr(update_or_query, 'effective_message'):
+            msg = update_or_query.effective_message
+        elif hasattr(update_or_query, 'message'):
+            msg = update_or_query.message
+        else:
+            msg = update_or_query  # already a Message object
+
+        # Determine how many posts were actually processed/sent
+        processed_count = pending["index"] if pending else 0
+        total_count = pending["total"] if pending else 0
+
+        # Fallback to stored context if pending cleared early
+        if processed_count == 0:
+            stored_posts = context.user_data.get(f"last_ai_context_{platform}_{account}", [])
+            processed_count = len(stored_posts)
+
         await send_ai_button(
-            update_or_query.effective_message if hasattr(update_or_query, 'effective_message') else update_or_query.message,
-            pending["total"] if pending else len(context.user_data.get(f"last_ai_context_{platform}_{account}", [])),
+            msg,
+            processed_count,
             platform,
             account,
             badge
         )
+
+        # Clean up pending session
         context.user_data.pop(user_data_key, None)
         return
-
     current_idx = pending["index"]
     post = pending["posts"][current_idx]
 
@@ -690,7 +709,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Move to next post
         pending["index"] += 1
-        await send_next_post_with_confirmation(query, context, platform, account)
+        await send_next_post_with_confirmation(query.message, context, platform, account)
         return
 
     if data.startswith("cancel_posts_"):
