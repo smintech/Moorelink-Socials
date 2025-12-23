@@ -5,5 +5,3 @@ beautifulsoup4
 instaloader
 openai
 httpx
-playwright
-chromium
