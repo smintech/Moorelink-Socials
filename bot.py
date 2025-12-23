@@ -236,7 +236,7 @@ async def handle_fetch_and_ai(update: Update, context: ContextTypes.DEFAULT_TYPE
             })
     elif platform == "fb":
         # Now it's async – await it!
-        raw_fb = await fetch_fb_urls(account)
+        raw_fb = fetch_fb_urls(account)
         post_list = []
         for p in raw_fb:
             pid = p.get("post_id") or p.get("post_url", "")
