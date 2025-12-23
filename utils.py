@@ -12,6 +12,7 @@ from psycopg2.extras import RealDictCursor
 import instaloader
 from openai import AsyncOpenAI, OpenAIError
 import json
+import urllib.parse
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
 TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separate TG DB
@@ -24,6 +25,7 @@ APIFY_RUN_URL = f"https://api.apify.com/v2/acts/apify~facebook-posts-scraper/run
 APIFY_DATASET_URL_TEMPLATE = "https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true&format=json&limit={limit}"
 APIFY_POLL_TIMEOUT = 25  # seconds total to wait
 APIFY_POLL_INTERVAL = 1.5  
+HTTP_CHECK_TIMEOUT = 6.0
 # ================ DB CONNECTIONS ============
 def get_db():
     if not DB_URL:
@@ -275,114 +277,176 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
         logging.debug("fetch_ig_urls failed", exc_info=True)
     return posts
 
+def looks_like_login_wall_html(text: str) -> bool:
+    low = (text or "").lower()
+    # simple heuristics
+    return ("log in to continue" in low) or ("login" in low and "facebook" in low) or ("sign in" in low and "facebook" in low)
+
+def url_looks_bad(url: str) -> bool:
+    if not url:
+        return True
+    u = url.lower()
+    # skip instagram links or share dialogs that are not direct permalinks
+    if "instagram.com" in u and "facebook.com" not in u:
+        return True
+    if "sharer.php" in u or "facebook.com/plugins" in u:
+        return True
+    return False
+
+def head_check_url_ok(url: str) -> bool:
+    """Do a HEAD/GET check to see if URL returns login wall or valid content."""
+    try:
+        # prefer HEAD then GET fallback
+        r = requests.head(url, allow_redirects=True, timeout=HTTP_CHECK_TIMEOUT)
+        if r.status_code >= 400:
+            # try GET — sometimes HEAD blocked
+            r = requests.get(url, allow_redirects=True, timeout=HTTP_CHECK_TIMEOUT)
+        content = r.text[:1000] if hasattr(r, "text") else ""
+        if looks_like_login_wall_html(content):
+            return False
+        # 200-ish and not login wall -> OK
+        return 200 <= r.status_code < 400
+    except Exception as e:
+        logging.debug("head_check_url_ok failed for %s: %s", url, e)
+        return False
+
+def construct_fb_permalink(page: str, post_id: str) -> str:
+    """Try a couple permalink forms."""
+    page = page.lstrip("@")
+    post_id = str(post_id or "")
+    if not post_id:
+        return ""
+    # prefer /posts/{id}
+    p1 = f"https://www.facebook.com/{page}/posts/{post_id}"
+    p2 = f"https://m.facebook.com/story.php?story_fbid={post_id}&id={page}"
+    # return p1 (caller can head_check)
+    return p1
+
+def normalize_apify_item_to_post(item: Dict[str, Any], page: str) -> Dict[str, Any]:
+    """
+    Extract best post_url + other fields from an Apify item defensively.
+    """
+    # fields Apify actors may contain:
+    # 'url', 'permalinkUrl', 'permalink', 'postUrl', 'post_url', 'id', 'text', 'caption', 'thumb', 'image'
+    caption = item.get("text") or item.get("caption") or item.get("title") or item.get("description") or ""
+    media_url = item.get("thumb") or item.get("image") or item.get("media") or item.get("fullPicture")
+    is_video = bool(item.get("isVideo") or item.get("is_video") or ("video" in (item.get("type") or "").lower()))
+    # prefer explicit permalink fields
+    candidates = [
+        item.get("permalinkUrl"),
+        item.get("permalink"),
+        item.get("postUrl"),
+        item.get("post_url"),
+        item.get("url"),
+        item.get("link"),
+    ]
+    # cleanup candidates
+    candidates = [c for c in (candidates or []) if c and isinstance(c, str)]
+    post_url = ""
+    for c in candidates:
+        if url_looks_bad(c):
+            continue
+        post_url = c
+        break
+
+    post_id = item.get("id") or item.get("postId") or item.get("post_id") or ""
+    # If post_url seems absent or bad, try to build one
+    if (not post_url or url_looks_bad(post_url)) and post_id:
+        built = construct_fb_permalink(page, post_id)
+        if built:
+            post_url = built
+
+    # Final safety: if we have a post_url but it appears to be a login wall or problematic, try alternate
+    if post_url:
+        ok = head_check_url_ok(post_url)
+        if not ok:
+            logging.debug("Post URL %s failed head check; trying to reconstruct.", post_url)
+            if post_id:
+                alt = construct_fb_permalink(page, post_id)
+                if alt and head_check_url_ok(alt):
+                    post_url = alt
+                else:
+                    # give up - clear to avoid giving login-wall link
+                    post_url = ""
+
+    return {
+        "post_id": post_id,
+        "post_url": post_url or "",
+        "caption": caption,
+        "media_url": media_url,
+        "is_video": is_video
+    }
+
 def fetch_fb_urls(account: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
     """
-    Synchronous fetch via Apify actor.
-    Returns a list of dicts: {post_id, post_url, caption, media_url, is_video}
+    Synchronous Apify run with robust permalink selection and login-wall avoidance.
     """
     account = account.lstrip("@")
     posts: List[Dict[str, Any]] = []
-
     if not APIFY_TOKEN:
-        logging.error("Apify token not set (APIFY_API_TOKEN / APIFY / APIFY_TOKEN).")
-        return []
+        logging.error("Apify token not set (APIFY_API_TOKEN/APIFY/APIFY_TOKEN).")
+        return posts
 
     payload = {
-        "startUrls": [{"url": f"https://m.facebook.com/{account}"}],  # mobile often easier
-        "resultsLimit": limit
+        "startUrls": [{"url": f"https://www.facebook.com/{account}"}],
+        "resultsLimit": limit,
+        # optional actor-specific flags - use apify proxy for better success
+        "proxy": {"useApifyProxy": True}
     }
     headers = {"Authorization": f"Bearer {APIFY_TOKEN}", "Content-Type": "application/json"}
 
     try:
         r = requests.post(APIFY_RUN_URL, json=payload, headers=headers, timeout=15)
-    except Exception as e:
-        logging.exception("Failed to start Apify run for %s: %s", account, e)
-        return []
+        if r.status_code not in (200, 201):
+            logging.error("Apify run start failed for %s: %s %s", account, r.status_code, r.text[:200])
+            return posts
+        data = r.json()
+        run_info = data.get("data") or data
+        dataset_id = run_info.get("defaultDatasetId") or run_info.get("defaultDataset") or run_info.get("defaultDatasetId")
+        run_id = run_info.get("id")
 
-    if r.status_code not in (200, 201):
-        logging.error("Apify run start failed for %s: status=%s body=%s", account, r.status_code, r.text)
-        return []
-
-    data = r.json()
-    # Depending on Apify version, run id and dataset id might live in data['data'] or directly in data
-    run_info = data.get("data") or data
-    run_id = run_info.get("id")
-    dataset_id = run_info.get("defaultDatasetId") or run_info.get("defaultDataset") or run_info.get("defaultDatasetId")
-
-    if not dataset_id and run_id:
-        # older endpoint: dataset id may be part of run details endpoint — try to fetch run details
-        try:
-            run_details = requests.get(f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}", timeout=10)
-            if run_details.status_code == 200:
-                rd = run_details.json()
-                ds = rd.get("data", {}).get("defaultDatasetId")
-                if ds:
-                    dataset_id = ds
-        except Exception:
-            pass
-
-    if not dataset_id:
-        logging.warning("No dataset id returned for Apify run (account=%s). Run info: %s", account, run_info)
-        # still try to poll the run items endpoint by run id
-        if run_id:
-            results_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?clean=true&format=json&limit={limit}&token={APIFY_TOKEN}"
+        if not dataset_id:
+            # fallback to run dataset endpoint
+            if run_id:
+                results_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?clean=true&format=json&limit={limit}&token={APIFY_TOKEN}"
+            else:
+                logging.error("No dataset id/run id for apify run: %s", run_info)
+                return posts
         else:
-            logging.error("No run_id/dataset_id to fetch results for %s", account)
-            return []
-    else:
-        results_url = APIFY_DATASET_URL_TEMPLATE.format(dataset_id=dataset_id, limit=limit) + f"&token={APIFY_TOKEN}"
+            results_url = APIFY_DATASET_URL_TEMPLATE.format(dataset_id=dataset_id, limit=limit) + f"&token={APIFY_TOKEN}"
 
-    # poll for results (short timeout)
-    start = time.time()
-    items = []
-    while time.time() - start < APIFY_POLL_TIMEOUT:
-        try:
+        # poll
+        start = time.time()
+        items = []
+        while time.time() - start < APIFY_POLL_TIMEOUT:
             rr = requests.get(results_url, headers=headers, timeout=10)
             if rr.status_code == 200:
                 items = rr.json()
-                # sometimes Apify returns an object, sometimes a list
                 if isinstance(items, dict) and "items" in items:
                     items = items["items"]
                 if items:
                     break
-            else:
-                # 204 / 202 maybe means not ready
-                logging.debug("Apify results not ready yet: status=%s body=%s", rr.status_code, rr.text[:200])
-        except Exception as e:
-            logging.debug("Error polling Apify results: %s", e)
-        time.sleep(APIFY_POLL_INTERVAL)
+            time.sleep(APIFY_POLL_INTERVAL)
 
-    if not items:
-        logging.warning("Apify returned no items for %s (ran but dataset empty or timed out). results_url=%s", account, results_url)
-        return []
+        if not items:
+            logging.warning("Apify returned no items or timed out for %s. results_url=%s", account, results_url)
+            return posts
 
-    # Normalize items -- actor field names vary; be defensive
-    for it in items[:limit]:
-        # actor often yields fields like: url, text, thumb, image, isVideo, media, id
-        caption = it.get("text") or it.get("caption") or it.get("title") or it.get("description") or ""
-        media_url = it.get("thumb") or it.get("image") or it.get("media") or it.get("fullPicture")
-        is_video = bool(it.get("isVideo") or it.get("is_video") or ("video" in (it.get("type") or "").lower()))
-        post_url = it.get("url") or it.get("permalinkUrl") or it.get("postUrl") or ""
+        # Normalize each item defensively
+        for it in items[:limit]:
+            normalized = normalize_apify_item_to_post(it, account)
+            # skip items with no safe post_url (avoids sending login-wall links)
+            if not normalized.get("post_url"):
+                logging.debug("Skipping item (no safe permalink): %s", it.get("url") or it)
+                continue
+            posts.append(normalized)
 
-        # try to extract post_id from url or id fields
-        post_id = it.get("id") or ""
-        if not post_id and post_url:
-            # crude extraction of last path segment
-            try:
-                post_id = post_url.rstrip("/").split("/")[-1]
-            except Exception:
-                post_id = ""
+        logging.info("Fetched %d safe posts via Apify for @%s", len(posts), account)
+        return posts
 
-        posts.append({
-            "post_id": post_id,
-            "post_url": post_url,
-            "caption": caption,
-            "media_url": media_url,
-            "is_video": is_video,
-        })
-
-    logging.info("Fetched %d posts via Apify for @%s", len(posts), account)
-    return posts
+    except Exception as e:
+        logging.exception("Apify FB fetch error for %s: %s", account, e)
+        return posts
 
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
     account = account.lstrip('@').lower()
