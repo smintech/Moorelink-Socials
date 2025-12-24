@@ -261,41 +261,51 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
 
     sent_preview = False
     edited = False
-    if message:  # We have a message → try edit
+    if message:
         try:
+            # Try media edit with short timeout
             if post.get("is_video"):
-                await context.bot.edit_message_media(
-                    chat_id=message.chat.id,
-                    message_id=message.message_id,
-                    media=InputMediaVideo(media=post.get("media_url"), caption=preview_text, parse_mode="HTML"),
-                    reply_markup=keyboard
-                )
+                media = InputMediaVideo(media=post.get("media_url"), caption=preview_text, parse_mode="HTML")
             else:
-                await context.bot.edit_message_media(
+                media = InputMediaPhoto(media=post.get("media_url"), caption=preview_text, parse_mode="HTML")
+
+            await asyncio.wait_for(
+                context.bot.edit_message_media(
                     chat_id=message.chat.id,
                     message_id=message.message_id,
-                    media=InputMediaPhoto(media=post.get("media_url"), caption=preview_text, parse_mode="HTML"),
+                    media=media,
                     reply_markup=keyboard
-                )
+                ),
+                timeout=8.0  # Telegram sometimes slow
+            )
             sent_preview = True
             edited = True
             logging.info("Edited preview msg %s to idx %s", message.message_id, current_idx)
+        except asyncio.TimeoutError:
+            logging.warning("Media edit timed out on msg %s", message.message_id)
         except Exception as edit_exc:
-            logging.warning("Edit failed on msg %s: %s", message.message_id, edit_exc)
-            # Fallback to text edit
+            logging.warning("Media edit failed on msg %s: %s", message.message_id, edit_exc)
+
+        if not sent_preview:
+            # Fallback: try text edit
             try:
-                await context.bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=message.message_id,
-                    text=preview_text,
-                    parse_mode="HTML",
-                    reply_markup=keyboard
+                await asyncio.wait_for(
+                    context.bot.edit_message_text(
+                        chat_id=message.chat.id,
+                        message_id=message.message_id,
+                        text=preview_text,
+                        parse_mode="HTML",
+                        reply_markup=keyboard
+                    ),
+                    timeout=8.0
                 )
                 sent_preview = True
                 edited = True
                 logging.info("Fallback text edit success on %s", message.message_id)
+            except asyncio.TimeoutError:
+                logging.warning("Text edit also timed out on msg %s", message.message_id)
             except Exception as e2:
-                logging.warning("Text edit also failed: %s", e2)
+                logging.warning("Text edit failed: %s", e2)
 
     if not sent_preview:
         # No message or edit failed → send new reply (fallback)
@@ -791,9 +801,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Mark that a single send happened (hides "Send all" on future previews)
         pending["has_sent_single"] = True
         context.user_data[user_data_key] = pending
-
+        logging.info("Flag set: has_sent_single=True for %s/%s", platform, account)
+        
         post = pending["posts"][idx]
-
         # Download and send clean post
         media_bytes = await download_media(post.get("media_url"))
         if not media_bytes:
@@ -871,8 +881,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     # NEW: Send all remaining
     if data.startswith("send_all_"):
-        _, _, plat_acc = data.partition("send_all_")
-        platform, _, account = plat_acc.partition("_")
+        query = update.callback_query
+        await query.answer()
+
+        # --- robust parsing (supports underscores in account names)
+        parts = data.split("_")
+        if len(parts) < 4:
+            await query.answer("Invalid callback.", show_alert=True)
+            return
+        platform = parts[2]
+        account = "_".join(parts[3:])
 
         user_data_key = f"pending_posts_{platform}_{account}"
         pending = context.user_data.get(user_data_key)
@@ -880,71 +898,157 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("No pending posts.", show_alert=True)
             return
 
-        current_idx = pending.get("index", 0)
+        # If user already sent a single post, block bulk-send
+        if pending.get("has_sent_single"):
+            await query.answer("Bulk send disabled after single send.", show_alert=True)
+            await send_next_post_with_confirmation(update, context, platform, account)
+            return
+
+        # Flip the flag immediately and persist so future previews hide "Send all"
+        pending["has_sent_single"] = True
+        context.user_data[user_data_key] = pending
+        logging.info("send_all: has_sent_single set for %s/%s", platform, account)
+
+        # Defensive shape
+        posts = pending.get("posts", []) or []
+        current_idx = int(pending.get("index", 0))
+        total_posts = int(pending.get("total", len(posts)))
+
+        # Edit preview to "Sending all..." (use short timeout to avoid long blocking)
+        try:
+            preview_text = (query.message.caption or query.message.text or "") + "\n\n🚀 Sending all remaining..."
+            try:
+                await asyncio.wait_for(
+                    context.bot.edit_message_caption(
+                        chat_id=query.message.chat.id,
+                        message_id=query.message.message_id,
+                        caption=preview_text,
+                        reply_markup=None
+                    ),
+                    timeout=6.0
+                )
+            except (asyncio.TimeoutError, Exception):
+                # fallback to text edit
+                await asyncio.wait_for(
+                    context.bot.edit_message_text(
+                        chat_id=query.message.chat.id,
+                        message_id=query.message.message_id,
+                        text=preview_text,
+                        reply_markup=None
+                    ),
+                    timeout=6.0
+                )
+        except Exception as e:
+            logging.warning("send_all: could not mark preview as sending: %s", e)
+
         total_sent = 0
 
-        # Edit preview to "Sending all..."
-        try:
-            await context.bot.edit_message_caption(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                caption=(query.message.caption or "") + "\n\n🚀 Sending all remaining...",
-                reply_markup=None
-            )
-        except Exception:
-            await context.bot.edit_message_text(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                text=(query.message.text or "") + "\n\n🚀 Sending all remaining...",
-                reply_markup=None
-            )
+        # Loop and send remaining posts (persist index as we go)
+        for idx in range(current_idx, min(total_posts, len(posts))):
+            post = posts[idx]
+            try:
+                media_bytes = await download_media(post.get("media_url"))
+            except Exception as e:
+                logging.warning("send_all: download_media exception for idx %s: %s", idx, e)
+                media_bytes = None
 
-        # Send all remaining posts
-        for idx in range(current_idx, pending["total"]):
-            post = pending["posts"][idx]
-            media_bytes = await download_media(post.get("media_url"))
-            if media_bytes:
-                view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
-                link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
-                caption = (post.get("caption", "") or "")[:1024]
-                full_caption = f"{link_html}\n\n{caption}" if link_html else caption
+            if not media_bytes:
+                logging.info("send_all: skipping idx %s (media failed)", idx)
+                # advance index so we don't get stuck
+                pending["index"] = idx + 1
+                context.user_data[user_data_key] = pending
+                continue
 
-                bio = io.BytesIO(media_bytes)
+            view_text = {
+                "x": "View on X🐦",
+                "fb": "View on Facebook 🌐",
+                "ig": "View on Instagram 📸"
+            }.get(platform, "View Post 🔗")
+            link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
+            caption = (post.get("caption") or "")[:1024]
+            full_caption = f"{link_html}\n\n{caption}" if link_html else caption
+
+            bio = io.BytesIO(media_bytes)
+            try:
                 if post.get("is_video"):
                     bio.name = "video.mp4"
-                    sent = await query.message.reply_video(video=bio, caption=full_caption, parse_mode="HTML")
+                    sent = await context.bot.send_video(
+                        chat_id=query.message.chat.id,
+                        video=bio,
+                        caption=full_caption,
+                        parse_mode="HTML"
+                    )
                 else:
                     bio.name = "photo.jpg"
-                    sent = await query.message.reply_photo(photo=bio, caption=full_caption, parse_mode="HTML")
-                await schedule_delete(context, sent.chat.id, sent.message_id)
-                total_sent += 1
+                    sent = await context.bot.send_photo(
+                        chat_id=query.message.chat.id,
+                        photo=bio,
+                        caption=full_caption,
+                        parse_mode="HTML"
+                    )
 
-        # Update pending to end
-        pending["index"] = pending["total"]
+                # schedule delete for the sent post (try await then fallback)
+                try:
+                    await schedule_delete(context, sent.chat.id, sent.message_id)
+                except TypeError:
+                    # schedule_delete might be synchronous
+                    try:
+                        schedule_delete(context, sent.chat.id, sent.message_id)
+                    except Exception:
+                        logging.debug("schedule_delete failed for sent message.")
+                except Exception:
+                    logging.debug("schedule_delete failed for sent message.")
+
+                total_sent += 1
+                logging.info("send_all: sent idx %s for %s/%s", idx, platform, account)
+
+            except Exception as e:
+                logging.exception("send_all: failed to send idx %s: %s", idx, e)
+                # do not stop the loop; advance index and continue
+
+            # persist progress immediately so other handlers see updated state
+            pending["index"] = idx + 1
+            context.user_data[user_data_key] = pending
+
+            # small sleep to avoid hitting rate limits (optional but recommended)
+            await asyncio.sleep(5)
+
+        # Finished sending: mark pending complete
+        pending["index"] = pending.get("total", pending.get("index", 0))
         context.user_data[user_data_key] = pending
 
-        # Edit original preview to done
+        # Edit original preview to done (best-effort)
         try:
-            await context.bot.edit_message_caption(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                caption=(query.message.caption or "") + f"\n\n✅ Sent all remaining ({total_sent} posts)!",
-                reply_markup=None
-            )
-        except Exception:
-            await context.bot.edit_message_text(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                text=(query.message.text or "") + f"\n\n✅ Sent all remaining ({total_sent} posts)!",
-                reply_markup=None
-            )
+            done_text = (query.message.caption or query.message.text or "") + f"\n\n✅ Sent all remaining ({total_sent} posts)!"
+            try:
+                await asyncio.wait_for(
+                    context.bot.edit_message_caption(
+                        chat_id=query.message.chat.id,
+                        message_id=query.message.message_id,
+                        caption=done_text,
+                        reply_markup=None
+                    ),
+                    timeout=6.0
+                )
+            except (asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(
+                    context.bot.edit_message_text(
+                        chat_id=query.message.chat.id,
+                        message_id=query.message.message_id,
+                        text=done_text,
+                        reply_markup=None
+                    ),
+                    timeout=6.0
+                )
+        except Exception as e:
+            logging.warning("send_all: could not mark preview done: %s", e)
 
-        # Show AI button if sent any
+        # Show AI button if we sent anything
         if total_sent > 0:
             badge = get_user_badge(uid)
             await send_ai_button(query.message, total_sent, platform, account, badge)
 
-        # Clear pending
+        # Finally clear pending
         context.user_data.pop(user_data_key, None)
         return
 
