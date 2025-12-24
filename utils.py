@@ -476,11 +476,10 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
     logging.info("fetch_fb_urls -> returned %d unique posts for facebook.com/%s", len(posts), clean_account)
     return posts
 
-def fetch_yt_videos(channel_username: str = None, channel_id: str = None, search_query: str = None, max_results: int = 10) -> List[Dict[str, Any]]:
+def fetch_yt_videos(channel_handle: str, max_results: int = POST_LIMIT) -> List[Dict[str, Any]]:
     """
-    Fetch latest videos from YouTube channel or search.
-    Use either channel_username (@handle) or channel_id.
-    Or use search_query for keyword search.
+    Fetch LATEST videos from a YouTube channel using handle (e.g. @MrBeast)
+    Sorted by newest first.
     """
     if not YOUTUBE_API_KEY:
         logging.warning("YOUTUBE_API_KEY not set")
@@ -491,69 +490,66 @@ def fetch_yt_videos(channel_username: str = None, channel_id: str = None, search
     videos = []
 
     try:
-        if channel_username or channel_id:
-            # First get channel's uploads playlist ID
-            channel_response = youtube.channels().list(
-                part='contentDetails',
-                forUsername=channel_username if channel_username else None,
-                id=channel_id if channel_id else None
-            ).execute()
+        # Get channel ID from handle
+        channel_response = youtube.channels().list(
+            part='contentDetails',
+            forHandle=channel_handle.lstrip('@')
+        ).execute()
 
-            if not channel_response.get('items'):
-                return []
+        items = channel_response.get('items', [])
+        if not items:
+            logging.info(f"No channel found for @{channel_handle}")
+            return []
 
-            uploads_id = channel_response['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+        uploads_playlist_id = items[0]['contentDetails']['relatedPlaylists']['uploads']
 
-            # Fetch videos from uploads playlist
-            playlist_response = youtube.playlistItems().list(
+        # Fetch videos – newest first with pagination
+        next_page_token = None
+        fetched = 0
+
+        while fetched < max_results:
+            request = youtube.playlistItems().list(
                 part='snippet',
-                playlistId=uploads_id,
-                maxResults=min(max_results, 50)
-            ).execute()
+                playlistId=uploads_playlist_id,
+                maxResults=min(50, max_results - fetched),  # API max 50 per page
+                pageToken=next_page_token
+            )
+            playlist_response = request.execute()
 
             for item in playlist_response.get('items', []):
                 snippet = item['snippet']
+                if snippet.get('title') == 'Private video' or snippet.get('title') == 'Deleted video':
+                    continue  # skip private/deleted
+
                 video_id = snippet['resourceId']['videoId']
-                videos.append({
-                    "title": snippet['title'],
-                    "video_id": video_id,
-                    "video_url": f"https://www.youtube.com/watch?v={video_id}",
-                    "thumbnail": snippet['thumbnails']['high']['url'],
-                    "description": snippet.get('description', '')[:500],
-                    "published_at": snippet['publishedAt'],
-                    "channel_title": snippet['videoOwnerChannelTitle'] or snippet['channelTitle']
-                })
 
-        elif search_query:
-            # Search videos by keyword
-            search_response = youtube.search().list(
-                part='snippet',
-                q=search_query,
-                type='video',
-                order='date',  # latest first
-                maxResults=min(max_results, 50)
-            ).execute()
-
-            for item in search_response.get('items', []):
-                snippet = item['snippet']
-                video_id = item['id']['videoId']
                 videos.append({
+                    "post_id": video_id,
+                    "post_url": f"https://www.youtube.com/watch?v={video_id}",
+                    "caption": f"<b>{snippet['title']}</b>\n\n{snippet.get('description', '')[:800]}",
+                    "media_url": snippet['thumbnails']['maxres']['url'] if 'maxres' in snippet['thumbnails'] else snippet['thumbnails']['high']['url'],
+                    "is_video": False,
                     "title": snippet['title'],
-                    "video_id": video_id,
-                    "video_url": f"https://www.youtube.com/watch?v={video_id}",
-                    "thumbnail": snippet['thumbnails']['high']['url'],
-                    "description": snippet.get('description', '')[:500],
                     "published_at": snippet['publishedAt'],
                     "channel_title": snippet['channelTitle']
                 })
+                fetched += 1
+                if fetched >= max_results:
+                    break
+
+            next_page_token = playlist_response.get('nextPageToken')
+            if not next_page_token:
+                break  # no more pages
+
+        # Sort by publishedAt descending (newest first) – just in case
+        videos.sort(key=lambda x: x['published_at'], reverse=True)
+
+        logging.info(f"Fetched {len(videos)} latest YouTube videos from @{channel_handle}")
 
     except Exception as e:
         logging.error(f"YouTube fetch error: {e}")
-        return []
 
-    return videos[:max_results]
-
-
+    return videos
 
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
     account = account.lstrip('@').lower()
