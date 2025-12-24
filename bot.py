@@ -1179,8 +1179,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["platform"] = "fb"
         context.user_data["awaiting_username"] = True
         await query.edit_message_text(
-            "Send the Facebook page username or name (e.g. nike, BBCNews, coca-cola):\n\n"
-            "Note: Only public pages work!",
+            "Send the Facebook page username or name (e.g. nike, coca-cola):\n\n"
+            "Note: Only public pages and send direct page link for accuracy(recommended)! only the posted pictures is fetched",
             reply_markup=build_back_markup("menu_main")
         )
         return
@@ -1213,7 +1213,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         items = list_saved_accounts(uid)
         if not items:
-            await query.edit_message_text("You no get any saved account.", reply_markup=build_saved_menu())
+            await query.edit_message_text("You no get any saved account. Save page link when saving in fb", reply_markup=build_saved_menu())
             return
 
         per_page = 4
