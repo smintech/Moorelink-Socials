@@ -1207,9 +1207,9 @@ Post captions:
 
 Answer ONLY in short, sweet Pidgin-mixed English:
 
-1. Wetin be the content? (Main message or purpose(check the pic or video well)
+1. Wetin be the content of the pic or video(check deep)? (Main message or purpose(check the pic or video well)
 
-2. Tone & intent: Promotion, Drama, Political, Education, Awareness, Campaign, or na saga?
+2. Tone & intent: Promotion, Drama, Political, Education, Memes, Awareness, Campaign, or na saga?
 
 3. Trend signal: Going viral, Mid viral, People talking about it, or neutral?
 
