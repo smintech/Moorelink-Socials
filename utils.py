@@ -1200,18 +1200,18 @@ async def call_social_ai(platform: str, account: str, posts: List[Dict]) -> str:
     captions_text = "\n---\n".join([p.get("caption", "No caption") for p in posts if p.get("caption")])
 
     prompt = f"""
-You are a sharp Nigerian social media analyst wey sabi X and IG well-well. Analyze these {platform.upper()} post(s) from @{account}.
+You are a sharp Nigerian social media analyst wey sabi X , IG, FB, YT well-well. Analyze these {platform.upper()} post(s) from @{account}.
 
 Post captions:
 {captions_text}
 
 Answer ONLY in short, sweet Pidgin-mixed English:
 
-1. Wetin dey happen? (Main message or event)
+1. Wetin dey happen? (Main message or purpose)
 
-2. Tone & intent: Promotion, Drama, Education, Awareness, Campaign, or Joke?
+2. Tone & intent: Promotion, Drama, Political, Education, Awareness, Campaign, or na saga?
 
-3. Trend signal: One-off post, part of series, or shift in style?
+3. Trend signal: Going viral, Mid viral, People talking about it, or neutral?
 
 Keep am short – max 5 sentences. Use Naija vibe and slang where e fit!
 """
