@@ -538,7 +538,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
     context.user_data[f"pending_posts_{platform}_{account}"] = {
         "posts": new_posts,
         "index": 0,
-        "total": len(new_posts)
+        "total": len(new_posts),
         "has_sent_single": False 
     }
     context.user_data[f"last_ai_context_{platform}_{account}"] = new_posts
