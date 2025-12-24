@@ -527,7 +527,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
                 "is_video": p.get("is_video", False)
             })
     elif platform == "yt":
-        raw_yt = fetch_yt_videos(channel_username=account)  # or search_query if you want
+        raw_yt = fetch_yt_videos(channel_handle=account)  # or search_query if you want
         post_list = []
         for v in raw_yt:
             post_list.append({
