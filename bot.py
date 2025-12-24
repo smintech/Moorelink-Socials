@@ -70,6 +70,7 @@ from utils import (
     call_social_ai,
     fetch_fb_urls,
     POST_LIMIT,
+    fetch_yt_videos,
 )
 
 # ================ CONFIG ================
@@ -234,7 +235,7 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
     post = pending["posts"][current_idx]
 
     # Build caption & keyboard (with new buttons)
-    view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
+    view_text = {"x": "View on 𝕏", "fb": "View on Facebook ⓕ", "ig": "View on Instagram 🅾", "yt": "View on YouTube📺"}.get(platform, "View Post 🔗")
     link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
     caption = (post.get("caption") or "")[:1024]
     full_caption = f"{link_html}\n\n{caption}" if link_html else caption
@@ -373,9 +374,10 @@ async def download_media(url: str) -> bytes:
 # ================ UI BUILDERS ================
 def build_main_menu():
     keyboard = [
-        [InlineKeyboardButton("X (Twitter)", callback_data="menu_x")],
-        [InlineKeyboardButton("Instagram", callback_data="menu_ig")],
-        [InlineKeyboardButton("Facebook", callback_data="menu_fb")],
+        [InlineKeyboardButton("X (Twitter)𝕏", callback_data="menu_x")],
+        [InlineKeyboardButton("Instagram🅾", callback_data="menu_ig")],
+        [InlineKeyboardButton("Facebookⓕ", callback_data="menu_fb")],
+        [InlineKeyboardButton("YouTube📹", callback_data="menu_yt")],
         [InlineKeyboardButton("Saved usernames", callback_data="saved_menu")],
         [InlineKeyboardButton("👤 Dashboard", callback_data="dashboard")],
         [InlineKeyboardButton("Help / Guide", callback_data="help")],
@@ -523,6 +525,17 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
                 "caption": p.get("caption", ""),
                 "media_url": p.get("media_url"),
                 "is_video": p.get("is_video", False)
+            })
+    elif platform == "yt":
+        raw_yt = fetch_yt_videos(channel_username=account)  # or search_query if you want
+        post_list = []
+        for v in raw_yt:
+            post_list.append({
+                "post_id": v["video_id"],
+                "post_url": v["video_url"],
+                "caption": f"{v['title']}\n\n{v['description']}",
+                "media_url": v["thumbnail"],
+                "is_video": False  # thumbnail is image
             })
     else:
         await message.reply_text("Unsupported platform.")
@@ -1180,7 +1193,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data =="help":
         await help_command(update, context)
         return
-
+        
+    if data == "menu_yt":
+        context.user_data["platform"] = "yt"
+        context.user_data["awaiting_username"] = True
+        await query.edit_message_text("Send YouTube channel username (e.g. Seyivibe) or search query:", reply_markup=build_back_markup("menu_main"))
+        return
+        
     if data == "saved_menu":
         await query.edit_message_text("Saved usernames:", reply_markup=build_saved_menu())
         return
