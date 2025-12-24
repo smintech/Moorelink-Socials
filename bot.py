@@ -531,7 +531,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
         post_list = []
         for v in raw_yt:
             post_list.append({
-                "post_id": v["video_id"],
+                "post_id": v["post_id"],
                 "post_url": v["video_url"],
                 "caption": f"{v['title']}\n\n{v['description']}",
                 "media_url": v["thumbnail"],
