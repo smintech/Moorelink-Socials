@@ -5,3 +5,4 @@ beautifulsoup4
 instaloader
 openai
 httpx
+google-api-python-client
