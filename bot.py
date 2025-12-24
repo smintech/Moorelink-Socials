@@ -109,7 +109,7 @@ def admin_only(handler_func):
 def get_invite_link(bot_username: str, user_id: int) -> str:
     return f"https://t.me/{bot_username}?start={user_id}"
 
-@admin_only
+
 async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin-only toggle for test mode.
@@ -128,7 +128,7 @@ async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cmd in ("on", "enable", "1"):
         TEST_MODE["enabled"] = True
         # save_testmode()  # uncomment if using persistence
-        await update.effective_message.reply_text("✅ Test mode ENABLED — bot will force-send posts and skip rate limits.")
+        await update.effective_message.reply_text("✅ Test mode ENABLED — bot will force-send posts seen before.")
         return
     if cmd in ("off", "disable", "0"):
         TEST_MODE["enabled"] = False
@@ -488,12 +488,11 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
     if TEST_MODE.get("enabled"):
         force = True
         
-    if not force:
-        cooldown_msg = check_and_increment_cooldown(uid)
-        if cooldown_msg:
-            await message.reply_text(cooldown_msg)
-            return
-
+    cooldown_msg = check_and_increment_cooldown(uid)
+    if cooldown_msg:
+        await message.reply_text(cooldown_msg)
+        return
+    force_send = TEST_MODE.get("enabled", False)
     await message.chat.send_action(ChatAction.TYPING)
 
     # Fetch raw posts
@@ -547,17 +546,16 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
     new_posts = [p for p in post_list if is_post_new(uid, platform, account, p['post_id'])]
 
     # TEST MODE: If enabled, ignore "seen" status and force send latest fetched posts
-    if TEST_MODE.get("enabled"):
-        logging.info("🧪 Test mode ACTIVE — forcing send of latest posts (ignoring seen status)")
-        new_posts = post_list[:POST_LIMIT]  # Send all fetched, even if previously seen
-        # Still mark as seen so next normal run no repeat
+    if force_send:
+        logging.info("🧪 Force mode ACTIVE for user %s — sending latest posts (ignoring seen status)", uid)
+        new_posts = post_list[:POST_LIMIT]
+        # Still mark as seen so next normal fetch no repeat unnecessarily
         mark_posts_seen(uid, platform, account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
     elif not new_posts:
         await message.reply_text(f"No new posts from @{account} since your last check.")
         return
     else:
         mark_posts_seen(uid, platform, account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
-
     # Store posts for sequential sending and AI context
     context.user_data[f"pending_posts_{platform}_{account}"] = {
         "posts": new_posts,
@@ -1768,7 +1766,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     "• /dashboard → See your badge 🏅, invites 📨, save slots 📦, and speed limits ⚡\n"
     "• /benefits → Full breakdown of what each badge unlocks\n"
     "• /leaderboard → Check the top inviters – will YOU claim the throne? 👑\n\n"
-    
+    "• /forcemode on|off → Force show latest posts (even previously seen).!"
     "<b>💥 Pro Tip: Invite Friends = Power Up!</b>\n"
     "Every person who joins using <b>your personal invite link</b> boosts your invite count.\n"
     "Higher invites = higher badge = MORE saved slots + FASTER fetching (no waiting!)\n"
@@ -1860,10 +1858,10 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"\nYour invite link: {get_invite_link(bot_username, tid)}")
     
     if TEST_MODE.get("enabled"):
-        lines.append("🧪 Test Mode: ON (force fetch, no cooldown)")
+        lines.append("🧪 Force Mode: ON (show latest posts even if seen before)")
     else:
-        lines.append("🧪 Test Mode: OFF (normal behavior)")
-    
+        lines.append("🧪 Force Mode: OFF")
+        
     await update.effective_message.reply_text("\n".join(lines))
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2040,7 +2038,7 @@ if __name__ == "__main__":
 
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    app.add_handler(CommandHandler("testmode", testmode_command))
+    app.add_handler(CommandHandler("forcemode", testmode_command))
 
     async def set_command_visibility(application):
         public_cmds = [
