@@ -527,15 +527,16 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
                 "is_video": p.get("is_video", False)
             })
     elif platform == "yt":
-        raw_yt = fetch_yt_videos(channel_handle=account)  # or search_query if you want
+        raw_yt = fetch_yt_videos(channel_handle=account)
         post_list = []
+        
         for v in raw_yt:
             post_list.append({
-                "post_id": v["post_id"],
-                "post_url": v["video_url"],
-                "caption": f"{v['title']}\n\n{v['description']}",
-                "media_url": v["thumbnail"],
-                "is_video": False  # thumbnail is image
+                 "post_id": v["post_id"],
+                "post_url": v["post_url"],
+                "caption": v["caption"],      # already formatted
+                "media_url": v["media_url"],
+                "is_video": True              # YouTube posts are videos
             })
     else:
         await message.reply_text("Unsupported platform.")
@@ -568,7 +569,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
 
     if not new_posts:
         # existing no new posts handling remains
-        return "I'm done 😁"
+        return
 
     # Start sending the first post with confirmation
     await send_next_post_with_confirmation(update, context, platform, account)
@@ -1498,7 +1499,7 @@ Answer in max 6 sentences. Keep it engaging.
 
         await update.effective_message.reply_text(
             "🚀 AI dey think on top your text...\n"
-            "(You fit send another one while this one dey run)"
+            "Hold...."
         )
         return
         
