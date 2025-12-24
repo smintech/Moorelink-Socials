@@ -1207,7 +1207,7 @@ Post captions:
 
 Answer ONLY in short, sweet Pidgin-mixed English:
 
-1. Wetin dey happen? (Main message or purpose)
+1. Wetin be the content? (Main message or purpose)
 
 2. Tone & intent: Promotion, Drama, Political, Education, Awareness, Campaign, or na saga?
 
