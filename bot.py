@@ -110,6 +110,29 @@ def admin_only(handler_func):
 def get_invite_link(bot_username: str, user_id: int) -> str:
     return f"https://t.me/{bot_username}?start={user_id}"
 
+def normalize_account(account: str, platform: str) -> str:
+    acct = (account or "").strip()
+    acct = acct.split('?')[0].rstrip('/')      # remove query + trailing slash
+    if acct.startswith('@'):
+        acct = acct[1:]
+    # If it's a URL, extract the most-likely username segment
+    if acct.startswith('http'):
+        parsed = urlparse(acct)
+        path = parsed.path.strip('/')
+        parts = [p for p in path.split('/') if p]
+        if parts:
+            # For ig/x/fb profile URLs username is typically the first segment
+            if platform in ('ig', 'x', 'fb'):
+                acct = parts[0]
+            # For YouTube, if they passed a handle or channel url, take the last segment
+            elif platform == 'yt':
+                acct = parts[-1]
+            else:
+                acct = parts[0]
+        else:
+            acct = parsed.netloc
+    return acct.lower()
+
 async def safe_edit(callback_query, text: str, parse_mode=None, reply_markup=None):
     """
     Safely edit text or caption. Falls back to new message if impossible.
@@ -692,54 +715,27 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
         return
 
     # Only new posts
-    # Only new posts (normal mode)
-    new_posts = [p for p in post_list if is_post_new(uid, platform, account, p['post_id'])]
-
-    # TEST MODE: If enabled, ignore "seen" status and force send latest fetched posts
+    clean_account = normalize_account(account, platform)
+    
+    new_posts = [p for p in post_list if is_post_new(uid, platform, clean_account, p['post_id'])]
+    
     if force_send:
         logging.info("🧪 Force mode ACTIVE for user %s — sending latest posts (ignoring seen status)", uid)
         new_posts = post_list[:POST_LIMIT]
-        # Still mark as seen so next normal fetch no repeat unnecessarily
-        mark_posts_seen(uid, platform, account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
+        
+        mark_posts_seen(uid, platform, clean_account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
     elif not new_posts:
-        await message.reply_text(f"No new posts from @{account} since your last check.")
+        await message.reply_text(f"No new posts from @{clean_account} since your last check.")
         return
     else:
-        # ALWAYS normalize account_name to clean username (no @, no http, lowercase)
-        clean_account = account.lstrip('@').lower()
-        if clean_account.startswith("http"):
-            # Extract username from URL
-            if platform == "fb":
-                clean_account = clean_account.split('/')[-1].split('?')[0]
-            elif platform == "yt":
-                clean_account = clean_account.split('@')[-1] if '@' in clean_account else clean_account.split('/')[-1].split('?')[0]
-            elif platform in ("ig", "x"):
-                clean_account = clean_account.split('/')[-2] if '/' in clean_account else clean_account  # e.g. instagram.com/p/shortcode → shortcode no, wait – for profile it's /username/
-
-        # For IG/X profiles, the URL is https://www.instagram.com/username/ or https://x.com/username
-        # So extract the username part
-        if platform == "ig":
-            if '/' in clean_account:
-                parts = clean_account.split('/')
-                clean_account = parts[-2] if len(parts) >= 2 else parts[-1]
-        elif platform == "x":
-            if '/' in clean_account:
-                parts = clean_account.split('/')
-                clean_account = parts[-1].split('?')[0] if parts else clean_account
-
-        # Final clean
-        clean_account = clean_account.lstrip('@').lower()
-
         mark_posts_seen(uid, platform, clean_account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
-    # Store posts for sequential sending and AI context
-    context.user_data[f"pending_posts_{platform}_{account}"] = {
+    context.user_data[f"pending_posts_{platform}_{clean_account}"] = {
         "posts": new_posts,
         "index": 0,
         "total": len(new_posts),
         "has_sent_single": False 
     }
-    context.user_data[f"last_ai_context_{platform}_{account}"] = new_posts
-
+    context.user_data[f"last_ai_context_{platform}_{clean_account}"] = new_posts
     if not new_posts:
         # existing no new posts handling remains
         return
