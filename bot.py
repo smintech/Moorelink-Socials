@@ -1622,8 +1622,10 @@ Answer in max 6 sentences. Keep it engaging.
             platform = "ig"
         if platform in ("facebook",):
             platform = "fb"
-        if platform not in ("x", "ig", "fb"):
-            await update.effective_message.reply_text("Platform must be x, fb, or ig.")
+        if platform in ("YouTube",):
+            platform = "yt"
+        if platform not in ("x", "ig", "fb", "yt"):
+            await update.effective_message.reply_text("Platform must be x, fb, YouTube, or ig.")
             return
         account = parts[1].lstrip('@').lower()
         label = parts[2] if len(parts) == 3 else None
@@ -1705,29 +1707,93 @@ Answer in max 6 sentences. Keep it engaging.
     if text.startswith("/save"):
         parts = text.split(maxsplit=3)
         if len(parts) < 3:
-            await update.effective_message.reply_text("Usage: /save <platform> <username> [label]")
+            await update.effective_message.reply_text(
+                "Usage: /save <platform> <username_or_url> [label]\n\n"
+                "Examples:\n"
+                "/save x elonmusk My GOAT\n"
+                "/save ig chioma_goodness\n"
+                "/save fb https://www.facebook.com/BBCNews BBC\n"
+                "/save yt https://www.youtube.com/@MrBeast MrBeast"
+            )
             return
-        platform = parts[1].lower()
-        if platform in ("twitter",):
-            platform = "x"
-        if platform in ("facebook",):
-            platform = "fb"
-        if platform in ("instagram",):
-            platform = "ig"
-        if platform not in ("x", "ig", "fb"):
-            await update.effective_message.reply_text("Platform must be x or ig.")
-            return
-        account = parts[2].lstrip('@').lower()
+
+        platform_input = parts[1].lower()
+        raw_input = parts[2].strip()
         label = parts[3] if len(parts) == 4 else None
-        current_count = count_saved_accounts(uid)
-        if isinstance(badge['save_slots'], (int, float)) and current_count >= badge['save_slots']:
-            await update.effective_message.reply_text(f"You reached saved limit ({badge['save_slots']}).")
+
+        # Map platform names
+        if platform_input in ("twitter", "x"):
+            platform = "x"
+        elif platform_input in ("instagram", "ig"):
+            platform = "ig"
+        elif platform_input in ("facebook", "fb"):
+            platform = "fb"
+        elif platform_input in ("youtube", "yt"):
+            platform = "yt"
+        else:
+            await update.effective_message.reply_text("Platform must be: x, ig, fb, or yt (YouTube)")
             return
+
+        # Special handling: detect and clean full URLs
+        account = raw_input.lower()
+
+        if raw_input.startswith("http"):
+            if platform == "fb":
+                if "facebook.com" in raw_input or "fb.com" in raw_input:
+                    # Extract clean profile URL
+                    clean_url = raw_input.split('?')[0].rstrip('/').split('/')[-1]
+                    if clean_url.startswith("profile.php"):
+                        # Handle profile.php?id=123 cases if needed later
+                        account = raw_input.split('?')[0].rstrip('/')
+                    else:
+                        account = raw_input.split('?')[0].rstrip('/')
+                    logging.info("Saved Facebook full URL: %s", account)
+                else:
+                    await update.effective_message.reply_text("Invalid Facebook URL. Please send a valid profile/page link.")
+                    return
+
+            elif platform == "yt":
+                if "youtube.com" in raw_input or "youtu.be" in raw_input:
+                    # Accept channel URL, @handle, or video link — we'll handle in fetch_yt_videos
+                    account = raw_input
+                    logging.info("Saved YouTube full URL/handle: %s", account)
+                else:
+                    await update.effective_message.reply_text("Invalid YouTube link. Please send a channel link or @handle.")
+                    return
+            else:
+                await update.effective_message.reply_text("Full URLs only supported for fb and yt platforms.")
+                return
+        else:
+            # Normal username — just strip @
+            account = raw_input.lstrip('@')
+
+        # Check save limit
+        current_count = count_saved_accounts(uid)
+        save_slots = badge.get('save_slots')
+        if isinstance(save_slots, (int, float)) and current_count >= save_slots:
+            await update.effective_message.reply_text(f"You've reached your save limit ({int(save_slots)}). Invite friends to upgrade!")
+            return
+
         try:
             saved = save_user_account(uid, platform, account, label)
-            await update.effective_message.reply_text(f"Saved {platform} @{account} (id: {saved.get('id')})")
+            # Show friendly name in confirmation
+            display_name = account
+            if account.startswith("http"):
+                if platform == "fb":
+                    display_name = account.split('/')[-1] or "Facebook Page"
+                elif platform == "yt":
+                    display_name = account.split('@')[-1] if '@' in account else account.split('/')[-1]
+
+            await update.effective_message.reply_text(
+                f"✅ Saved {platform.upper()} account:\n"
+                f"• Name: {display_name}\n"
+                f"• Label: {label or 'None'}\n"
+                f"• ID: {saved.get('id')}\n\n"
+                f"Use /saved_list to view all"
+            )
         except Exception as e:
-            await update.effective_message.reply_text(f"Error saving: {e}")
+            logging.error(f"Error saving account for user {uid}: {e}")
+            await update.effective_message.reply_text(f"❌ Error saving account: {str(e)}")
         return
 
     if text.startswith("/saved_list"):
