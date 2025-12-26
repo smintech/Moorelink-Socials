@@ -519,17 +519,17 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
     if TEST_MODE.get("enabled"):
         force = True
         
-    cooldown_msg = check_and_increment_cooldown(uid)
-    if cooldown_msg and badge['name'] not in ('Diamond', 'Admin'):
-        # For non-unlimited users: show cooldown but still allow preview (just slower)
-        await message.reply_text(cooldown_msg + "\n\nFetching latest posts anyway (may be limited)...")
-        # Continue — don't return!
-    elif cooldown_msg:
-        # For Diamond/Admin: ignore cooldown
-        pass
-    else:
-        await message.chat.send_action(ChatAction.TYPING)
     force_send = TEST_MODE.get("enabled", False)
+    
+    if is_admin(uid):
+        pass  # no cooldown
+    else:
+        # Normal users: cooldown applies even in force mode
+        cooldown_msg = check_and_increment_cooldown(uid)
+        if cooldown_msg:
+            await message.reply_text(cooldown_msg)
+            return
+    
     await message.chat.send_action(ChatAction.TYPING)
 
     # Fetch raw posts
