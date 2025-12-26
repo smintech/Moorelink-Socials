@@ -659,17 +659,32 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
         await message.reply_text(f"No new posts from @{account} since your last check.")
         return
     else:
-        db_account = account
-        if account.startswith("http"):
+        # ALWAYS normalize account_name to clean username (no @, no http, lowercase)
+        clean_account = account.lstrip('@').lower()
+        if clean_account.startswith("http"):
+            # Extract username from URL
             if platform == "fb":
-                db_account = account.split('/')[-1] or account  # e.g. "BBCNews"
+                clean_account = clean_account.split('/')[-1].split('?')[0]
             elif platform == "yt":
-                db_account = account.split('@')[-1] if '@' in account else account.split('/')[-1]
-            elif platform == "ig" or platform == "x":
-                db_account = account.split('/')[-1]
+                clean_account = clean_account.split('@')[-1] if '@' in clean_account else clean_account.split('/')[-1].split('?')[0]
+            elif platform in ("ig", "x"):
+                clean_account = clean_account.split('/')[-2] if '/' in clean_account else clean_account  # e.g. instagram.com/p/shortcode → shortcode no, wait – for profile it's /username/
 
-        # Use clean db_account for seen tracking
-        mark_posts_seen(uid, platform, db_account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
+        # For IG/X profiles, the URL is https://www.instagram.com/username/ or https://x.com/username
+        # So extract the username part
+        if platform == "ig":
+            if '/' in clean_account:
+                parts = clean_account.split('/')
+                clean_account = parts[-2] if len(parts) >= 2 else parts[-1]
+        elif platform == "x":
+            if '/' in clean_account:
+                parts = clean_account.split('/')
+                clean_account = parts[-1].split('?')[0] if parts else clean_account
+
+        # Final clean
+        clean_account = clean_account.lstrip('@').lower()
+
+        mark_posts_seen(uid, platform, clean_account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
     # Store posts for sequential sending and AI context
     context.user_data[f"pending_posts_{platform}_{account}"] = {
         "posts": new_posts,
