@@ -140,51 +140,97 @@ async def safe_edit(callback_query, text: str, parse_mode=None, reply_markup=Non
         except Exception:
             await callback_query.answer("Action completed.", show_alert=True)
 
-async def safe_send_media_or_link(chat, media_url: str, is_video: bool = False, caption: str = "", parse_mode=None):
+async def safe_send_media_or_link(chat: Any,
+                                  media_url: str,
+                                  is_video: bool = False,
+                                  caption: str = "",
+                                  parse_mode: Optional[str] = None,
+                                  reply_markup: Optional[InlineKeyboardMarkup] = None):
     """
-    Send media robustly with guaranteed non-empty caption/text.
+    Robust send helper that accepts reply_markup.
+    `chat` may be a Message OR a Chat-like object. When `chat` is a Message we use reply_* to preserve thread.
+    Returns the sent Message or None on failure.
     """
-    # Ensure caption always has something
+    # Normalize
+    prefer_reply = chat if isinstance(chat, Message) else None
+    target_chat = chat.chat if isinstance(chat, Message) else chat
+
+    # Ensure non-empty caption
     if not caption:
         caption = "🔗 View post"
 
-    # Try direct send
+    # Attempt direct send by URL (prefer message.reply_* to keep thread)
     try:
-        if is_video:
-            return await chat.send_video(video=media_url, caption=caption, parse_mode=parse_mode)
+        if prefer_reply:
+            if is_video:
+                return await prefer_reply.reply_video(video=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+            else:
+                return await prefer_reply.reply_photo(photo=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
         else:
-            return await chat.send_photo(photo=media_url, caption=caption, parse_mode=parse_mode)
-    except TelegramError:
-        pass
+            if is_video:
+                return await target_chat.send_video(video=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+            else:
+                return await target_chat.send_photo(photo=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception as e:
+        logger.debug("Direct send by URL failed for %s: %s", media_url, e)
 
-    # Download & upload
+    # Inspect content-type to decide if download+upload is worth it
+    content_type = ""
     try:
-        r = requests.get(media_url, stream=True, timeout=15)
-        r.raise_for_status()
-        content_type = r.headers.get("content-type", "")
-        if "image" in content_type or "video" in content_type:
-            ext = ".mp4" if is_video or "video" in content_type else ".jpg"
+        head = requests.head(media_url, allow_redirects=True, timeout=8)
+        content_type = head.headers.get("content-type", "") or ""
+    except Exception:
+        try:
+            r = requests.get(media_url, stream=True, timeout=8)
+            content_type = r.headers.get("content-type", "") or ""
+        except Exception:
+            content_type = ""
+
+    logger.debug("safe_send_media_or_link: content-type=%s for url=%s", content_type, media_url)
+
+    # Download & upload if it looks like media
+    if any(k in content_type for k in ("image/", "video/", "mp4", "mpeg")):
+        tmp_path = None
+        try:
+            r = requests.get(media_url, stream=True, timeout=20)
+            r.raise_for_status()
+            ext = ".mp4" if (is_video or "video" in content_type or "mp4" in content_type) else ".jpg"
             with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                for chunk in r.iter_content(1024*64):
+                for chunk in r.iter_content(1024 * 32):
+                    if not chunk:
+                        break
                     tmp.write(chunk)
                 tmp_path = tmp.name
 
-            try:
-                if is_video:
-                    sent = await chat.send_video(video=InputFile(tmp_path), caption=caption, parse_mode=parse_mode)
+            # Upload file
+            if prefer_reply:
+                if ext == ".mp4":
+                    return await prefer_reply.reply_video(video=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
                 else:
-                    sent = await chat.send_photo(photo=InputFile(tmp_path), caption=caption, parse_mode=parse_mode)
-                return sent
-            finally:
-                os.unlink(tmp_path)
-    except Exception as e:
-        logger.warning("Download failed: %s", e)
+                    return await prefer_reply.reply_photo(photo=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+            else:
+                if ext == ".mp4":
+                    return await target_chat.send_video(video=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+                else:
+                    return await target_chat.send_photo(photo=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+        except Exception as e:
+            logger.warning("Download+upload failed for %s: %s", media_url, e)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
-    # Final fallback: always send text with link
-    fallback_text = caption + "\n\n🔗 " + media_url
+    # Final fallback: always send a text message with link and the reply_markup
     try:
-        return await chat.send_message(text=fallback_text, parse_mode=parse_mode, disable_web_page_preview=False)
-    except Exception:
+        fallback_text = f"{caption}\n\n🔗 {media_url}"
+        if prefer_reply:
+            return await prefer_reply.reply_text(fallback_text, parse_mode=parse_mode, disable_web_page_preview=False, reply_markup=reply_markup)
+        else:
+            return await target_chat.send_message(text=fallback_text, parse_mode=parse_mode, disable_web_page_preview=False, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error("Final fallback text send failed for %s: %s", media_url, e)
         return None
 
 async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
