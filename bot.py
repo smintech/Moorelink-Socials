@@ -13,7 +13,7 @@ import logging
 from typing import Optional, List, Dict, Any
 from functools import wraps
 from datetime import datetime
-
+import tempfile
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -24,6 +24,7 @@ from telegram import (
     BotCommandScopeChat,
     InputMediaPhoto,
     InputMediaVideo,
+    Message,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -37,7 +38,7 @@ from telegram.constants import ChatAction
 import logging
 # If you use Groq's OpenAI-compatible client via the openai package:
 from openai import AsyncOpenAI
-
+from telegram.error import TelegramError
 # utils - import everything we rely on
 from utils import (
     fetch_latest_urls,
@@ -109,6 +110,98 @@ def admin_only(handler_func):
 def get_invite_link(bot_username: str, user_id: int) -> str:
     return f"https://t.me/{bot_username}?start={user_id}"
 
+async def safe_edit(callback_query, text, parse_mode=None):
+    """
+    Try to edit the message text if it exists; otherwise edit caption if media; otherwise send a new message.
+    callback_query: update.callback_query
+    """
+    try:
+        msg: Message = callback_query.message
+        # If original message has text -> edit text
+        if getattr(msg, "text", None):
+            await callback_query.edit_message_text(text, parse_mode=parse_mode)
+            return
+
+        # If original message is media and has caption -> edit caption
+        if getattr(msg, "caption", None) is not None:
+            await callback_query.edit_message_caption(caption=text, parse_mode=parse_mode)
+            return
+
+        # Otherwise we can't edit: send a new message
+        await callback_query.message.reply_text(text, parse_mode=parse_mode)
+
+    except TelegramError as e:
+        # Fallback: send a new message
+        try:
+            await callback_query.message.reply_text(text, parse_mode=parse_mode)
+        except Exception:
+            # last resort: answer callback to avoid spinner
+            await callback_query.answer()
+
+async def safe_send_media_or_link(chat, media_url, is_video=False, caption=None, parse_mode=None):
+    """
+    Robustly send a photo/video or fallback to sending the URL as text.
+    chat: update.message.chat or update.effective_chat
+    media_url: URL string
+    is_video: bool
+    Returns the sent message (or None on failure)
+    """
+    # Quick attempt: try to send by URL first (works if it's a direct file URL)
+    try:
+        if is_video:
+            sent = await chat.send_video(video=media_url, caption=caption, parse_mode=parse_mode)
+        else:
+            sent = await chat.send_photo(photo=media_url, caption=caption, parse_mode=parse_mode)
+        return sent
+    except TelegramError as e:
+        # Telegram couldn't fetch the URL (common). Try to HEAD the URL to inspect content-type.
+        pass
+    except Exception:
+        pass
+
+    # Inspect content-type via HEAD (some servers block HEAD; try GET if HEAD fails)
+    try:
+        head = requests.head(media_url, allow_redirects=True, timeout=8)
+        content_type = head.headers.get("content-type", "")
+        if not content_type:
+            # Try GET for content-type
+            r = requests.get(media_url, stream=True, timeout=8)
+            content_type = r.headers.get("content-type", "")
+        # If content-type looks like media -> try download & upload
+        if content_type.startswith("image/") or content_type.startswith("video/") or "mpeg" in content_type:
+            # Download to temp file then upload
+            r = requests.get(media_url, stream=True, timeout=20)
+            r.raise_for_status()
+            ext = ".jpg" if content_type.startswith("image/") else ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
+                for chunk in r.iter_content(1024 * 8):
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                tmp_path = f.name
+
+            try:
+                if content_type.startswith("image/"):
+                    sent = await chat.send_photo(photo=InputFile(tmp_path), caption=caption, parse_mode=parse_mode)
+                else:
+                    sent = await chat.send_video(video=InputFile(tmp_path), caption=caption, parse_mode=parse_mode)
+                return sent
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+    except requests.RequestException:
+        pass
+    except Exception:
+        pass
+
+    # Last resort: send fallback text with link (so user can open manually)
+    try:
+        fallback = caption + "\n\n" + media_url if caption else media_url
+        return await chat.send_message(fallback, parse_mode=parse_mode, disable_web_page_preview=False)
+    except Exception:
+        return None
 
 async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -234,7 +327,7 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
     current_idx = pending["index"]
     post = pending["posts"][current_idx]
 
-    # Build caption & keyboard (with new buttons)
+    # Build caption & keyboard
     view_text = {"x": "View on 𝕏", "fb": "View on Facebook ⓕ", "ig": "View on Instagram 🅾", "yt": "View on YouTube📺"}.get(platform, "View Post 🔗")
     link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
     caption = (post.get("caption") or "")[:1024]
@@ -262,6 +355,8 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
 
     sent_preview = False
     edited = False
+    preview_msg = None  # Will hold the final sent message (edited or new)
+
     if message:
         try:
             # Try media edit with short timeout
@@ -277,10 +372,11 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
                     media=media,
                     reply_markup=keyboard
                 ),
-                timeout=8.0  # Telegram sometimes slow
+                timeout=8.0
             )
             sent_preview = True
             edited = True
+            preview_msg = message  # We edited the existing message
             logging.info("Edited preview msg %s to idx %s", message.message_id, current_idx)
         except asyncio.TimeoutError:
             logging.warning("Media edit timed out on msg %s", message.message_id)
@@ -302,49 +398,41 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
                 )
                 sent_preview = True
                 edited = True
+                preview_msg = message
                 logging.info("Fallback text edit success on %s", message.message_id)
             except asyncio.TimeoutError:
                 logging.warning("Text edit also timed out on msg %s", message.message_id)
             except Exception as e2:
                 logging.warning("Text edit failed: %s", e2)
 
+    # If still not sent (both edits failed), use safe_send_media_or_link as final fallback
     if not sent_preview:
-        # No message or edit failed → send new reply (fallback)
-        try:
-            preview_msg = None
-            if post.get("is_video"):
-                preview_msg = await message.reply_video(
-                    video=post.get("media_url"),
-                    caption=preview_text,
-                    parse_mode="HTML",
-                    reply_markup=keyboard
-                )
-            else:
-                try:
-                    preview_msg = await message.reply_photo(
-                        photo=post.get("media_url"),
-                        caption=preview_text,
-                        parse_mode="HTML",
-                        reply_markup=keyboard
-                    )
-                except Exception:
-                    # Last fallback: text
-                    preview_msg = await message.reply_text(
-                        preview_text,
-                        parse_mode="HTML",
-                        reply_markup=keyboard
-                    )
+        preview_msg = await safe_send_media_or_link(
+            chat=message.chat,
+            media_url=post.get("media_url"),
+            is_video=post.get("is_video", False),
+            caption=preview_text,
+            parse_mode="HTML"
+        )
+        if preview_msg:
             sent_preview = True
-            await schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
-            logging.info("Sent NEW preview msg %s (fallback)", preview_msg.message_id)
-        except Exception as send_exc:
-            logging.error("Fallback send also failed: %s", send_exc)
-            return
+            logging.info("Sent fallback preview using safe_send_media_or_link (msg %s)", preview_msg.message_id)
+        else:
+            logging.error("All media send attempts failed for post idx %s", current_idx)
 
-    if sent_preview:
-        # Schedule delete if we showed something
-        if edited and message:
+    # Schedule auto-delete for the final preview message
+    if sent_preview and preview_msg:
+        try:
+            await schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
+        except Exception as e:
+            logging.debug("Failed to schedule delete for preview: %s", e)
+
+    # If we successfully edited the original message, also schedule its delete (in case of media → text switch)
+    if edited and message:
+        try:
             await schedule_delete(context, message.chat.id, message.message_id)
+        except Exception:
+            pass
 
 async def download_media(url: str) -> bytes:
     """Download media using urllib (no external deps) – async compatible"""
@@ -735,11 +823,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         # Inform user we are analyzing
-        await context.bot.edit_message_text(
-            chat_id=query.message.chat.id,
-            message_id=query.message.message_id,
-            text="🤖 Analyzing with Nigerian fire..."
-        )
+        await safe_edit(query, text="🤖 Analyzing with Nigerian fire...")
 
         # Collect posts context and call AI
         posts = context.user_data.get(f"last_ai_context_{platform}_{account}", [])
@@ -756,12 +840,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
 
         # Replace the analyzing message with final analysis
-        await context.bot.edit_message_text(
-            chat_id=query.message.chat.id,
-            message_id=query.message.message_id,
-            text=final_text,
-            parse_mode="HTML"
-        )
+        await safe_edit(query, text=final_text, parse_mode="HTML")
         return
 
     # Saved quick send
@@ -861,27 +940,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_delete(context, sent.chat.id, sent.message_id)
 
         # Edit old preview to "Sent!" and REMOVE buttons using explicit edit
-        try:
-            old_caption = query.message.caption or query.message.text or ""
-            new_caption = old_caption.rstrip()
-            await context.bot.edit_message_caption(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                caption=new_caption + "\n\n✅ <b>Sent!</b>",
-                parse_mode="HTML",
-                reply_markup=None
-            )
-        except Exception:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=query.message.chat.id,
-                    message_id=query.message.message_id,
-                    text=new_caption + "\n\n✅ <b>Sent!</b>",
-                    parse_mode="HTML",
-                    reply_markup=None
-                )
-            except Exception as e:
-                logging.warning(f"Could not edit confirmation: {e}")
+        await safe_edit(query, text=new_caption + "\n\n✅ <b>Sent!</b>", parse_mode="HTML", reply_markup=None)
 
         # Advance and persist before showing next preview
         pending["index"] += 1
@@ -1118,15 +1177,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_count = pending["index"] if pending else 0
         total = pending["total"] if pending else 0
 
-        try:
-            await context.bot.edit_message_caption(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                caption=(query.message.caption or "") + f"\n\n❌ Cancelled. Sent {sent_count}/{total} posts.",
-                reply_markup=None
-            )
-        except Exception:
-            await query.message.reply_text(f"❌ Sending cancelled. Sent {sent_count}/{total} posts.")
+        await safe_edit(query, text=(query.message.caption or "") + f"\n\n❌ Cancelled. Sent {sent_count}/{total} posts.", parse_mode="HTML", reply_markup=None)
+        await query.message.reply_text(f"❌ Sending cancelled. Sent {sent_count}/{total} posts.")
 
         # Show AI button if at least one sent
         if pending and pending["index"] > 0:
