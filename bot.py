@@ -1613,45 +1613,108 @@ Answer in max 6 sentences. Keep it engaging.
         text = update.message.text.strip()
         parts = text.split(maxsplit=2)
         if len(parts) < 2:
-            await update.effective_message.reply_text("Send: <platform> <username> [label]")
+            await update.effective_message.reply_text("Send: <platform> <username_or_url> [label]")
             return
-        platform = parts[0].lower()
-        if platform in ("twitter",):
-            platform = "x"
-        if platform in ("instagram",):
-            platform = "ig"
-        if platform in ("facebook",):
-            platform = "fb"
-        if platform in ("YouTube",):
-            platform = "yt"
-        if platform not in ("x", "ig", "fb", "yt"):
-            await update.effective_message.reply_text("Platform must be x, fb, YouTube, or ig.")
-            return
-        account = parts[1].lstrip('@').lower()
+
+        platform_input = parts[0].lower()
+        raw_input = parts[1].strip()
         label = parts[2] if len(parts) == 3 else None
+
+        # Map platform names
+        if platform_input in ("twitter", "x"):
+            platform = "x"
+        elif platform_input in ("instagram", "ig"):
+            platform = "ig"
+        elif platform_input in ("facebook", "fb"):
+            platform = "fb"
+        elif platform_input in ("youtube", "yt"):
+            platform = "yt"
+        else:
+            await update.effective_message.reply_text("Platform must be: x, ig, fb, or yt (YouTube)")
+            return
+
+        # Special handling for full URLs
+        account = raw_input
+
+        if raw_input.startswith("http"):
+            if platform == "fb":
+                if "facebook.com" in raw_input or "fb.com" in raw_input:
+                    account = raw_input.split('?')[0].rstrip('/')
+                else:
+                    await update.effective_message.reply_text("Invalid Facebook URL.")
+                    context.user_data.pop("awaiting_save", None)
+                    return
+            elif platform == "yt":
+                if "youtube.com" in raw_input or "youtu.be" in raw_input:
+                    account = raw_input
+                else:
+                    await update.effective_message.reply_text("Invalid YouTube link.")
+                    context.user_data.pop("awaiting_save", None)
+                    return
+            else:
+                await update.effective_message.reply_text("Full URLs only supported for fb and yt.")
+                context.user_data.pop("awaiting_save", None)
+                return
+        else:
+            # Normal username — strip @
+            account = raw_input.lstrip('@').lower()
+
+        # Check save limit
         current_count = count_saved_accounts(uid)
-        if isinstance(badge['save_slots'], (int, float)) and current_count >= badge['save_slots']:
-            await update.effective_message.reply_text(f"You reached saved limit ({badge['save_slots']}). Remove some or invite to increase.")
+        save_slots = badge.get('save_slots')
+        if isinstance(save_slots, (int, float)) and current_count >= save_slots:
+            await update.effective_message.reply_text(f"You've reached your save limit ({int(save_slots)}). Invite friends to upgrade!")
             context.user_data.pop("awaiting_save", None)
             return
+
         try:
             saved = save_user_account(uid, platform, account, label)
-            await update.effective_message.reply_text(f"Saved {platform} @{account} (id: {saved.get('id')})", reply_markup=build_saved_menu())
+
+            # Smart display name (no @ on full URLs)
+            if account.startswith("http"):
+                if platform == "fb":
+                    display_name = account.split('/')[-1] or "Facebook Page"
+                elif platform == "yt":
+                    display_name = account.split('@')[-1] if '@' in account else account.split('/')[-1]
+                else:
+                    display_name = account
+            else:
+                display_name = "@" + account
+
+            await update.effective_message.reply_text(
+                f"✅ Saved {platform.upper()} account:\n"
+                f"{display_name}\n"
+                f"Label: {label or 'None'}\n"
+                f"ID: {saved.get('id')}",
+                reply_markup=build_saved_menu()
+            )
         except Exception as e:
-            await update.effective_message.reply_text(f"Error saving: {e}", reply_markup=build_saved_menu())
+            logging.error(f"Save error for user {uid}: {e}")
+            await update.effective_message.reply_text(f"❌ Error saving: {str(e)}", reply_markup=build_saved_menu())
+
         context.user_data.pop("awaiting_save", None)
         return
 
-    # Prompted username flow
+    # Prompted username flow (from menu)
     if context.user_data.get("awaiting_username"):
-        account = update.message.text.strip().lstrip("@").lower()
+        raw_input = update.message.text.strip()
         platform = context.user_data.get("platform", "x")
         context.user_data["awaiting_username"] = False
+
+        # Allow full URLs here too (same logic as save)
+        account = raw_input
+        if raw_input.startswith("http") and platform in ("fb", "yt"):
+            if platform == "fb" and ("facebook.com" in raw_input or "fb.com" in raw_input):
+                account = raw_input.split('?')[0].rstrip('/')
+            elif platform == "yt" and ("youtube.com" in raw_input or "youtu.be" in raw_input):
+                account = raw_input
+        else:
+            account = raw_input.lstrip("@").lower()
+
         await handle_fetch_and_ai(update, context, platform, account)
         return
 
     # /saved_send command
-    text = update.message.text.strip()
     if text.startswith("/saved_send"):
         parts = text.split()
         if len(parts) < 2:
@@ -1669,6 +1732,7 @@ Answer in max 6 sentences. Keep it engaging.
         await handle_fetch_and_ai(update, context, saved["platform"], saved["account_name"])
         return
 
+    # /saved_remove
     if text.startswith("/saved_remove"):
         parts = text.split()
         if len(parts) < 2:
@@ -1680,12 +1744,12 @@ Answer in max 6 sentences. Keep it engaging.
             await update.effective_message.reply_text("Invalid id.")
             return
         ok = remove_saved_account(uid, sid)
-        if ok:
-            await update.effective_message.reply_text(f"Removed saved account {sid}.")
-        else:
-            await update.effective_message.reply_text("Could not remove saved account.")
+        await update.effective_message.reply_text(
+            f"Removed saved account {sid}." if ok else "Could not remove account."
+        )
         return
 
+    # /saved_rename
     if text.startswith("/saved_rename"):
         parts = text.split(maxsplit=2)
         if len(parts) < 3:
@@ -1698,22 +1762,22 @@ Answer in max 6 sentences. Keep it engaging.
             return
         new_label = parts[2].strip()
         ok = update_saved_account_label(uid, sid, new_label)
-        if ok:
-            await update.effective_message.reply_text(f"Renamed saved account {sid} -> {new_label}")
-        else:
-            await update.effective_message.reply_text("Could not rename saved account.")
+        await update.effective_message.reply_text(
+            f"Renamed account {sid} → {new_label}" if ok else "Could not rename account."
+        )
         return
 
+    # /save command (direct command version)
     if text.startswith("/save"):
         parts = text.split(maxsplit=3)
         if len(parts) < 3:
             await update.effective_message.reply_text(
                 "Usage: /save <platform> <username_or_url> [label]\n\n"
                 "Examples:\n"
-                "/save x elonmusk My GOAT\n"
-                "/save ig chioma_goodness\n"
-                "/save fb https://www.facebook.com/BBCNews BBC\n"
-                "/save yt https://www.youtube.com/@MrBeast MrBeast"
+                "/save x elonmusk\n"
+                "/save ig davido\n"
+                "/save fb https://www.facebook.com/BBCNews BBC News\n"
+                "/save yt @MrBeast"
             )
             return
 
@@ -1721,7 +1785,7 @@ Answer in max 6 sentences. Keep it engaging.
         raw_input = parts[2].strip()
         label = parts[3] if len(parts) == 4 else None
 
-        # Map platform names
+        # Map platform
         if platform_input in ("twitter", "x"):
             platform = "x"
         elif platform_input in ("instagram", "ig"):
@@ -1731,94 +1795,90 @@ Answer in max 6 sentences. Keep it engaging.
         elif platform_input in ("youtube", "yt"):
             platform = "yt"
         else:
-            await update.effective_message.reply_text("Platform must be: x, ig, fb, or yt (YouTube)")
+            await update.effective_message.reply_text("Platform must be x, ig, fb, or yt")
             return
 
-        # Special handling: detect and clean full URLs
-        account = raw_input.lower()
-
+        # Handle full URLs
+        account = raw_input
         if raw_input.startswith("http"):
-            if platform == "fb":
-                if "facebook.com" in raw_input or "fb.com" in raw_input:
-                    # Extract clean profile URL
-                    clean_url = raw_input.split('?')[0].rstrip('/').split('/')[-1]
-                    if clean_url.startswith("profile.php"):
-                        # Handle profile.php?id=123 cases if needed later
-                        account = raw_input.split('?')[0].rstrip('/')
-                    else:
-                        account = raw_input.split('?')[0].rstrip('/')
-                    logging.info("Saved Facebook full URL: %s", account)
-                else:
-                    await update.effective_message.reply_text("Invalid Facebook URL. Please send a valid profile/page link.")
-                    return
-
-            elif platform == "yt":
-                if "youtube.com" in raw_input or "youtu.be" in raw_input:
-                    # Accept channel URL, @handle, or video link — we'll handle in fetch_yt_videos
-                    account = raw_input
-                    logging.info("Saved YouTube full URL/handle: %s", account)
-                else:
-                    await update.effective_message.reply_text("Invalid YouTube link. Please send a channel link or @handle.")
-                    return
-            else:
-                await update.effective_message.reply_text("Full URLs only supported for fb and yt platforms.")
+            if platform not in ("fb", "yt"):
+                await update.effective_message.reply_text("Full URLs only for fb and yt")
                 return
+            if platform == "fb" and not ("facebook.com" in raw_input or "fb.com" in raw_input):
+                await update.effective_message.reply_text("Invalid Facebook URL")
+                return
+            if platform == "yt" and not ("youtube.com" in raw_input or "youtu.be" in raw_input):
+                await update.effective_message.reply_text("Invalid YouTube link")
+                return
+            account = raw_input.split('?')[0].rstrip('/') if platform == "fb" else raw_input
         else:
-            # Normal username — just strip @
-            account = raw_input.lstrip('@')
+            account = raw_input.lstrip('@').lower()
 
-        # Check save limit
+        # Save limit check
         current_count = count_saved_accounts(uid)
         save_slots = badge.get('save_slots')
         if isinstance(save_slots, (int, float)) and current_count >= save_slots:
-            await update.effective_message.reply_text(f"You've reached your save limit ({int(save_slots)}). Invite friends to upgrade!")
+            await update.effective_message.reply_text(f"Save limit reached ({int(save_slots)})")
             return
 
         try:
             saved = save_user_account(uid, platform, account, label)
-            # Show friendly name in confirmation
-            display_name = account
+            # Clean display
             if account.startswith("http"):
-                if platform == "fb":
-                    display_name = account.split('/')[-1] or "Facebook Page"
-                elif platform == "yt":
-                    display_name = account.split('@')[-1] if '@' in account else account.split('/')[-1]
+                display = account.split('/')[-1] or account
+            else:
+                display = "@" + account
 
             await update.effective_message.reply_text(
-                f"✅ Saved {platform.upper()} account:\n"
-                f"• Name: {display_name}\n"
-                f"• Label: {label or 'None'}\n"
-                f"• ID: {saved.get('id')}\n\n"
-                f"Use /saved_list to view all"
+                f"✅ Saved {platform.upper()}:\n{display}\nLabel: {label or 'None'}\nID: {saved.get('id')}"
             )
         except Exception as e:
-            logging.error(f"Error saving account for user {uid}: {e}")
-            await update.effective_message.reply_text(f"❌ Error saving account: {str(e)}")
+            await update.effective_message.reply_text(f"❌ Save failed: {e}")
         return
 
+    # /saved_list
     if text.startswith("/saved_list"):
         items = list_saved_accounts(uid)
         if not items:
-            await update.effective_message.reply_text("No saved accounts. Use /save or the Saved menu.")
+            await update.effective_message.reply_text("No saved accounts yet. Use /save to add one.")
             return
+
         text_out = "Your saved accounts:\n\n"
         rows = []
         for it in items:
             sid = it["id"]
-            plat = it["platform"]
+            plat = it["platform"].upper()
             acc = it["account_name"]
             lbl = it.get("label") or ""
-            text_out += f"{sid}. [{plat}] @{acc} {('- '+lbl) if lbl else ''}\n"
+
+            # Clean display: no @ on full URLs
+            if acc.startswith("http"):
+                if plat == "FB":
+                    name = acc.split('/')[-1] or "Page"
+                elif plat == "YT":
+                    name = acc.split('@')[-1] if '@' in acc else acc.split('/')[-1]
+                else:
+                    name = acc
+                display = f"{sid}. [{plat}] {name}"
+            else:
+                display = f"{sid}. [{plat}] @{acc}"
+
+            if lbl:
+                display += f" — {lbl}"
+
+            text_out += display + "\n"
+
             rows.append([
-                InlineKeyboardButton(f"Send {sid}", callback_data=f"saved_sendcb_{sid}"),
+                InlineKeyboardButton(f"Send", callback_data=f"saved_sendcb_{sid}"),
                 InlineKeyboardButton("Rename", callback_data=f"saved_rename_start_{sid}"),
                 InlineKeyboardButton("Remove", callback_data=f"saved_removecb_{sid}")
             ])
-        rows.append([InlineKeyboardButton("↩️ Back", callback_data="saved_menu")])
+
+        rows.append([InlineKeyboardButton("↩️ Back to Menu", callback_data="saved_menu")])
         await update.effective_message.reply_text(text_out, reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    # Default
+    # Default fallback
     await record_user_and_check_ban(update, context)
     await update.effective_message.reply_text("Use the menu or /help for commands.")
 
