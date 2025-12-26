@@ -140,51 +140,78 @@ async def safe_edit(callback_query, text: str, parse_mode=None, reply_markup=Non
         except Exception:
             await callback_query.answer("Action completed.", show_alert=True)
 
-async def safe_send_media_or_link(chat, media_url: str, is_video: bool = False, caption: str = "", parse_mode=None):
+async def safe_send_media_or_link(chat, media_url: str, is_video: bool = False, caption: str = "", parse_mode=None, reply_markup=None):
     """
-    Send media robustly with guaranteed non-empty caption/text.
+    Send media robustly with guaranteed non-empty caption/text and support reply_markup.
+    chat may be a `Message` or `Chat`-like object. Prefer reply when `chat` is a Message.
     """
     # Ensure caption always has something
     if not caption:
         caption = "🔗 View post"
 
-    # Try direct send
-    try:
-        if is_video:
-            return await chat.send_video(video=media_url, caption=caption, parse_mode=parse_mode)
-        else:
-            return await chat.send_photo(photo=media_url, caption=caption, parse_mode=parse_mode)
-    except TelegramError:
-        pass
+    prefer_reply = None
+    target_chat = None
+    if isinstance(chat, Message):
+        prefer_reply = chat
+        target_chat = chat.chat
+    else:
+        target_chat = chat
 
-    # Download & upload
+    # Try direct send by URL using reply_* if possible
+    try:
+        if prefer_reply:
+            if is_video:
+                return await prefer_reply.reply_video(video=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+            else:
+                return await prefer_reply.reply_photo(photo=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+        else:
+            if is_video:
+                return await target_chat.send_video(video=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+            else:
+                return await target_chat.send_photo(photo=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception as e:
+        logger.debug("Direct media send failed for %s: %s", media_url, e)
+
+    # Download & upload fallback
     try:
         r = requests.get(media_url, stream=True, timeout=15)
         r.raise_for_status()
         content_type = r.headers.get("content-type", "")
-        if "image" in content_type or "video" in content_type:
-            ext = ".mp4" if is_video or "video" in content_type else ".jpg"
+        if "image" in content_type or "video" in content_type or any(k in content_type for k in ("mp4", "mpeg")):
+            ext = ".mp4" if is_video or "video" in content_type or "mp4" in content_type else ".jpg"
             with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
                 for chunk in r.iter_content(1024*64):
                     tmp.write(chunk)
                 tmp_path = tmp.name
 
             try:
-                if is_video:
-                    sent = await chat.send_video(video=InputFile(tmp_path), caption=caption, parse_mode=parse_mode)
+                if prefer_reply:
+                    if ext == ".mp4":
+                        return await prefer_reply.reply_video(video=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+                    else:
+                        return await prefer_reply.reply_photo(photo=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
                 else:
-                    sent = await chat.send_photo(photo=InputFile(tmp_path), caption=caption, parse_mode=parse_mode)
-                return sent
+                    if ext == ".mp4":
+                        return await target_chat.send_video(video=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+                    else:
+                        return await target_chat.send_photo(photo=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
             finally:
-                os.unlink(tmp_path)
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
     except Exception as e:
         logger.warning("Download failed: %s", e)
 
-    # Final fallback: always send text with link
+    # Final fallback: always send text with link (include reply_markup too)
     fallback_text = caption + "\n\n🔗 " + media_url
     try:
-        return await chat.send_message(text=fallback_text, parse_mode=parse_mode, disable_web_page_preview=False)
-    except Exception:
+        if prefer_reply:
+            return await prefer_reply.reply_text(fallback_text, parse_mode=parse_mode, disable_web_page_preview=False, reply_markup=reply_markup)
+        else:
+            return await target_chat.send_message(text=fallback_text, parse_mode=parse_mode, disable_web_page_preview=False, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error("Final fallback failed: %s", e)
         return None
 
 async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -355,27 +382,49 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
                 timeout=6.0
             )
             sent_preview = True
+            edited = True
             preview_msg = message
             logging.info("Text edit success on msg %s", message.message_id)
         except Exception as e:
             logging.warning("Text edit failed: %s → falling back to new message", e)
 
-    # If text edit failed, send new message using safe helper
+    # If text edit failed, send new message using safe helper (attach keyboard)
     if not sent_preview:
         preview_msg = await safe_send_media_or_link(
-            chat=message.chat,
+            chat=message if message else context.bot,
             media_url=post.get("media_url"),
             is_video=post.get("is_video", False),
             caption=preview_text,
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=keyboard   # <<-- attach keyboard here!!
         )
         if preview_msg:
             sent_preview = True
-            logging.info("New preview sent (msg %s)", preview_msg.message_id)
+            logging.info("New preview sent (msg %s)", getattr(preview_msg, "message_id", None))
 
-    # Schedule delete only if we have a message
-    if sent_preview and preview_msg:
-        await schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
+    # If we successfully showed the preview (either edit or new send), then advance index
+    if sent_preview:
+        # increment index now, not earlier
+        pending["index"] = pending.get("index", 0) + 1
+        context.user_data[user_data_key] = pending
+
+        # Schedule delete only if we have a message
+        try:
+            await schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
+        except Exception as e:
+            logging.debug("schedule_delete failed: %s", e)
+
+        # If we edited the original message, optionally schedule delete for the edited message (old)
+        if edited and message:
+            try:
+                schedule_delete(context, message.chat.id, message.message_id)
+            except Exception as e:
+                logging.debug("Failed to schedule delete for edited message: %s", e)
+
+    else:
+        # Send failed completely — do not advance index; log and stop
+        logging.error("Failed to show preview for idx %s — will not advance pending index", pending.get("index"))
+        return
 
 async def download_media(url: str) -> bytes:
     """Download media using urllib (no external deps) – async compatible"""
