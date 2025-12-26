@@ -508,7 +508,7 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
     # If we edited the original message, optionally schedule delete for the previous one as cleanup
     if edited and message:
         try:
-            schedule_delete(context, message.chat.id, message.message_id)
+            await schedule_delete(context, message.chat.id, message.message_id)
         except Exception as e:
             logging.debug("Failed to schedule delete for edited message: %s", e)
 
