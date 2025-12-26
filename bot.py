@@ -110,32 +110,34 @@ def admin_only(handler_func):
 def get_invite_link(bot_username: str, user_id: int) -> str:
     return f"https://t.me/{bot_username}?start={user_id}"
 
-async def safe_edit(callback_query, text, parse_mode=None):
+async def safe_edit(callback_query, text: str, parse_mode=None, reply_markup=None):
     """
-    Try to edit the message text if it exists; otherwise edit caption if media; otherwise send a new message.
-    callback_query: update.callback_query
+    Safely edit text or caption. Falls back to new message if impossible.
+    Now supports reply_markup.
     """
     try:
-        msg: Message = callback_query.message
-        # If original message has text -> edit text
-        if getattr(msg, "text", None):
-            await callback_query.edit_message_text(text, parse_mode=parse_mode)
+        msg = callback_query.message
+        if msg.text:
+            await callback_query.edit_message_text(
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup
+            )
             return
-
-        # If original message is media and has caption -> edit caption
-        if getattr(msg, "caption", None) is not None:
-            await callback_query.edit_message_caption(caption=text, parse_mode=parse_mode)
+        if msg.caption:
+            await callback_query.edit_message_caption(
+                caption=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup
+            )
             return
-
-        # Otherwise we can't edit: send a new message
-        await callback_query.message.reply_text(text, parse_mode=parse_mode)
-
+        # Can't edit → send new message
+        await msg.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
     except TelegramError as e:
-        # Fallback: send a new message
+        logger.warning("safe_edit failed: %s", e.message)
         try:
-            await callback_query.message.reply_text(text, parse_mode=parse_mode)
+            await callback_query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
         except Exception:
-            # last resort: answer callback to avoid spinner
             await callback_query.answer()
 
 async def safe_send_media_or_link(chat, media_url, is_video=False, caption=None, parse_mode=None):
