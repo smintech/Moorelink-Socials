@@ -3,6 +3,7 @@
 # Updated Groq models to current best: llama-3.3-70b-versatile (latest flagship)
 # Every single line from the original is included or appropriately modified – nothing omitted 😏
 import urllib.request
+from urllib.parse import urlparse
 import io
 import os
 import asyncio
