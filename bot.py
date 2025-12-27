@@ -1,7 +1,4 @@
-# bot.py - FULL COMPLETE UPDATED FILE - NO EXCLUSIONS WHATSOEVER (December 22, 2025)
-# All original features preserved + Manual AI now fully button-driven (no /ai_call command)
-# Updated Groq models to current best: llama-3.3-70b-versatile (latest flagship)
-# Every single line from the original is included or appropriately modified – nothing omitted 😏
+
 import urllib.request
 from urllib.parse import urlparse
 import io
@@ -117,7 +114,7 @@ def normalize_account(account: str, platform: str) -> str:
     acct = acct.split('?')[0].rstrip('/')      # remove query + trailing slash
     if acct.startswith('@'):
         acct = acct[1:]
-    # If it's a URL, extract the most-likely username segment
+    # If it's a URL, extract the most-likely username segment — KEEP ORIGINAL CASE
     if acct.startswith('http'):
         parsed = urlparse(acct)
         path = parsed.path.strip('/')
@@ -133,7 +130,8 @@ def normalize_account(account: str, platform: str) -> str:
                 acct = parts[0]
         else:
             acct = parsed.netloc
-    return acct.lower()
+    # DO NOT .lower() — usernames case-insensitive but some scrapers/FB prefer original casing
+    return acct
 
 async def safe_edit(callback_query, text: str, parse_mode=None, reply_markup=None):
     """
@@ -472,17 +470,17 @@ async def download_media(url: str) -> bytes:
     """Download media using urllib (no external deps) – async compatible"""
     loop = asyncio.get_event_loop()
     try:
-        # Run blocking urllib in thread pool to avoid blocking event loop
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+                "Referer": "https://www.facebook.com/"  # Critical for FB media URLs
             }
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             if response.status == 200:
                 data = response.read()
-                if len(data) > 50 * 1024 * 1024:  # >50MB → Telegram no go accept
+                if len(data) > 50 * 1024 * 1024:
                     logging.warning(f"Media too large ({len(data)/1024/1024:.1f}MB): {url}")
                     return None
                 return data
@@ -1721,7 +1719,7 @@ Answer in max 6 sentences. Keep it engaging.
                 return
         else:
             # Normal username — strip @
-            account = raw_input.lstrip('@').lower()
+            account = raw_input.lstrip("@")  # remove .lower()
 
         # Check save limit
         current_count = count_saved_accounts(uid)
@@ -2245,7 +2243,7 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platform = args[0].lower()
         if platform in ("twitter",):
             platform = "x"
-        account = args[1].lstrip('@').lower()
+        account = args[1].lstrip('@')
 
         await handle_fetch_and_ai(update, context, platform, account)
         return
