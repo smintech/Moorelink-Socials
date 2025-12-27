@@ -16,6 +16,7 @@ import urllib.parse
 import re
 from html import unescape
 from googleapiclient.discovery import build
+import random
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
 TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separate TG DB
@@ -215,14 +216,16 @@ def get_recent_urls(platform: str, account: str) -> list:
         conn.close()
 
 # ================ EXTERNAL FETCHERS (X + IG) ============
-NITTER_INSTANCES = [
-    "https://xcancel.com",
-    "https://nitter.net",
+NITTER_INSTANCES = [  # updated list above
     "https://nitter.poast.org",
+    "https://nitter.privacyredirect.com",
     "https://nitter.space",
     "https://nuku.trabun.org",
     "https://lightbrd.com",
-    "https://nitter.privacyredirect.com"
+    "https://nitter.net",
+    "https://nitter.tiekoetter.com",
+    "https://nitter.catsarch.com",
+    "https://xcancel.com",  # keep last – e get strong anti-bot
 ]
 
 def fetch_x_urls(account: str) -> List[str]:
@@ -231,31 +234,60 @@ def fetch_x_urls(account: str) -> List[str]:
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        ),
+            "Chrome/131.0 Safari/537.36"
+        ),  # update to latest Chrome
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
-    for base in NITTER_INSTANCES:
+
+    # Shuffle instances so no overload one
+    instances = NITTER_INSTANCES.copy()
+    random.shuffle(instances)
+
+    for base in instances:
         try:
-            url = f"{base}/{account}"
-            resp = requests.get(url, headers=headers, timeout=10)
-            resp.raise_for_status()
-            if len(resp.text) < 4000:
+            url = f"{base.rstrip('/')}/{account}"
+            resp = requests.get(url, headers=headers, timeout=15)
+            
+            if resp.status_code != 200:
+                time.sleep(1)
                 continue
-            soup = BeautifulSoup(resp.text, "html.parser")
+
+            text = resp.text
+
+            # Better block detection
+            if any(phrase in text.lower() for phrase in ["verifying your request", "x cancelled", "antibot", "challenge", "cloudflare", "just a moment"]):
+                print(f"Blocked by anti-bot on {base}")
+                time.sleep(1.5)
+                continue
+
+            if len(text) < 5000:  # too short = probably error/blocked page
+                continue
+
+            soup = BeautifulSoup(text, "html.parser")
+
+            # Check if timeline empty or error
+            if soup.select_one(".timeline-empty") or "Rate limit exceeded" in text or "Account suspended" in text:
+                continue
+
             urls = []
             for item in soup.select("div.timeline-item"):
-                link = item.select_one("a.tweet-link")
+                link = item.select_one("a.tweet-link, a.tweet-body > a[href*='/status/']")
                 if link and "/status/" in link.get("href", ""):
-                    clean = link["href"].split("#")[0]
-                    full_url = f"https://x.com{clean}"
+                    clean = link["href"].split("#")[0].split("?")[0]
+                    full_url = f"https://x.com{clean}" if clean.startswith("/") else f"https://x.com/{account}{clean}"
                     if full_url not in urls:
                         urls.append(full_url)
+
             if urls:
+                print(f"Success with {base} – found {len(urls)} posts")
                 return urls[:POST_LIMIT]
-        except Exception:
-            time.sleep(0.7)
-            continue
+
+        except Exception as e:
+            print(f"Error with {base}: {e}")
+            time.sleep(1)
+
+    print("All instances failed or blocked")
     return []
 
 def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
