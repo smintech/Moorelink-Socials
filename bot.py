@@ -640,7 +640,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
             })
     elif platform == "fb":
         # Now it's async – await it!
-        raw_fb = fetch_fb_urls(account)
+        raw_fb = await fetch_fb_urls(account)
         post_list = []
         for p in raw_fb:
             pid = p.get("post_id") or p.get("post_url", "")
@@ -1771,7 +1771,7 @@ Answer in max 6 sentences. Keep it engaging.
             elif platform == "yt" and ("youtube.com" in raw_input or "youtu.be" in raw_input):
                 account = raw_input
         else:
-            account = raw_input.lstrip("@").lower()
+            account = raw_input.lstrip("@")
 
         await handle_fetch_and_ai(update, context, platform, account)
         return
@@ -1874,7 +1874,7 @@ Answer in max 6 sentences. Keep it engaging.
                 return
             account = raw_input.split('?')[0].rstrip('/') if platform == "fb" else raw_input
         else:
-            account = raw_input.lstrip('@').lower()
+            account = raw_input.lstrip('@')
 
         # Save limit check
         current_count = count_saved_accounts(uid)
