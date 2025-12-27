@@ -76,6 +76,7 @@ from utils import (
 )
 
 # ================ CONFIG ================
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.getenv("BOTTOKEN")
@@ -164,97 +165,102 @@ async def safe_edit(callback_query, text: str, parse_mode=None, reply_markup=Non
         except Exception:
             await callback_query.answer("Action completed.", show_alert=True)
 
-async def safe_send_media_or_link(chat: Any,
-                                  media_url: str,
-                                  is_video: bool = False,
-                                  caption: str = "",
-                                  parse_mode: Optional[str] = None,
-                                  reply_markup: Optional[InlineKeyboardMarkup] = None):
+async def safe_send_media_or_link(
+    chat: Any,  # Message or effective_chat or Update-like with .bot and .chat
+    media_url: str,
+    is_video: bool = False,
+    caption: str = "",
+    parse_mode: Optional[str] = None,
+    reply_markup: Optional[InlineKeyboardMarkup] = None
+) -> Optional[Message]:
     """
-    Robust send helper that accepts reply_markup.
-    `chat` may be a Message OR a Chat-like object. When `chat` is a Message we use reply_* to preserve thread.
-    Returns the sent Message or None on failure.
+    Robustly send media by URL with fallbacks.
+    - Tries direct URL send (photo/video/document)
+    - Falls back to document if photo/video rejected
+    - Final fallback: text message with link
+    - Preserves thread by using reply_* if `chat` is a Message
+    - Fully async, no blocking requests
+    Returns sent Message or None
     """
-    # Normalize
-    prefer_reply = chat if isinstance(chat, Message) else None
-    target_chat = chat.chat if isinstance(chat, Message) else chat
+    # Normalize chat and bot access
+    if isinstance(chat, Message):
+        reply_target = chat
+        bot = chat.bot
+        chat_id = chat.chat.id
+    else:
+        # Assume chat has .bot and .chat (e.g. effective_chat, Update, etc.)
+        reply_target = None
+        bot = getattr(chat, "bot", None)
+        chat_id = getattr(getattr(chat, "chat", None), "id", None)
+        if not bot or chat_id is None:
+            logger.error("safe_send_media_or_link: cannot resolve bot or chat_id")
+            return None
 
-    # Ensure non-empty caption
-    if not caption:
-        caption = "🔗 View post"
+    media_url = (media_url or "").strip()
+    caption = (caption or "").strip() or "Post preview"
 
-    # Attempt direct send by URL (prefer message.reply_* to keep thread)
-    try:
-        if prefer_reply:
-            if is_video:
-                return await prefer_reply.reply_video(video=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
-            else:
-                return await prefer_reply.reply_photo(photo=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
-        else:
-            if is_video:
-                return await target_chat.send_video(video=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
-            else:
-                return await target_chat.send_photo(photo=media_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
-    except Exception as e:
-        logger.debug("Direct send by URL failed for %s: %s", media_url, e)
-
-    # Inspect content-type to decide if download+upload is worth it
-    content_type = ""
-    try:
-        head = requests.head(media_url, allow_redirects=True, timeout=8)
-        content_type = head.headers.get("content-type", "") or ""
-    except Exception:
+    def is_valid_url(url: str) -> bool:
         try:
-            r = requests.get(media_url, stream=True, timeout=8)
-            content_type = r.headers.get("content-type", "") or ""
+            parsed = urlparse(url)
+            return parsed.scheme in ("http", "https") and bool(parsed.netloc)
         except Exception:
-            content_type = ""
+            return False
 
-    logger.debug("safe_send_media_or_link: content-type=%s for url=%s", content_type, media_url)
-
-    # Download & upload if it looks like media
-    if any(k in content_type for k in ("image/", "video/", "mp4", "mpeg")):
-        tmp_path = None
-        try:
-            r = requests.get(media_url, stream=True, timeout=20)
-            r.raise_for_status()
-            ext = ".mp4" if (is_video or "video" in content_type or "mp4" in content_type) else ".jpg"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                for chunk in r.iter_content(1024 * 32):
-                    if not chunk:
-                        break
-                    tmp.write(chunk)
-                tmp_path = tmp.name
-
-            # Upload file
-            if prefer_reply:
-                if ext == ".mp4":
-                    return await prefer_reply.reply_video(video=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
-                else:
-                    return await prefer_reply.reply_photo(photo=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
-            else:
-                if ext == ".mp4":
-                    return await target_chat.send_video(video=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
-                else:
-                    return await target_chat.send_photo(photo=InputFile(tmp_path), caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
-        except Exception as e:
-            logger.warning("Download+upload failed for %s: %s", media_url, e)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
-
-    # Final fallback: always send a text message with link and the reply_markup
-    try:
-        fallback_text = f"{caption}\n\n🔗 {media_url}"
-        if prefer_reply:
-            return await prefer_reply.reply_text(fallback_text, parse_mode=parse_mode, disable_web_page_preview=False, reply_markup=reply_markup)
+    # Helper to send with reply or direct
+    async def send(method, **kwargs):
+        if reply_target:
+            return await getattr(reply_target, f"reply_{method}")(**kwargs)
         else:
-            return await target_chat.send_message(text=fallback_text, parse_mode=parse_mode, disable_web_page_preview=False, reply_markup=reply_markup)
+            return await getattr(bot, f"send_{method}")(chat_id=chat_id, **kwargs)
+
+    try:
+        if not media_url or not is_valid_url(media_url):
+            logger.info("Invalid or missing media_url → text fallback")
+        else:
+            # Primary: try correct media type
+            if is_video:
+                try:
+                    return await send("video", video=media_url, caption=caption,
+                                       parse_mode=parse_mode, reply_markup=reply_markup)
+                except TelegramError as e:
+                    logger.debug("send_video failed (%s) → trying document", e.message)
+            else:
+                try:
+                    return await send("photo", photo=media_url, caption=caption,
+                                       parse_mode=parse_mode, reply_markup=reply_markup)
+                except TelegramError as e:
+                    logger.debug("send_photo failed (%s) → trying document", e.message)
+
+            # Secondary: fallback to document (works for almost any file)
+            return await send("document", document=media_url, caption=caption,
+                              parse_mode=parse_mode, reply_markup=reply_markup)
+
+    except TelegramError as e:
+        # Log specific Telegram errors (e.g. Bad Request: wrong file type, etc.)
+        logger.warning("Media send failed for %s: %s", media_url, e.message)
     except Exception as e:
-        logger.error("Final fallback text send failed for %s: %s", media_url, e)
+        logger.exception("Unexpected error sending media %s: %s", media_url, e)
+
+    # Final fallback: always send text with link
+    try:
+        fallback_text = f"{caption}\n\n🔗 <a href='{media_url}'>View original media</a>" if media_url and is_valid_url(media_url) else caption
+        if reply_target:
+            return await reply_target.reply_text(
+                text=fallback_text,
+                parse_mode="HTML" if "<a href" in fallback_text else parse_mode,
+                disable_web_page_preview=False,
+                reply_markup=reply_markup
+            )
+        else:
+            return await bot.send_message(
+                chat_id=chat_id,
+                text=fallback_text,
+                parse_mode="HTML" if "<a href" in fallback_text else parse_mode,
+                disable_web_page_preview=False,
+                reply_markup=reply_markup
+            )
+    except Exception as e:
+        logger.error("Even final text fallback failed: %s", e)
         return None
 
 async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -329,30 +335,24 @@ async def send_ai_button(message, count, platform, account, badge, context=None,
 # --- slight adjustments to your send_next_post_with_confirmation (only small safe edits) ---
 async def send_next_post_with_confirmation(update_or_query, context: ContextTypes.DEFAULT_TYPE, platform: str, account: str):
     """
-    Robustly replace the preview message with the next pending post and attach a new keyboard.
-    Fixes:
-      - don't try to edit text when message has no text (avoids "There is no text in the message to edit")
-      - attach keyboard on fallback sends
-      - only advance pending index AFTER a successful edit/send
-      - always answer callback_query to stop spinner
-    Requires helpers:
-      safe_send_media_or_link(..., reply_markup=...), schedule_delete(...),
-      get_user_badge(uid), send_ai_button(...)
+    Robust preview sender: edits previous message if possible, otherwise sends new one.
+    Advances queue even if preview fails (records failures).
     """
     user_data_key = f"pending_posts_{platform}_{account}"
     pending = context.user_data.get(user_data_key)
 
-    # Resolve message, callback_query and uid defensively
+    # Resolve callback_query, message, and user id safely
     cq = getattr(update_or_query, "callback_query", None)
     message = None
     uid = None
+
     if cq:
         try:
-            await cq.answer()  # stop spinner ASAP
+            await cq.answer()  # stop spinner immediately
         except Exception:
             pass
         message = cq.message
-        uid = cq.from_user.id if cq.from_user else None
+        uid = cq.from_user.id
     elif hasattr(update_or_query, "effective_message") and update_or_query.effective_message:
         message = update_or_query.effective_message
         uid = getattr(update_or_query.effective_user, "id", None)
@@ -360,12 +360,12 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
         message = update_or_query.message
         uid = getattr(update_or_query.from_user, "id", None)
 
-    # Defensive: if no pending or finished -> store last_ai_context, show AI button, clear pending
+    # If queue is finished or missing
     if not pending or pending.get("index", 0) >= pending.get("total", 0):
         if not uid and message and getattr(message, "from_user", None):
             uid = message.from_user.id
         if not uid:
-            logging.warning("send_next_post_with_confirmation: cannot determine uid; clearing pending.")
+            logger.warning("Cannot determine user id; clearing pending.")
             context.user_data.pop(user_data_key, None)
             return
 
@@ -373,76 +373,61 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
         posts_to_store = pending.get("posts", [])[:] if pending else context.user_data.get(f"last_ai_context_{platform}_{account}", [])
         context.user_data[f"last_ai_context_{platform}_{account}"] = posts_to_store
 
-        processed_count = pending.get("index", 0) if pending else 0
-        total_count = pending.get("total", processed_count) if pending else len(posts_to_store)
+        processed = pending.get("index", 0) if pending else 0
+        total = pending.get("total", processed) if pending else len(posts_to_store)
 
-        target_msg = message or update_or_query
-        await send_ai_button(target_msg, max(processed_count, total_count), platform, account, badge, context=context, auto_delete_after=None)
-
+        target = message or update_or_query
+        await send_ai_button(target, max(processed, total), platform, account, badge, context=context, auto_delete_after=None)
         context.user_data.pop(user_data_key, None)
         return
 
-    # Ensure message or chat exists (we can still send a new message if no message object)
-    chat_for_send = None
-    if message:
-        chat_for_send = message  # prefer replying to the message object (keeps thread)
-    else:
-        # try to infer chat from update_or_query
-        if hasattr(update_or_query, "effective_chat") and update_or_query.effective_chat:
-            chat_for_send = update_or_query.effective_chat
-        else:
-            logging.warning("send_next_post_with_confirmation: no message or chat available; aborting.")
-            return
+    # Determine where to send (prefer existing message)
+    chat_for_send = message or getattr(update_or_query, "effective_chat", None)
+    if not chat_for_send:
+        logger.warning("No chat available to send preview.")
+        return
 
-    # Defensive uid resolution
-    if not uid and message and getattr(message, "from_user", None):
+    if not uid and getattr(message, "from_user", None):
         uid = message.from_user.id
 
-    # Bound and indexes
     current_idx = pending.get("index", 0)
-    if current_idx >= len(pending.get("posts", [])):
-        logging.warning("send_next_post_with_confirmation: index out of range (idx=%s, len=%s). Clearing pending.", current_idx, len(pending.get("posts", [])))
+    posts = pending.get("posts", [])
+    if current_idx >= len(posts):
+        logger.warning("Index out of range; clearing pending.")
         context.user_data.pop(user_data_key, None)
         return
 
-    post = pending["posts"][current_idx]
+    post = posts[current_idx]
 
-    # Build caption & keyboard
-    view_text = {"x": "View on 𝕏", "fb": "View on Facebook ⓕ", "ig": "View on Instagram 🅾", "yt": "View on YouTube📺"}.get(platform, "View Post 🔗")
+    # Build caption and link
+    view_text = {"x": "View on 𝕏", "fb": "View on Facebook ⓕ", "ig": "View on Instagram 🅮", "yt": "View on YouTube 📺"}.get(platform, "View Post 🔗")
     link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
     caption = (post.get("caption") or "")[:1024]
     full_caption = f"{link_html}\n\n{caption}" if link_html else caption
     preview_text = (full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?"
 
-    # Keyboard with Send this, Skip, Send all (conditional), Cancel
+    # Keyboard
+    total_posts = pending.get("total", len(posts))
     keyboard_rows = [[
-        InlineKeyboardButton(f"✅ Send this post ({current_idx + 1}/{pending.get('total', len(pending.get('posts', [])))})",
+        InlineKeyboardButton(f"✅ Send this post ({current_idx + 1}/{total_posts})",
                              callback_data=f"confirm_post_{platform}_{account}_{current_idx}"),
         InlineKeyboardButton("⏭️ Skip this post", callback_data=f"skip_post_{platform}_{account}_{current_idx}")
     ]]
     if not pending.get("has_sent_single", False):
-        remaining = max(0, pending.get("total", len(pending.get("posts", []))) - current_idx)
-        keyboard_rows.append([
-            InlineKeyboardButton(f"✅ Send all remaining ({remaining})", callback_data=f"send_all_{platform}_{account}")
-        ])
-    keyboard_rows.append([
-        InlineKeyboardButton("❌ Cancel remaining", callback_data=f"cancel_posts_{platform}_{account}")
-    ])
+        remaining = max(0, total_posts - current_idx)
+        if remaining > 1:
+            keyboard_rows.append([InlineKeyboardButton(f"✅ Send all remaining ({remaining})",
+                                                      callback_data=f"send_all_{platform}_{account}")])
+    keyboard_rows.append([InlineKeyboardButton("❌ Cancel remaining", callback_data=f"cancel_posts_{platform}_{account}")])
     keyboard = InlineKeyboardMarkup(keyboard_rows)
 
-    # We'll only increment index AFTER we successfully show the preview (edit or new send)
+    # Try to edit existing message (only if it has text and is from bot)
     sent_preview = False
     preview_msg = None
     edited = False
 
-    # Attempt to edit text only if original message has text AND was sent by bot (safe)
-    try:
-        can_try_text_edit = False
-        if message and getattr(message, "text", None) is not None:
-            # ensure bot originally sent it (can't edit other users' messages)
-            if getattr(message, "from_user", None) and getattr(message.from_user, "is_bot", False):
-                can_try_text_edit = True
-        if can_try_text_edit:
+    if message and getattr(message, "text", None) is not None:
+        if getattr(message, "from_user", None) and message.from_user.is_bot:
             try:
                 await asyncio.wait_for(
                     context.bot.edit_message_text(
@@ -452,67 +437,51 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
                         parse_mode="HTML",
                         reply_markup=keyboard
                     ),
-                    timeout=6.0
+                    timeout=8.0
                 )
                 sent_preview = True
                 preview_msg = message
                 edited = True
-                logging.info("Text edit success on msg %s (idx %s)", message.message_id, current_idx)
+                logger.info("Successfully edited preview message (idx %s)", current_idx)
             except Exception as e:
-                # common reasons: message can't be edited, edit timed out, etc.
-                logging.debug("Text edit attempt failed (will fallback): %s", e)
-    except Exception as e:
-        logging.debug("Safety check for text edit failed: %s", e)
+                logger.debug("Edit failed (will send new): %s", e)
 
-    # If edit didn't work (or wasn't attempted), send a new message (attach keyboard)
+    # If edit failed or not applicable → send new message with media or fallback
     if not sent_preview:
-        try:
-            preview_msg = await safe_send_media_or_link(
-                chat=chat_for_send,
-                media_url=post.get("media_url"),
-                is_video=post.get("is_video", False),
-                caption=preview_text,
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
-            if preview_msg:
-                sent_preview = True
-                logging.info("Sent new preview message (idx %s) msg_id=%s", current_idx, getattr(preview_msg, "message_id", None))
-        except Exception as e:
-            logging.error("Failed to send new preview message for idx %s: %s", current_idx, e)
+        preview_msg = await safe_send_media_or_link(
+            chat=chat_for_send,
+            media_url=post.get("media_url"),
+            is_video=post.get("is_video", False),
+            caption=preview_text,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        if preview_msg:
+            sent_preview = True
+            logger.info("Sent new preview message (idx %s, msg_id %s)", current_idx, preview_msg.message_id)
+        else:
+            logger.error("Failed to send any preview for idx %s", current_idx)
 
-    # If still not sent, do not advance index; log and optionally notify user/admin
+    # If we still couldn't show anything → record failure but advance anyway
     if not sent_preview:
-        logging.error("send_next_post_with_confirmation: could not show preview for idx %s — not advancing index", current_idx)
-        # Optionally inform user (keep it minimal)
-        try:
-            if cq:
-                await cq.answer("Couldn't show preview. Try again later.", show_alert=False)
-            elif message:
-                await message.reply_text("Couldn't show preview. Try again later.")
-        except Exception:
-            pass
-        return
+        failed_list = pending.setdefault("failed", [])
+        failed_list.append({"index": current_idx, "post_id": post.get("post_id"), "reason": "preview_send_failed"})
+        logger.info("Preview completely failed for idx %s — marking failed and advancing", current_idx)
+    else:
+        logger.info("Preview shown successfully for idx %s", current_idx)
 
-    # Success: increment index and persist pending
-    pending["index"] = pending.get("index", 0) + 1
+    # ALWAYS advance the index (prevents stalling)
+    pending["index"] = current_idx + 1
     context.user_data[user_data_key] = pending
 
-    # Schedule deletion of the new preview (only if we have a message object)
+    # Schedule deletion of preview message(s)
     try:
-        if preview_msg and getattr(preview_msg, "chat", None) and getattr(preview_msg, "message_id", None):
+        if preview_msg:
             await schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
-    except Exception as e:
-        logging.debug("Failed to schedule delete for preview message: %s", e)
-
-    # If we edited the original message, optionally schedule delete for the previous one as cleanup
-    if edited and message:
-        try:
+        if edited and message:
             await schedule_delete(context, message.chat.id, message.message_id)
-        except Exception as e:
-            logging.debug("Failed to schedule delete for edited message: %s", e)
-
-    return
+    except Exception as e:
+        logger.debug("Failed to schedule delete: %s", e)
 
 async def download_media(url: str) -> bytes:
     """Download media using urllib (no external deps) – async compatible"""
@@ -2040,7 +2009,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
     "🔥 <b>Welcome to MooreLinkBot – Your Ultimate Social Media Tracker!</b> 🔥\n\n"
     
-    "Get the latest posts from X (Twitter) & Instagram instantly – no login needed! "
+    "Get the latest posts from supported platforms instantly – no login needed! "
     "Save your favorite accounts for one-tap access, climb the ranks with invites, and unlock unlimited power 💎\n\n"
     
     "<b>🚀 Quick Commands</b>\n"
