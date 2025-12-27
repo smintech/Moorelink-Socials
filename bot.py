@@ -1270,6 +1270,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_ai_button(query.message, pending["index"], platform, account, badge)
         return
     # ... rest of callbacks (confirm_unban_, confirm_export_csv, etc.) unchanged ...
+    if data.startswith("confirm_ban_"):
+        if not is_admin(uid):
+            await query.edit_message_text("❌ Admins only.")
+            return
+        _, _, tid_s = data.partition("confirm_ban_")
+        try:
+            tid = int(tid_s)
+        except:
+            await query.edit_message_text("Invalid id.")
+            return
+        ban_tg_user(tid)
+        await query.edit_message_text(f"User {tid} has been banned.", reply_markup=build_admin_menu())
+        return
+
+    if data.startswith("confirm_reset_cooldown_"):
+        if not is_admin(uid):
+            await query.edit_message_text("❌ Admins only.")
+            return
+        _, _, tid_s = data.partition("confirm_reset_cooldown_")
+        try:
+            tid = int(tid_s)
+        except:
+            await query.edit_message_text("Invalid id.")
+            return
+        reset_cooldown(tid)
+        await query.edit_message_text(f"Cooldown reset for user {tid}.", reply_markup=build_admin_menu())
+        return
+
     if data.startswith("confirm_unban_"):
         if not is_admin(uid):
             await query.edit_message_text("❌ Admins only.")
