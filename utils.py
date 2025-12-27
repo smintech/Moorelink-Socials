@@ -18,6 +18,7 @@ from html import unescape
 from googleapiclient.discovery import build
 import random
 from ntscraper import Nitter
+import json
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
 TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separate TG DB
@@ -29,6 +30,8 @@ RAPIDAPI_HOST = 'facebook-pages-scraper3.p.rapidapi.com'
 RAPIDAPI_BASE = f"https://{RAPIDAPI_HOST}"
 APIFY_FALLBACK_TIMEOUT = 8
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+APIFY_API_TOKEN = os.getenv("APIFY")  # Add your Apify token to env
+APIFY_ACTOR_ID = "gentle_cloud/twitter-tweets-scraper"
 # ================ DB CONNECTIONS ============
 def get_db():
     if not DB_URL:
@@ -217,33 +220,69 @@ def get_recent_urls(platform: str, account: str) -> list:
         conn.close()
 
 # ================ EXTERNAL FETCHERS (X + IG) ============
-NITTER_INSTANCES = [  # updated list above
-    "https://nitter.poast.org",
-    "https://nitter.privacyredirect.com",
-    "https://nitter.space",
-    "https://nuku.trabun.org",
-    "https://lightbrd.com",
-    "https://nitter.net",
-    "https://nitter.tiekoetter.com",
-    "https://nitter.catsarch.com",
-    "https://xcancel.com",  # keep last – e get strong anti-bot
-]
-
-def fetch_x_urls(account: str) -> List[str]:
+def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
     account = account.lstrip('@')
-    scraper = Nitter(log_level=1, skip_instance_check=False)  # e go test instances automatically
+    profile_url = f"https://twitter.com/{account}"
     
+    if not APIFY_API_TOKEN:
+        logging.warning("APIFY_TOKEN not set – skipping X fetch")
+        return []
+
+    # Apify run payload
+    payload = {
+        "url": profile_url,
+        "maxTweets": limit + 5,  # small buffer
+        "sort": "Latest"  # or "Top" if you want
+    }
+
+    headers = {
+        "Authorization": f"Bearer {APIFY_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    # Start run
+    run_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs"
     try:
-        tweets = scraper.get_tweets(account, mode="user", number=POST_LIMIT)
+        run_resp = requests.post(run_url, headers=headers, json=payload, timeout=30)
+        run_resp.raise_for_status()
+        run_data = run_resp.json()
+        run_id = run_data["data"]["id"]
+
+        # Wait for finish (poll status)
+        dataset_id = run_data["data"]["defaultDatasetId"]
+        status_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs/{run_id}"
+        
+        for _ in range(30):  # max ~5-10 mins wait
+            status_resp = requests.get(status_url, headers=headers)
+            status_data = status_resp.json()
+            status = status_data["data"]["status"]
+            if status in ["SUCCEEDED", "FAILED", "TIMED-OUT"]:
+                break
+            time.sleep(10)  # poll every 10s
+
+        if status != "SUCCEEDED":
+            logging.warning(f"Apify run {status} for @{account}")
+            return []
+
+        # Get results
+        items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true"
+        items_resp = requests.get(items_url, headers=headers)
+        items = items_resp.json()
+
         urls = []
-        for tweet in tweets.get('tweets', []):
-            tweet_id = tweet.get('id') or tweet.get('link', '').split('/')[-1]
+        for item in items[:limit]:
+            tweet_id = item.get("id") or item.get("tweetId")
             if tweet_id:
                 urls.append(f"https://x.com/{account}/status/{tweet_id}")
-        print(f"ntscraper success: found {len(urls)} posts for @{account}")
-        return urls[:POST_LIMIT]
+        
+        logging.info(f"Apify success: fetched {len(urls)} posts for @{account}")
+        for u in urls:
+            save_url("x", account, u)  # keep your cache
+
+        return urls
+
     except Exception as e:
-        print(f"ntscraper failed for @{account}: {e}")
+        logging.warning(f"Apify fetch failed for @{account}: {e}")
         return []
 
 def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
