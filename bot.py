@@ -166,7 +166,8 @@ async def safe_edit(callback_query, text: str, parse_mode=None, reply_markup=Non
             await callback_query.answer("Action completed.", show_alert=True)
 
 async def safe_send_media_or_link(
-    chat: Any,  # Message or effective_chat or Update-like with .bot and .chat
+    chat: Any,
+    context: ContextTypes.DEFAULT_TYPE,
     media_url: str,
     is_video: bool = False,
     caption: str = "",
@@ -175,26 +176,15 @@ async def safe_send_media_or_link(
 ) -> Optional[Message]:
     """
     Robustly send media by URL with fallbacks.
-    - Tries direct URL send (photo/video/document)
-    - Falls back to document if photo/video rejected
-    - Final fallback: text message with link
-    - Preserves thread by using reply_* if `chat` is a Message
-    - Fully async, no blocking requests
-    Returns sent Message or None
+    Requires context to access bot (PTB 20+ safe).
+    Preserves thread using reply_* when chat is a Message.
     """
-    # Normalize chat and bot access
-    if isinstance(chat, Message):
-        reply_target = chat
-        bot = context.bot
-        chat_id = chat.chat.id
-    else:
-        # Assume chat has .bot and .chat (e.g. effective_chat, Update, etc.)
-        reply_target = None
-        bot = getattr(chat, "bot", None)
-        chat_id = getattr(getattr(chat, "chat", None), "id", None)
-        if not bot or chat_id is None:
-            logger.error("safe_send_media_or_link: cannot resolve bot or chat_id")
-            return None
+    bot = context.bot
+    reply_target = chat if isinstance(chat, Message) else None
+    chat_id = chat.chat.id if isinstance(chat, Message) else getattr(getattr(chat, "chat", None), "id", None)
+    if chat_id is None:
+        logger.error("safe_send_media_or_link: cannot determine chat_id")
+        return None
 
     media_url = (media_url or "").strip()
     caption = (caption or "").strip() or "Post preview"
@@ -206,48 +196,42 @@ async def safe_send_media_or_link(
         except Exception:
             return False
 
-    # Helper to send with reply or direct
-    async def send(method, **kwargs):
+    async def send(method: str, **kwargs):
         if reply_target:
             return await getattr(reply_target, f"reply_{method}")(**kwargs)
         else:
             return await getattr(bot, f"send_{method}")(chat_id=chat_id, **kwargs)
 
     try:
-        if not media_url or not is_valid_url(media_url):
-            logger.info("Invalid or missing media_url → text fallback")
-        else:
-            # Primary: try correct media type
+        if media_url and is_valid_url(media_url):
             if is_video:
                 try:
                     return await send("video", video=media_url, caption=caption,
-                                       parse_mode=parse_mode, reply_markup=reply_markup)
-                except TelegramError as e:
-                    logger.debug("send_video failed (%s) → trying document", e.message)
+                                      parse_mode=parse_mode, reply_markup=reply_markup)
+                except Exception as e:
+                    logger.debug("send_video failed: %s → trying document", e)
             else:
                 try:
                     return await send("photo", photo=media_url, caption=caption,
-                                       parse_mode=parse_mode, reply_markup=reply_markup)
-                except TelegramError as e:
-                    logger.debug("send_photo failed (%s) → trying document", e.message)
+                                      parse_mode=parse_mode, reply_markup=reply_markup)
+                except Exception as e:
+                    logger.debug("send_photo failed: %s → trying document", e)
 
-            # Secondary: fallback to document (works for almost any file)
+            # Fallback to document
             return await send("document", document=media_url, caption=caption,
                               parse_mode=parse_mode, reply_markup=reply_markup)
 
-    except TelegramError as e:
-        # Log specific Telegram errors (e.g. Bad Request: wrong file type, etc.)
-        logger.warning("Media send failed for %s: %s", media_url, e.message)
     except Exception as e:
-        logger.exception("Unexpected error sending media %s: %s", media_url, e)
+        logger.warning("Media send failed for %s: %s", media_url, e)
 
-    # Final fallback: always send text with link
+    # Final text fallback
     try:
         fallback_text = f"{caption}\n\n🔗 <a href='{media_url}'>View original media</a>" if media_url and is_valid_url(media_url) else caption
+        parse_mode_fallback = "HTML" if "<a href" in fallback_text else parse_mode
         if reply_target:
             return await reply_target.reply_text(
                 text=fallback_text,
-                parse_mode="HTML" if "<a href" in fallback_text else parse_mode,
+                parse_mode=parse_mode_fallback,
                 disable_web_page_preview=False,
                 reply_markup=reply_markup
             )
@@ -255,12 +239,12 @@ async def safe_send_media_or_link(
             return await bot.send_message(
                 chat_id=chat_id,
                 text=fallback_text,
-                parse_mode="HTML" if "<a href" in fallback_text else parse_mode,
+                parse_mode=parse_mode_fallback,
                 disable_web_page_preview=False,
                 reply_markup=reply_markup
             )
     except Exception as e:
-        logger.error("Even final text fallback failed: %s", e)
+        logger.error("Final text fallback failed: %s", e)
         return None
 
 async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
