@@ -640,7 +640,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
             })
     elif platform == "fb":
         # Now it's async – await it!
-        raw_fb = await fetch_fb_urls(account)
+        raw_fb = fetch_fb_urls(account)
         post_list = []
         for p in raw_fb:
             pid = p.get("post_id") or p.get("post_url", "")
@@ -694,7 +694,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
         return
 
     # Start sending the first post with confirmation
-    await send_next_post_with_confirmation(update, context, platform, account)
+    await send_next_post_with_confirmation(update, context, platform, clean_account)
 # ================ IMPROVED MANUAL AI TASK ================
 async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, source: str = "manual"):
     logging.info("run_ai_task started for user %s (source=%s)", user_id, source)
