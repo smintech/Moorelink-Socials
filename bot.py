@@ -2022,7 +2022,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Welcome to MooreLinkBot!\n\n"
         "Commands & quick actions available in the menu.\n"
         "Saved accounts: /save /saved_list /saved_send /saved_remove /saved_rename\n\n"
-        "Admins: /admin\n"
     )
     await update.effective_message.reply_text(text, reply_markup=build_main_menu())
 
