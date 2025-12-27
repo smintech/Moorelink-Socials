@@ -185,7 +185,7 @@ async def safe_send_media_or_link(
     # Normalize chat and bot access
     if isinstance(chat, Message):
         reply_target = chat
-        bot = chat.bot
+        bot = context.bot
         chat_id = chat.chat.id
     else:
         # Assume chat has .bot and .chat (e.g. effective_chat, Update, etc.)
@@ -450,6 +450,7 @@ async def send_next_post_with_confirmation(update_or_query, context: ContextType
     if not sent_preview:
         preview_msg = await safe_send_media_or_link(
             chat=chat_for_send,
+            context=context,
             media_url=post.get("media_url"),
             is_video=post.get("is_video", False),
             caption=preview_text,
