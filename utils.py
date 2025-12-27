@@ -32,6 +32,7 @@ APIFY_FALLBACK_TIMEOUT = 8
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 APIFY_API_TOKEN = os.getenv("APIFY")  # Add your Apify token to env
 APIFY_ACTOR_ID = "gentle_cloud/twitter-tweets-scraper"
+APIFY_BASE = "https://api.apify.com/v2"
 # ================ DB CONNECTIONS ============
 def get_db():
     if not DB_URL:
@@ -221,69 +222,113 @@ def get_recent_urls(platform: str, account: str) -> list:
 
 # ================ EXTERNAL FETCHERS (X + IG) ============
 def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
-    account = account.lstrip('@')
+    account = account.lstrip("@")
     profile_url = f"https://twitter.com/{account}"
-    
+
     if not APIFY_API_TOKEN:
-        logging.warning("APIFY_TOKEN not set – skipping X fetch")
+        logging.warning("APIFY_API_TOKEN not set – skipping X fetch")
         return []
 
-    # Apify run payload
+    actor_id = APIFY_ACTOR_ID.strip().strip("/")
+    run_url = (
+        f"{APIFY_BASE}/acts/{actor_id}/runs"
+        f"?token={APIFY_API_TOKEN}"
+    )
+
+    # ✅ MATCHES ACTOR INPUT SCHEMA
     payload = {
-        "url": profile_url,
-        "maxTweets": limit + 5,  # small buffer
-        "sort": "Latest"  # or "Top" if you want
+        "startUrls": [{"url": profile_url}],
+        "maxTweets": limit,
+        "sort": "Latest"
     }
 
-    headers = {
-        "Authorization": f"Bearer {APIFY_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    logging.info("Starting Apify run for @%s", account)
 
-    # Start run
-    run_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs"
     try:
-        run_resp = requests.post(run_url, headers=headers, json=payload, timeout=30)
-        run_resp.raise_for_status()
-        run_data = run_resp.json()
-        run_id = run_data["data"]["id"]
-
-        # Wait for finish (poll status)
-        dataset_id = run_data["data"]["defaultDatasetId"]
-        status_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs/{run_id}"
-        
-        for _ in range(30):  # max ~5-10 mins wait
-            status_resp = requests.get(status_url, headers=headers)
-            status_data = status_resp.json()
-            status = status_data["data"]["status"]
-            if status in ["SUCCEEDED", "FAILED", "TIMED-OUT"]:
-                break
-            time.sleep(10)  # poll every 10s
-
-        if status != "SUCCEEDED":
-            logging.warning(f"Apify run {status} for @{account}")
-            return []
-
-        # Get results
-        items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true"
-        items_resp = requests.get(items_url, headers=headers)
-        items = items_resp.json()
-
-        urls = []
-        for item in items[:limit]:
-            tweet_id = item.get("id") or item.get("tweetId")
-            if tweet_id:
-                urls.append(f"https://x.com/{account}/status/{tweet_id}")
-        
-        logging.info(f"Apify success: fetched {len(urls)} posts for @{account}")
-        for u in urls:
-            save_url("x", account, u)  # keep your cache
-
-        return urls
-
+        run_resp = requests.post(run_url, json=payload, timeout=30)
     except Exception as e:
-        logging.warning(f"Apify fetch failed for @{account}: {e}")
+        logging.warning("Apify POST failed: %s", e)
         return []
+
+    if run_resp.status_code not in (200, 201):
+        logging.warning(
+            "Apify run start failed (%s): %s",
+            run_resp.status_code,
+            run_resp.text[:800]
+        )
+        return []
+
+    try:
+        run_data = run_resp.json()["data"]
+        run_id = run_data["id"]
+        dataset_id = run_data["defaultDatasetId"]
+    except Exception:
+        logging.warning("Invalid Apify run response: %s", run_resp.text[:800])
+        return []
+
+    # ────────────────────────────
+    # Poll run status
+    # ────────────────────────────
+    status_url = (
+        f"{APIFY_BASE}/acts/{actor_id}/runs/{run_id}"
+        f"?token={APIFY_API_TOKEN}"
+    )
+
+    status = None
+    for _ in range(36):  # 6 minutes max
+        try:
+            r = requests.get(status_url, timeout=15)
+            r.raise_for_status()
+            status = r.json()["data"]["status"]
+        except Exception:
+            time.sleep(10)
+            continue
+
+        if status in ("SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"):
+            break
+
+        time.sleep(10)
+
+    if status != "SUCCEEDED":
+        logging.warning("Apify run ended with status=%s for @%s", status, account)
+        return []
+
+    # ────────────────────────────
+    # Fetch dataset items
+    # ────────────────────────────
+    items_url = (
+        f"{APIFY_BASE}/datasets/{dataset_id}/items"
+        f"?clean=true&token={APIFY_API_TOKEN}"
+    )
+
+    try:
+        items_resp = requests.get(items_url, timeout=30)
+        items_resp.raise_for_status()
+        items = items_resp.json()
+    except Exception as e:
+        logging.warning("Failed to fetch Apify dataset: %s", e)
+        return []
+
+    urls = []
+
+    for item in items[:limit]:
+        tweet_id = (
+            item.get("id")
+            or item.get("tweetId")
+            or item.get("tweet_id")
+        )
+        if tweet_id:
+            url = f"https://x.com/{account}/status/{tweet_id}"
+            urls.append(url)
+            save_url("x", account, url)
+
+    logging.info(
+        "Apify success: fetched %d posts for @%s",
+        len(urls),
+        account
+    )
+
+    return urls
 
 def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
     """
