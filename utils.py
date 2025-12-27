@@ -230,7 +230,7 @@ NITTER_INSTANCES = [  # updated list above
 ]
 
 def fetch_x_urls(account: str) -> List[str]:
-    account = account.lstrip('@').lower()
+    account = account.lstrip('@')
     scraper = Nitter(log_level=1, skip_instance_check=False)  # e go test instances automatically
     
     try:
@@ -251,7 +251,7 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
     Reliable Instagram scraper Dec 2025 – uses i.instagram.com/api/v1/users/web_profile_info/
     No login needed, direct media URLs wey Telegram go accept.
     """
-    account = account.lstrip('@').lower()
+    account = account.lstrip('@')
     posts = []
 
     headers = {
@@ -557,7 +557,7 @@ def fetch_yt_videos(channel_handle: str, max_results: Optional[int] = None) -> L
     return videos
 
 def fetch_latest_urls(platform: str, account: str) -> List[str]:
-    account = account.lstrip('@').lower()
+    account = account.lstrip('@')
     cached = get_recent_urls(platform, account)
     if cached:
         return cached
@@ -758,7 +758,7 @@ def list_all_tg_users(limit: int = 1000) -> List[Dict[str, Any]]:
 # ================ SAVED ACCOUNTS HELPERS ============
 def save_user_account(owner_telegram_id: int, platform: str, account_name: str, label: Optional[str]=None) -> Dict[str, Any]:
     platform = platform.lower()
-    account_name = account_name.lstrip('@').lower()
+    account_name = account_name.lstrip('@')
     try:
         conn = get_tg_db()
         cur = conn.cursor()
