@@ -487,7 +487,7 @@ def rapidapi_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: in
 def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
     input_str = account_or_url.strip()
 
-    # 1. Handle single post share links (as in your original code)
+    # Handle single shared post/reel URLs
     if any(x in input_str for x in ["share/", "mibextid=", "/posts/", "/photo.php", "/reel/"]):
         clean_url = input_str.split("?")[0].rstrip("/")
         return [{
@@ -501,7 +501,7 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
             "shares": 0,
         }]
 
-    # 2. Extract profile/page handle and build full URL
+    # Extract handle and build profile URL
     clean_account = input_str.lstrip("@").split("/")[-1].split("?")[0]
     if not clean_account:
         return []
@@ -510,7 +510,7 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
 
     posts: List[Dict[str, Any]] = []
     seen_ids = set()
-    end_cursor: Optional[str] = None  # For pagination
+    end_cursor: Optional[str] = None
 
     try:
         while len(posts) < limit:
@@ -521,61 +521,93 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
             if end_cursor:
                 params["end_cursor"] = end_cursor
 
-            # Correct path!
             data = rapidapi_get("get_facebook_posts_details", params=params)
 
-            # Flexible extraction of post list (common patterns)
-            raw_items = []
-            page_info = {}
-            if isinstance(data, dict):
-                raw_items = data.get("data", []) or data.get("results", []) or data.get("posts", []) or []
-                page_info = data.get("page_info", {}) or data.get("paging", {}) or {}
+            # === SAFE EXTRACTION ===
+            # Handle case where API returns {"data": {...}} or just {...}
+            inner_data = data.get("data") if isinstance(data, dict) else data
+            if not isinstance(inner_data, dict):
+                logging.warning("Unexpected response format (not dict): %s", type(inner_data))
+                break
 
-            for item in raw_items:
+            raw_posts = inner_data.get("posts", [])
+            page_info = inner_data.get("page_info", {})
+
+            if not raw_posts:
+                break  # No more posts
+
+            for item in raw_posts:
                 if len(posts) >= limit:
                     break
 
-                post_id = str(item.get("post_id") or item.get("id") or item.get("postId") or "")
+                # Safely extract post_id
+                post_id = (
+                    item.get("details", {}).get("post_id") or
+                    item.get("values", {}).get("post_id") or
+                    ""
+                )
                 if not post_id or post_id in seen_ids:
                     continue
                 seen_ids.add(post_id)
 
-                # Detect video
-                is_video = (
-                    item.get("is_video", False) or
-                    item.get("type") == "video" or
-                    item.get("video_id") or
-                    "video" in item.get("post_url", "").lower()
-                )
-
-                # Best media URL (thumbnail or full)
-                media_url = (
-                    item.get("image") or
-                    item.get("image_low_res") or
-                    item.get("thumbnail") or
-                    item.get("video_thumbnail") or
-                    item.get("media_url") or
+                # Caption
+                caption = (
+                    item.get("values", {}).get("text") or
+                    item.get("details", {}).get("text") or
                     ""
                 )
+                caption = html.unescape(caption)
 
-                caption = item.get("text") or item.get("description") or item.get("message") or ""
-                caption = html.unescape(caption)  # Clean HTML entities
+                # Post URL
+                post_url = (
+                    item.get("details", {}).get("post_link") or
+                    item.get("values", {}).get("post_link") or
+                    f"https://www.facebook.com/{clean_account}/posts/{post_id}"
+                )
+
+                # Is video?
+                is_video = (
+                    "reel" in post_url.lower() or
+                    item.get("values", {}).get("is_media") == "Video" or
+                    bool(item.get("attachments"))
+                )
+
+                # Media URL (thumbnail)
+                media_url = ""
+                attachments = item.get("attachments", [])
+                if attachments and isinstance(attachments, list):
+                    first_att = attachments[0]
+                    if first_att.get("__typename") == "Video":
+                        media_url = first_att.get("thumbnail_url", "")
+                    elif first_att.get("__typename") == "Photo":
+                        photo = first_att.get("photo_image", {})
+                        media_url = photo.get("uri", "") if isinstance(photo, dict) else ""
+
+                # Reactions / counts
+                reactions = item.get("reactions", {})
+                likes = reactions.get("Like") or reactions.get("total_reaction_count", 0)
+
+                comments = item.get("details", {}).get("comments_count", "0")
+                comments = int(''.join(filter(str.isdigit, str(comments)))) if comments else 0
+
+                shares = item.get("details", {}).get("share_count", "0")
+                shares = int(''.join(filter(str.isdigit, str(shares)))) if shares else 0
 
                 posts.append({
                     "post_id": post_id,
-                    "post_url": item.get("post_url") or item.get("link") or f"https://www.facebook.com/{clean_account}/posts/{post_id}",
+                    "post_url": post_url,
                     "caption": caption,
                     "media_url": media_url,
                     "is_video": is_video,
-                    "likes": item.get("likes_count") or item.get("likes") or 0,
-                    "comments": item.get("comments_count") or item.get("comments") or 0,
-                    "shares": item.get("shares_count") or item.get("shares") or 0,
+                    "likes": likes,
+                    "comments": comments,
+                    "shares": shares,
                 })
 
-            # Pagination: get next cursor
-            end_cursor = page_info.get("end_cursor") or page_info.get("cursor") or page_info.get("next_cursor")
-            if not end_cursor or not raw_items:
-                break  # No more pages
+            # Update cursor for next page
+            end_cursor = page_info.get("end_cursor")
+            if not end_cursor or not page_info.get("has_next", False):
+                break
 
         logging.info("Facebook success: fetched %d posts for %s", len(posts), profile_url)
 
