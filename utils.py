@@ -280,22 +280,22 @@ def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
     except Exception as e:
         logging.warning("Failed to fetch dataset: %s", e)
         return []
-
-    urls = []
-    # 1. Properly indented loop
-    for item in items:
-        # 2. Strict handle validation to filter out random accounts
-        scraped_handle = item.get("screen_name") or item.get("user", {}).get("screen_name")
         
-        if scraped_handle and scraped_handle.lower() != account.lower():
-            logging.info("Skipping unmatched post from @%s", scraped_handle)
-            continue
+    urls = []
+    for item in items:
+        # --- REMOVE OR COMMENT OUT THIS BLOCK ---
+        # scraped_handle = item.get("screen_name") or item.get("user", {}).get("screen_name")
+        # if scraped_handle and scraped_handle.lower() != account.lower():
+        #    logging.info("Skipping unmatched post from @%s", scraped_handle)
+        #    continue
+        # ----------------------------------------
 
-        # 3. Construct/Fetch URL
+        # Construct/Fetch URL
         tweet_url = item.get("url")
         if not tweet_url:
             tweet_id = item.get("id") or item.get("tweet_id")
             if tweet_id:
+                # Use the requested account name for the URL so it always points to the user's timeline view
                 tweet_url = f"https://x.com/{account}/status/{tweet_id}"
 
         if tweet_url:
@@ -305,7 +305,7 @@ def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
             except NameError:
                 pass 
         
-        # Stop once we hit the requested limit of VALIDATED URLs
+        # Stop once we hit the requested limit
         if len(urls) >= limit:
             break
 
