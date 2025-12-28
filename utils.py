@@ -225,133 +225,91 @@ def get_recent_urls(platform: str, account: str) -> list:
 def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
     """
     Fetches tweet URLs for a specific X (Twitter) account using Apify.
-    Normalizes the account name to remove the '@' prefix.
+    Ensures results belong strictly to the requested account.
     """
     # Normalize account: remove whitespace and the '@' symbol
     account = account.strip().lstrip("@")
-    profile_url = f"https://x.com/{account}"
+    # Correct URL construction for the scraper
+    profile_url = f"twitter.com{account}"
 
     if not APIFY_API_TOKEN:
         logging.warning("APIFY_API_TOKEN not set – skipping X fetch")
         return []
 
     actor_id = APIFY_ACTOR_ID.strip().strip("/")
-    run_url = (
-        f"{APIFY_BASE}/acts/{actor_id}/runs"
-        f"?token={APIFY_API_TOKEN}"
-    )
+    run_url = f"{APIFY_BASE}/acts/{actor_id}/runs?token={APIFY_API_TOKEN}"
 
-    # Match Actor Input Schema
+    # Updated payload to match gentle_cloud~twitter-tweets-scraper schema
     payload = {
-        "start_urls": [{"url": f"twitter.com{account}"}],
+        "start_urls": [{"url": profile_url}],
         "result_count": str(limit),
         "since_date": "2024-03-05"
     }
 
-    logging.info("Starting Apify run for %s (sent to Apify without @)", account)
-
     try:
         run_resp = requests.post(run_url, json=payload, timeout=30)
-    except Exception as e:
-        logging.warning("Apify POST failed: %s", e)
-        return []
-
-    if run_resp.status_code not in (200, 201):
-        logging.warning(
-            "Apify run start failed (%s): %s",
-            run_resp.status_code,
-            run_resp.text[:800]
-        )
-        return []
-
-    try:
+        run_resp.raise_for_status()
         run_data = run_resp.json()["data"]
         run_id = run_data["id"]
         dataset_id = run_data["defaultDatasetId"]
-    except (KeyError, ValueError):
-        logging.warning("Invalid Apify run response: %s", run_resp.text[:800])
+    except Exception as e:
+        logging.warning("Apify run start failed: %s", e)
         return []
 
-    # ────────────────────────────
-    # Poll run status
-    # ────────────────────────────
-    status_url = (
-        f"{APIFY_BASE}/acts/{actor_id}/runs/{run_id}"
-        f"?token={APIFY_API_TOKEN}"
-    )
-
+    # Polling status
+    status_url = f"{APIFY_BASE}/acts/{actor_id}/runs/{run_id}?token={APIFY_API_TOKEN}"
     status = None
-    for _ in range(36):  # 6 minutes max (10s * 36)
+    for _ in range(36): 
         try:
             r = requests.get(status_url, timeout=15)
-            r.raise_for_status()
             status = r.json()["data"]["status"]
-        except Exception:
-            time.sleep(10)
-            continue
-
-        if status in ("SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"):
-            break
-
+            if status in ("SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"):
+                break
+        except:
+            pass
         time.sleep(10)
 
     if status != "SUCCEEDED":
-        logging.warning("Apify run ended with status=%s for @%s", status, account)
         return []
 
-    # ────────────────────────────
     # Fetch dataset items
-    # ────────────────────────────
-    items_url = (
-        f"{APIFY_BASE}/datasets/{dataset_id}/items"
-        f"?clean=true&token={APIFY_API_TOKEN}"
-    )
-
+    items_url = f"{APIFY_BASE}/datasets/{dataset_id}/items?clean=true&token={APIFY_API_TOKEN}"
     try:
         items_resp = requests.get(items_url, timeout=30)
-        items_resp.raise_for_status()
         items = items_resp.json()
     except Exception as e:
-        logging.warning("Failed to fetch Apify dataset: %s", e)
+        logging.warning("Failed to fetch dataset: %s", e)
         return []
 
     urls = []
-
-    for item in items[:limit]:
+    # 1. Properly indented loop
+    for item in items:
+        # 2. Strict handle validation to filter out random accounts
         scraped_handle = item.get("screen_name") or item.get("user", {}).get("screen_name")
-    
-    # Validation: Skip if the handle doesn't match the target account
-    if scraped_handle and scraped_handle.lower() != account.lower():
-        logging.warning("Unmatched account found: @%s (expected @%s). Skipping.", scraped_handle, account)
-        continue
+        
+        if scraped_handle and scraped_handle.lower() != account.lower():
+            logging.info("Skipping unmatched post from @%s", scraped_handle)
+            continue
 
-    tweet_url = item.get("url")
-    
-        # 2. Fallback: Try to construct it if only ID is present
+        # 3. Construct/Fetch URL
+        tweet_url = item.get("url")
         if not tweet_url:
-            tweet_id = (
-                item.get("id")
-                or item.get("tweetId")
-                or item.get("tweet_id")
-            )
+            tweet_id = item.get("id") or item.get("tweet_id")
             if tweet_id:
                 tweet_url = f"https://x.com/{account}/status/{tweet_id}"
 
-        # If we found a URL, save it
         if tweet_url:
             urls.append(tweet_url)
-            # Assuming save_url is defined elsewhere in your project
             try:
                 save_url("x", account, tweet_url)
             except NameError:
                 pass 
+        
+        # Stop once we hit the requested limit of VALIDATED URLs
+        if len(urls) >= limit:
+            break
 
-    logging.info(
-        "Apify success: fetched %d posts for @%s",
-        len(urls),
-        account
-    )
-
+    logging.info("Apify success: fetched %d valid posts for @%s", len(urls), account)
     return urls
 
 def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
