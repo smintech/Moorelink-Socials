@@ -14,6 +14,7 @@ from openai import AsyncOpenAI, OpenAIError
 import json
 import urllib.parse
 import re
+import html
 from html import unescape
 from googleapiclient.discovery import build
 import random
