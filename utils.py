@@ -487,7 +487,7 @@ def rapidapi_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: in
 def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
     input_str = account_or_url.strip()
 
-    # 1. Handle single post share links
+    # 1. Handle single post share links (as in your original code)
     if any(x in input_str for x in ["share/", "mibextid=", "/posts/", "/photo.php", "/reel/"]):
         clean_url = input_str.split("?")[0].rstrip("/")
         return [{
@@ -501,72 +501,88 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
             "shares": 0,
         }]
 
-    # 2. Extract profile handle and construct the full URL
-    # This ensures we pass a valid 'link' parameter as required by the API
+    # 2. Extract profile/page handle and build full URL
     clean_account = input_str.lstrip("@").split("/")[-1].split("?")[0]
     if not clean_account:
         return []
 
     profile_url = f"https://www.facebook.com/{clean_account}"
-    
-    # Updated path and params based on your documentation
-    path = "posts" 
-    params = {
-        "link": profile_url,
-        "timezone": "UTC"
-    }
 
     posts: List[Dict[str, Any]] = []
     seen_ids = set()
+    end_cursor: Optional[str] = None  # For pagination
 
     try:
-        # Call the corrected endpoint
-        data = rapidapi_get(path, params=params)
-        
-        # The API usually returns results in a 'results' or 'data' list
-        # We check common keys used by this specific scraper
-        raw_items = []
-        if isinstance(data, dict):
-            raw_items = data.get("results") or data.get("data") or []
-        elif isinstance(data, list):
-            raw_items = data
+        while len(posts) < limit:
+            params = {
+                "link": profile_url,
+                "timezone": "UTC",
+            }
+            if end_cursor:
+                params["end_cursor"] = end_cursor
 
-        for item in raw_items:
-            if len(posts) >= limit:
-                break
+            # Correct path!
+            data = rapidapi_get("get_facebook_posts_details", params=params)
 
-            # Extract unique ID
-            post_id = str(item.get("post_id") or item.get("id") or "")
-            if not post_id or post_id in seen_ids:
-                continue
-            
-            # Identify if it is a video
-            is_video = item.get("is_video", False) or item.get("type") == "video"
-            
-            # Extract the best available image/video thumbnail
-            media_url = (
-                item.get("image_low_res") or 
-                item.get("thumbnail") or 
-                item.get("image") or 
-                ""
-            )
+            # Flexible extraction of post list (common patterns)
+            raw_items = []
+            page_info = {}
+            if isinstance(data, dict):
+                raw_items = data.get("data", []) or data.get("results", []) or data.get("posts", []) or []
+                page_info = data.get("page_info", {}) or data.get("paging", {}) or {}
 
-            posts.append({
-                "post_id": post_id,
-                "post_url": item.get("post_url") or f"https://www.facebook.com/{post_id}",
-                "caption": unescape(item.get("text") or item.get("description") or ""),
-                "media_url": media_url,
-                "is_video": is_video,
-                "likes": item.get("likes_count", 0),
-                "comments": item.get("comments_count", 0),
-                "shares": item.get("shares_count", 0),
-            })
-            seen_ids.add(post_id)
+            for item in raw_items:
+                if len(posts) >= limit:
+                    break
+
+                post_id = str(item.get("post_id") or item.get("id") or item.get("postId") or "")
+                if not post_id or post_id in seen_ids:
+                    continue
+                seen_ids.add(post_id)
+
+                # Detect video
+                is_video = (
+                    item.get("is_video", False) or
+                    item.get("type") == "video" or
+                    item.get("video_id") or
+                    "video" in item.get("post_url", "").lower()
+                )
+
+                # Best media URL (thumbnail or full)
+                media_url = (
+                    item.get("image") or
+                    item.get("image_low_res") or
+                    item.get("thumbnail") or
+                    item.get("video_thumbnail") or
+                    item.get("media_url") or
+                    ""
+                )
+
+                caption = item.get("text") or item.get("description") or item.get("message") or ""
+                caption = html.unescape(caption)  # Clean HTML entities
+
+                posts.append({
+                    "post_id": post_id,
+                    "post_url": item.get("post_url") or item.get("link") or f"https://www.facebook.com/{clean_account}/posts/{post_id}",
+                    "caption": caption,
+                    "media_url": media_url,
+                    "is_video": is_video,
+                    "likes": item.get("likes_count") or item.get("likes") or 0,
+                    "comments": item.get("comments_count") or item.get("comments") or 0,
+                    "shares": item.get("shares_count") or item.get("shares") or 0,
+                })
+
+            # Pagination: get next cursor
+            end_cursor = page_info.get("end_cursor") or page_info.get("cursor") or page_info.get("next_cursor")
+            if not end_cursor or not raw_items:
+                break  # No more pages
+
+        logging.info("Facebook success: fetched %d posts for %s", len(posts), profile_url)
 
     except Exception as e:
         logging.error("Failed to fetch Facebook posts for %s: %s", profile_url, e)
 
-    return posts
+    return posts[:limit]
 
 def fetch_yt_videos(channel_handle: str, max_results: Optional[int] = None) -> List[Dict[str, Any]]:
     """
