@@ -28,11 +28,14 @@ GROQ_API_KEY=os.getenv("GROQ_KEY")
 RAPIDAPI_KEY = os.getenv("RAPID_API")
 RAPIDAPI_HOST = 'facebook-pages-scraper3.p.rapidapi.com'
 RAPIDAPI_BASE = f"https://{RAPIDAPI_HOST}"
+RAPIDAPIHOST = "twitter-x-api.p.rapidapi.com"
 APIFY_FALLBACK_TIMEOUT = 8
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 APIFY_API_TOKEN = os.getenv("APIFY")  # Add your Apify token to env
 APIFY_ACTOR_ID = "apidojo~tweet-scraper"
 APIFY_BASE = "https://api.apify.com/v2"
+USER_BY_USERNAME_URL = "https://twitter-x-api.p.rapidapi.com/api/user/by_username"
+USER_TWEETS_URL = "https://twitter-x-api.p.rapidapi.com/api/user/tweets"
 # ================ DB CONNECTIONS ============
 def get_db():
     if not DB_URL:
@@ -222,89 +225,106 @@ def get_recent_urls(platform: str, account: str) -> list:
 
 # ================ EXTERNAL FETCHERS (X + IG) ============
 
-def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
+def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
     """
-    Fetches tweet URLs for a specific X (Twitter) account using Apify.
-    Ensures results belong strictly to the requested account.
+    Fetch the latest tweet URLs from a given X/Twitter account using RapidAPI.
+    Returns a list of https://x.com/username/status/tweet_id URLs.
     """
-    # Normalize account: remove whitespace and the '@' symbol
-    account = account.strip().lstrip("@")
-    # Correct URL construction for the scraper
-    if not APIFY_API_TOKEN:
-        logging.warning("APIFY_API_TOKEN not set – skipping X fetch")
+    account = account.lstrip("@").strip()
+    
+    if not RAPIDAPI_KEY:
+        logging.warning("RAPIDAPI_KEY not set – skipping X fetch")
         return []
 
-    actor_id = APIFY_ACTOR_ID.strip().strip("/")
-    run_url = f"{APIFY_BASE}/acts/{actor_id}/runs?token={APIFY_API_TOKEN}"
-
-    # Updated payload to match gentle_cloud~twitter-tweets-scraper schema
-    payload = {
-        "twitterHandles": [account], 
-        "maxItems": limit,
-        "sort": "Latest",
-        "tweetLanguage": "en",
-        "start": "2024-03-05",  # Start date
-        "includeSearchTerms": False
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": RAPIDAPIHOST
     }
 
-    try:
-        run_resp = requests.post(run_url, json=payload, timeout=30)
-        run_resp.raise_for_status()
-        run_data = run_resp.json()["data"]
-        run_id = run_data["id"]
-        dataset_id = run_data["defaultDatasetId"]
-    except Exception as e:
-        logging.warning("Apify run start failed: %s", e)
-        return []
-
-    # Polling status
-    status_url = f"{APIFY_BASE}/acts/{actor_id}/runs/{run_id}?token={APIFY_API_TOKEN}"
-    status = None
-    for _ in range(36): 
-        try:
-            r = requests.get(status_url, timeout=15)
-            status = r.json()["data"]["status"]
-            if status in ("SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"):
-                break
-        except:
-            pass
-        time.sleep(10)
-
-    if status != "SUCCEEDED":
-        return []
-
-    # Fetch dataset items
-    items_url = f"{APIFY_BASE}/datasets/{dataset_id}/items?clean=true&token={APIFY_API_TOKEN}"
-    try:
-        items_resp = requests.get(items_url, timeout=30)
-        items = items_resp.json()
-    except Exception as e:
-        logging.warning("Failed to fetch dataset: %s", e)
-        return []
-        
     urls = []
-    for item in items:
-        # Check 'tweet_url' first (Standard for this actor)
-        tweet_url = item.get("tweet_url") or item.get("url")
-        
-        # Fallback: Construct if missing
-        if not tweet_url:
-            tweet_id = item.get("id_str") or item.get("id")
-            if tweet_id:
-                tweet_url = f"https://x.com/{account}/status/{tweet_id}"
 
-        if tweet_url:
-            urls.append(tweet_url)
-            try:
-                save_url("x", account, tweet_url)
-            except NameError:
-                pass
-        
-        if len(urls) >= limit:
-            break
+    try:
+        # Step 1: Resolve username to user_id
+        lookup_resp = requests.get(
+            USER_BY_USERNAME_URL,
+            headers=headers,
+            params={"username": account},
+            timeout=20
+        )
+        lookup_resp.raise_for_status()
+        user_data = lookup_resp.json()
 
-    logging.info("Apify success: fetched %d valid posts for @%s", len(urls), account)
-    return urls
+        # Common response paths — adjust if your API returns differently
+        user_id = (
+            user_data.get("data", {}).get("id")
+            or user_data.get("id")
+            or user_data.get("user_id")
+            or user_data.get("id_str")
+        )
+        if not user_id:
+            logging.warning("User ID not found in lookup response for @%s: %s", account, user_data)
+            return []
+
+        logging.info("Resolved @%s → user_id %s", account, user_id)
+
+        # Step 2: Fetch latest tweets
+        tweets_resp = requests.get(
+            USER_TWEETS_URL,
+            headers=headers,
+            params={
+                "user_id": user_id,
+                "count": limit + 10  # Fetch extra to cover possible replies/quotes if filtered later
+            },
+            timeout=30
+        )
+        tweets_resp.raise_for_status()
+        response_json = tweets_resp.json()
+
+        # Extract tweets array — common variations
+        tweets = (
+            response_json.get("data", [])
+            or response_json.get("tweets", [])
+            or response_json.get("statuses", [])
+            or []
+        )
+
+        if not tweets:
+            logging.info("No tweets returned for @%s (possibly protected or no recent posts)", account)
+            return []
+
+        # Step 3: Build URLs
+        for tweet in tweets:
+            tweet_id = tweet.get("id_str") or tweet.get("id")
+            if not tweet_id:
+                continue
+
+            url = f"https://x.com/{account}/status/{tweet_id}"
+            urls.append(url)
+            save_url("x", account, url)  # Your existing function to track seen URLs
+
+            if len(urls) >= limit:
+                break
+
+        logging.info(
+            "RapidAPI success: fetched %d posts for @%s",
+            len(urls),
+            account
+        )
+
+    except requests.exceptions.HTTPError as http_err:
+        status_code = http_err.response.status_code if http_err.response else "unknown"
+        logging.warning(
+            "RapidAPI HTTP error %s for @%s: %s",
+            status_code,
+            account,
+            http_err.response.text[:500] if http_err.response else str(http_err)
+        )
+    except requests.exceptions.RequestException as e:
+        logging.warning("RapidAPI request failed for @%s: %s", account, e)
+    except Exception as e:
+        logging.warning("Unexpected error fetching tweets for @%s: %s", account, e)
+
+    return urls[:limit]
 
 def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
     """
