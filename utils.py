@@ -34,8 +34,7 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 APIFY_API_TOKEN = os.getenv("APIFY")  # Add your Apify token to env
 APIFY_ACTOR_ID = "apidojo~tweet-scraper"
 APIFY_BASE = "https://api.apify.com/v2"
-USER_BY_USERNAME_URL = "https://twitter-x-api.p.rapidapi.com/api/user/by_username"
-USER_TWEETS_URL = "https://twitter-x-api.p.rapidapi.com/api/user/tweets"
+TWEETS_URL = "https://twitter-x-api.p.rapidapi.com/api/user/tweets"
 # ================ DB CONNECTIONS ============
 def get_db():
     if not DB_URL:
@@ -225,74 +224,58 @@ def get_recent_urls(platform: str, account: str) -> list:
 
 # ================ EXTERNAL FETCHERS (X + IG) ============
 
+KNOWN_USER_IDS = {
+    "taylorswift13": "17919972",
+    "kaicenat": "830435768514596866",
+    # Add more here, e.g.:
+    # "poojamedia": "1234567890123456789",  # Get this from a lookup tool (see below)
+    # "elonmusk": "44196397",
+}
+
 def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
     """
-    Fetch the latest tweet URLs from a given X/Twitter account using RapidAPI.
-    Returns a list of https://x.com/username/status/tweet_id URLs.
+    Fetch latest tweet URLs from an X/Twitter account using your RapidAPI endpoint.
+    Requires user_id – uses hardcoded known IDs for reliability.
     """
-    account = account.lstrip("@").strip()
+    account = account.lstrip("@").strip().lower()
     
     if not RAPIDAPI_KEY:
         logging.warning("RAPIDAPI_KEY not set – skipping X fetch")
         return []
 
+    user_id = KNOWN_USER_IDS.get(account)
+    if not user_id:
+        logging.warning(
+            "No known user_id for @%s – add it to KNOWN_USER_IDS dict "
+            "(lookup at https://tweeterid.com or similar)",
+            account
+        )
+        return []
+
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": RAPIDAPIHOST
+        "x-rapidapi-host": RAPIDAPI_HOST
     }
 
     urls = []
 
     try:
-        # Step 1: Resolve username to user_id
-        lookup_resp = requests.get(
-            USER_BY_USERNAME_URL,
-            headers=headers,
-            params={"username": account},
-            timeout=20
-        )
-        lookup_resp.raise_for_status()
-        user_data = lookup_resp.json()
+        params = {
+            "user_id": user_id,
+            "count": limit + 10  # Fetch extra in case of filtering needs
+        }
 
-        # Common response paths — adjust if your API returns differently
-        user_id = (
-            user_data.get("data", {}).get("id")
-            or user_data.get("id")
-            or user_data.get("user_id")
-            or user_data.get("id_str")
-        )
-        if not user_id:
-            logging.warning("User ID not found in lookup response for @%s: %s", account, user_data)
-            return []
+        resp = requests.get(TWEETS_URL, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
 
-        logging.info("Resolved @%s → user_id %s", account, user_id)
-
-        # Step 2: Fetch latest tweets
-        tweets_resp = requests.get(
-            USER_TWEETS_URL,
-            headers=headers,
-            params={
-                "user_id": user_id,
-                "count": limit + 10  # Fetch extra to cover possible replies/quotes if filtered later
-            },
-            timeout=30
-        )
-        tweets_resp.raise_for_status()
-        response_json = tweets_resp.json()
-
-        # Extract tweets array — common variations
-        tweets = (
-            response_json.get("data", [])
-            or response_json.get("tweets", [])
-            or response_json.get("statuses", [])
-            or []
-        )
+        # Flexible tweet extraction (matches your Taylor Swift response format)
+        tweets = data.get("data", []) or []
 
         if not tweets:
-            logging.info("No tweets returned for @%s (possibly protected or no recent posts)", account)
+            logging.info("No recent tweets found for @%s", account)
             return []
 
-        # Step 3: Build URLs
         for tweet in tweets:
             tweet_id = tweet.get("id_str") or tweet.get("id")
             if not tweet_id:
@@ -300,29 +283,23 @@ def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
 
             url = f"https://x.com/{account}/status/{tweet_id}"
             urls.append(url)
-            save_url("x", account, url)  # Your existing function to track seen URLs
+            save_url("x", account, url)  # Your existing seen-tracker
 
             if len(urls) >= limit:
                 break
 
-        logging.info(
-            "RapidAPI success: fetched %d posts for @%s",
-            len(urls),
-            account
-        )
+        logging.info("RapidAPI success: fetched %d posts for @%s", len(urls), account)
 
     except requests.exceptions.HTTPError as http_err:
-        status_code = http_err.response.status_code if http_err.response else "unknown"
+        status = http_err.response.status_code if http_err.response else "unknown"
         logging.warning(
-            "RapidAPI HTTP error %s for @%s: %s",
-            status_code,
-            account,
-            http_err.response.text[:500] if http_err.response else str(http_err)
+            "RapidAPI HTTP error %s for @%s (user_id %s): %s",
+            status, account, user_id, http_err.response.text[:500] if http_err.response else str(http_err)
         )
     except requests.exceptions.RequestException as e:
         logging.warning("RapidAPI request failed for @%s: %s", account, e)
     except Exception as e:
-        logging.warning("Unexpected error fetching tweets for @%s: %s", account, e)
+        logging.warning("Unexpected error for @%s: %s", account, e)
 
     return urls[:limit]
 
