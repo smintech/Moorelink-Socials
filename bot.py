@@ -2330,4 +2330,9 @@ if __name__ == "__main__":
         print(f"[startup] init_tg_db() failed or not available: {e}")
 
     print("🤖 MooreLinkBot (full) started — with Groq AI, only new posts, Diamond/Admin unlimited chat!")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+    drop_pending_updates=True,
+    timeout=60,  # Longer for long-polls
+    poll_interval=1,
+    allowed_updates=["message", "callback_query"]  # Optimize
+)
