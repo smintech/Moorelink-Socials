@@ -296,6 +296,8 @@ def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
     # ────────────────────────────
     # Fetch dataset items
     # ────────────────────────────
+    # Note: We do not filter 'fields' here so that 'full_text' and 'media' 
+    # remain available in the 'items' list if you need them later.
     items_url = (
         f"{APIFY_BASE}/datasets/{dataset_id}/items"
         f"?clean=true&token={APIFY_API_TOKEN}"
@@ -312,15 +314,25 @@ def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
     urls = []
 
     for item in items[:limit]:
-        tweet_id = (
-            item.get("id")
-            or item.get("tweetId")
-            or item.get("tweet_id")
-        )
-        if tweet_id:
-            url = f"https://x.com/{account}/status/{tweet_id}"
-            urls.append(url)
-            save_url("x", account, url)
+        # 1. Try to get the direct URL provided by the actor
+        tweet_url = item.get("url")
+        
+        # 2. Fallback: Try to construct it if only ID is present
+        if not tweet_url:
+            tweet_id = (
+                item.get("id")
+                or item.get("tweetId")
+                or item.get("tweet_id")
+            )
+            if tweet_id:
+                tweet_url = f"https://x.com/{account}/status/{tweet_id}"
+
+        # If we found a URL, save it
+        if tweet_url:
+            urls.append(tweet_url)
+            save_url("x", account, tweet_url)
+            # If you need to access full_text or media here, 
+            # they are available in item.get("full_text") etc.
 
     logging.info(
         "Apify success: fetched %d posts for @%s",
