@@ -31,7 +31,7 @@ RAPIDAPI_BASE = f"https://{RAPIDAPI_HOST}"
 APIFY_FALLBACK_TIMEOUT = 8
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 APIFY_API_TOKEN = os.getenv("APIFY")  # Add your Apify token to env
-APIFY_ACTOR_ID = "gentle_cloud~twitter-tweets-scraper"
+APIFY_ACTOR_ID = "apidojo/tweet-scraper"
 APIFY_BASE = "https://api.apify.com/v2"
 # ================ DB CONNECTIONS ============
 def get_db():
