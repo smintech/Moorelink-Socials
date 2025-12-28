@@ -230,7 +230,7 @@ def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
     # Normalize account: remove whitespace and the '@' symbol
     account = account.strip().lstrip("@")
     # Correct URL construction for the scraper
-    profile_url = f"twitter.com{account}"
+    profile_url = f"https://twitter.com/{account}"
 
     if not APIFY_API_TOKEN:
         logging.warning("APIFY_API_TOKEN not set – skipping X fetch")
