@@ -230,8 +230,6 @@ def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
     # Normalize account: remove whitespace and the '@' symbol
     account = account.strip().lstrip("@")
     # Correct URL construction for the scraper
-    profile_url = f"https://twitter.com/{account}"
-
     if not APIFY_API_TOKEN:
         logging.warning("APIFY_API_TOKEN not set – skipping X fetch")
         return []
@@ -241,9 +239,12 @@ def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
 
     # Updated payload to match gentle_cloud~twitter-tweets-scraper schema
     payload = {
-        "start_urls": [{"url": profile_url}],
-        "result_count": str(limit),
-        "since_date": "2024-03-05"
+        "twitterHandles": [account], 
+        "maxItems": limit,
+        "sort": "Latest",
+        "tweetLanguage": "en",
+        "start": "2024-03-05",  # Start date
+        "includeSearchTerms": False
     }
 
     try:
@@ -282,37 +283,23 @@ def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
         return []
         
     urls = []
-    target_handle = account.strip().lstrip("@")
     for item in items:
-        user_data = item.get("user", {})
-        scraped_handle = (
-            item.get("screen_name") or 
-            user_data.get("screen_name") or 
-            user_data.get("username") or ""
-        )
-
-        # SKIP if the handle doesn't match your target (removes "random" suggestions)
-        if scraped_handle != target_handle:
-            continue
-        # Construct/Fetch URL
-        tweet_url = item.get("url")
+        # Check 'tweet_url' first (Standard for this actor)
+        tweet_url = item.get("tweet_url") or item.get("url")
+        
+        # Fallback: Construct if missing
         if not tweet_url:
-            tweet_id = item.get("id_str") or item.get("id") or item.get("tweet_id")
+            tweet_id = item.get("id_str") or item.get("id")
             if tweet_id:
-                tweet_url = f"https://x.com/{target_handle}/status/{tweet_id}"
+                tweet_url = f"https://x.com/{account}/status/{tweet_id}"
 
         if tweet_url:
-            # Clean the URL to match the format in your manual test
-            if "twitter.com" in tweet_url:
-                tweet_url = tweet_url.replace("twitter.com", "x.com")
-            
             urls.append(tweet_url)
             try:
-                save_url("x", target_handle, tweet_url)
+                save_url("x", account, tweet_url)
             except NameError:
-                pass 
-
-        # Stop once we hit the requested limit of VALIDATED items
+                pass
+        
         if len(urls) >= limit:
             break
 
