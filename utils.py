@@ -101,12 +101,27 @@ def init_tg_db():
             day_reset TIMESTAMP
         );
         """)
-                # seen_posts table for deduping new posts (AI gatekeeper)
+
+        # NEW: platform_types table for FK robustness
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS platform_types (
+            platform TEXT PRIMARY KEY
+        );
+        """)
+
+        # Insert allowed platforms (idempotent via ON CONFLICT)
+        cur.execute("""
+        INSERT INTO platform_types (platform)
+        VALUES ('x'), ('ig'), ('fb'), ('yt')
+        ON CONFLICT DO NOTHING;
+        """)
+
+        # seen_posts table for deduping new posts (AI gatekeeper)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS seen_posts (
             id SERIAL PRIMARY KEY,
             owner_telegram_id BIGINT NOT NULL,
-            platform TEXT NOT NULL CHECK (platform IN ('x', 'ig', 'fb')),
+            platform TEXT NOT NULL REFERENCES platform_types(platform),
             account_name TEXT NOT NULL,
             post_id TEXT NOT NULL,                  -- X: tweet ID, IG: shortcode
             post_url TEXT NOT NULL,
@@ -1243,25 +1258,97 @@ def is_post_new(owner_id: int, platform: str, account: str, post_id: str) -> boo
         logging.debug("is_post_new failed", exc_info=True)
         return True  # safe default
 
-# Mark posts as seen
-def mark_posts_seen(owner_id: int, platform: str, account: str, posts: List[Dict[str, str]]):
-    """posts = [{'post_id': ..., 'post_url': ...}, ...]"""
-    if not posts:
-        return
+def ensure_platform_exists(platform: str) -> bool:
+    """
+    Ensure the platform exists in platform_types (insert if missing).
+    Returns True if exists/inserted, False on error.
+    """
     try:
         conn = get_tg_db()
         cur = conn.cursor()
-        for p in posts:
-            cur.execute("""
-                INSERT INTO seen_posts (owner_telegram_id, platform, account_name, post_id, post_url)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """, (owner_id, platform, account, p['post_id'], p['post_url']))
+        cur.execute("""
+            INSERT INTO platform_types (platform)
+            VALUES (%s)
+            ON CONFLICT DO NOTHING
+        """, (platform,))
         conn.commit()
         cur.close()
         conn.close()
+        return True
     except Exception:
-        logging.debug("mark_posts_seen failed", exc_info=True)
+        logging.debug("ensure_platform_exists failed for '%s'", platform, exc_info=True)
+        return False
+# Mark posts as seen
+def mark_posts_seen(owner_id: int, platform: str, account: str, posts: List[Dict[str, str]]):
+    """
+    Mark a list of posts as seen for a specific user.
+    
+    posts = [{'post_id': '123456789', 'post_url': 'https://...'}, ...]
+    
+    Safe against:
+    - Duplicates (UNIQUE constraint)
+    - Invalid platform values (CHECK via FK)
+    - DB errors (won't crash bot)
+    """
+    if not posts:
+        return
+
+    platform = platform.lower()
+    account = account.lstrip('@')
+
+    # Ensure platform exists (required for FK)
+    if not ensure_platform_exists(platform):
+        logging.warning(f"Skipping mark_posts_seen due to platform '{platform}' insert failure")
+        return
+
+    try:
+        conn = get_tg_db()
+        cur = conn.cursor()
+
+        # Use executemany for efficiency and safety
+        values = [
+            (
+                owner_id,
+                platform,
+                account,
+                p['post_id'],
+                p['post_url']
+            )
+            for p in posts
+            if p.get('post_id') and p.get('post_url')  # basic validation
+        ]
+
+        if values:
+            cur.executemany("""
+                INSERT INTO seen_posts (
+                    owner_telegram_id, 
+                    platform, 
+                    account_name, 
+                    post_id, 
+                    post_url
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (owner_telegram_id, platform, account_name, post_id) 
+                DO NOTHING
+            """, values)
+
+        conn.commit()
+        logging.info(
+            "Marked %d %s posts as seen for user %d (@%s)",
+            len(values), platform.upper(), owner_id, account
+        )
+
+    except psycopg2.IntegrityError as e:
+        # This catches CHECK/FK violations (e.g. invalid platform)
+        logging.warning("Integrity error marking posts seen: %s", e)
+    except Exception as e:
+        logging.error("Failed to mark posts seen: %s", e, exc_info=True)
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
 
 def check_and_increment_cooldown(telegram_id: int) -> Optional[str]:
     """
