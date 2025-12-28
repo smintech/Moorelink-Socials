@@ -282,30 +282,37 @@ def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
         return []
         
     urls = []
+    target_handle = account.strip().lstrip("@")
     for item in items:
-        # --- REMOVE OR COMMENT OUT THIS BLOCK ---
-        # scraped_handle = item.get("screen_name") or item.get("user", {}).get("screen_name")
-        # if scraped_handle and scraped_handle.lower() != account.lower():
-        #    logging.info("Skipping unmatched post from @%s", scraped_handle)
-        #    continue
-        # ----------------------------------------
+        user_data = item.get("user", {})
+        scraped_handle = (
+            item.get("screen_name") or 
+            user_data.get("screen_name") or 
+            user_data.get("username") or ""
+        )
 
+        # SKIP if the handle doesn't match your target (removes "random" suggestions)
+        if scraped_handle != target_handle:
+            continue
         # Construct/Fetch URL
         tweet_url = item.get("url")
         if not tweet_url:
-            tweet_id = item.get("id") or item.get("tweet_id")
+            tweet_id = item.get("id_str") or item.get("id") or item.get("tweet_id")
             if tweet_id:
-                # Use the requested account name for the URL so it always points to the user's timeline view
-                tweet_url = f"https://x.com/{account}/status/{tweet_id}"
+                tweet_url = f"https://x.com/{target_handle}/status/{tweet_id}"
 
         if tweet_url:
+            # Clean the URL to match the format in your manual test
+            if "twitter.com" in tweet_url:
+                tweet_url = tweet_url.replace("twitter.com", "x.com")
+            
             urls.append(tweet_url)
             try:
-                save_url("x", account, tweet_url)
+                save_url("x", target_handle, tweet_url)
             except NameError:
                 pass 
-        
-        # Stop once we hit the requested limit
+
+        # Stop once we hit the requested limit of VALIDATED items
         if len(urls) >= limit:
             break
 
