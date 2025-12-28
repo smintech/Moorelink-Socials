@@ -487,7 +487,7 @@ def rapidapi_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: in
 def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
     input_str = account_or_url.strip()
 
-    # Handle single post share links
+    # 1. Handle single post share links
     if any(x in input_str for x in ["share/", "mibextid=", "/posts/", "/photo.php", "/reel/"]):
         clean_url = input_str.split("?")[0].rstrip("/")
         return [{
@@ -501,47 +501,65 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
             "shares": 0,
         }]
 
-    # Normal profile fetch
+    # 2. Extract profile handle and construct the full URL
+    # This ensures we pass a valid 'link' parameter as required by the API
     clean_account = input_str.lstrip("@").split("/")[-1].split("?")[0]
     if not clean_account:
         return []
 
     profile_url = f"https://www.facebook.com/{clean_account}"
-    path = "get-profile-home-page-details"
-    params = {"urlSupplier": profile_url}
+    
+    # Updated path and params based on your documentation
+    path = "posts" 
+    params = {
+        "link": profile_url,
+        "timezone": "UTC"
+    }
 
     posts: List[Dict[str, Any]] = []
     seen_ids = set()
 
     try:
+        # Call the corrected endpoint
         data = rapidapi_get(path, params=params)
-        # The API typically returns a 'data' or 'posts' list
-        raw_items = data.get("data", []) if isinstance(data, dict) else []
+        
+        # The API usually returns results in a 'results' or 'data' list
+        # We check common keys used by this specific scraper
+        raw_items = []
+        if isinstance(data, dict):
+            raw_items = data.get("results") or data.get("data") or []
+        elif isinstance(data, list):
+            raw_items = data
 
         for item in raw_items:
             if len(posts) >= limit:
                 break
 
-            post_id = item.get("post_id") or item.get("id")
-            if post_id in seen_ids:
+            # Extract unique ID
+            post_id = str(item.get("post_id") or item.get("id") or "")
+            if not post_id or post_id in seen_ids:
                 continue
             
-            # Extract content
-            is_video = item.get("is_video", False) or "video" in item.get("type", "").lower()
+            # Identify if it is a video
+            is_video = item.get("is_video", False) or item.get("type") == "video"
             
-            # Media URL logic: prioritize high res
-            media_url = item.get("image_high_res") or item.get("video_url") or item.get("thumbnail") or ""
+            # Extract the best available image/video thumbnail
+            media_url = (
+                item.get("image_low_res") or 
+                item.get("thumbnail") or 
+                item.get("image") or 
+                ""
+            )
 
             posts.append({
                 "post_id": post_id,
                 "post_url": item.get("post_url") or f"https://www.facebook.com/{post_id}",
-                "caption": item.get("text") or item.get("description") or "",
+                "caption": unescape(item.get("text") or item.get("description") or ""),
                 "media_url": media_url,
                 "is_video": is_video,
                 "likes": item.get("likes_count", 0),
                 "comments": item.get("comments_count", 0),
                 "shares": item.get("shares_count", 0),
-                "timestamp": item.get("timestamp")
             })
             seen_ids.add(post_id)
 
