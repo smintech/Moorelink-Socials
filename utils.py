@@ -19,7 +19,6 @@ from googleapiclient.discovery import build
 import random
 from ntscraper import Nitter
 import json
-from bot import normalize_account
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
 TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separate TG DB
