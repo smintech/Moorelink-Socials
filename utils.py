@@ -1,4 +1,4 @@
-# utils.py
+I'm # utils.py
 import os
 import hashlib
 import time
@@ -248,7 +248,7 @@ def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
         "sort": "Latest"
     }
 
-    logging.info("Starting Apify run for @%s", account)
+    logging.info("Starting Apify run for %s (sent to Apify without @)", account)
 
     try:
         run_resp = requests.post(run_url, json=payload, timeout=30)
