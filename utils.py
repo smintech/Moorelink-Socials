@@ -19,6 +19,7 @@ from googleapiclient.discovery import build
 import random
 from ntscraper import Nitter
 import json
+from bot import normalize_account
 # ================ CONFIG ================
 DB_URL = os.getenv("DATABASE_URL")                       # main cache DB (social posts)
 TG_DB_URL = os.getenv("USERS_DATABASE_URL") or os.getenv("TG_DB_URL")   # separate TG DB
@@ -221,8 +222,14 @@ def get_recent_urls(platform: str, account: str) -> list:
         conn.close()
 
 # ================ EXTERNAL FETCHERS (X + IG) ============
-def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
-    account = account.lstrip("@")
+
+def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
+    """
+    Fetches tweet URLs for a specific X (Twitter) account using Apify.
+    Normalizes the account name to remove the '@' prefix.
+    """
+    # Normalize account: remove whitespace and the '@' symbol
+    account = account.strip().lstrip("@")
     profile_url = f"https://x.com/{account}"
 
     if not APIFY_API_TOKEN:
@@ -235,7 +242,7 @@ def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
         f"?token={APIFY_API_TOKEN}"
     )
 
-    # ✅ MATCHES ACTOR INPUT SCHEMA
+    # Match Actor Input Schema
     payload = {
         "startUrls": [{"url": profile_url}],
         "maxTweets": limit,
@@ -262,7 +269,7 @@ def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
         run_data = run_resp.json()["data"]
         run_id = run_data["id"]
         dataset_id = run_data["defaultDatasetId"]
-    except Exception:
+    except (KeyError, ValueError):
         logging.warning("Invalid Apify run response: %s", run_resp.text[:800])
         return []
 
@@ -275,7 +282,7 @@ def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
     )
 
     status = None
-    for _ in range(36):  # 6 minutes max
+    for _ in range(36):  # 6 minutes max (10s * 36)
         try:
             r = requests.get(status_url, timeout=15)
             r.raise_for_status()
@@ -296,8 +303,6 @@ def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
     # ────────────────────────────
     # Fetch dataset items
     # ────────────────────────────
-    # Note: We do not filter 'fields' here so that 'full_text' and 'media' 
-    # remain available in the 'items' list if you need them later.
     items_url = (
         f"{APIFY_BASE}/datasets/{dataset_id}/items"
         f"?clean=true&token={APIFY_API_TOKEN}"
@@ -330,9 +335,11 @@ def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
         # If we found a URL, save it
         if tweet_url:
             urls.append(tweet_url)
-            save_url("x", account, tweet_url)
-            # If you need to access full_text or media here, 
-            # they are available in item.get("full_text") etc.
+            # Assuming save_url is defined elsewhere in your project
+            try:
+                save_url("x", account, tweet_url)
+            except NameError:
+                pass 
 
     logging.info(
         "Apify success: fetched %d posts for @%s",
