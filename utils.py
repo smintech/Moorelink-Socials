@@ -224,83 +224,127 @@ def get_recent_urls(platform: str, account: str) -> list:
 
 # ================ EXTERNAL FETCHERS (X + IG) ============
 
-KNOWN_USER_IDS = {
+KNOWN_USER_IDS: Dict[str, str] = {
     "taylorswift13": "17919972",
     "kaicenat": "830435768514596866",
-    # Add more here, e.g.:
-    # "poojamedia": "1234567890123456789",  # Get this from a lookup tool (see below)
-    # "elonmusk": "44196397",
 }
 
-def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
+
+def _safe_get_tweet_id(tweet: dict) -> Optional[str]:
+    """Return a string tweet id from common shapes (id_str, id)."""
+    tid = tweet.get("id_str") or tweet.get("id")
+    if tid is None:
+        return None
+    return str(tid)
+
+
+def _extract_tweets_from_response(data: dict) -> List[dict]:
     """
-    Fetch latest tweet URLs from an X/Twitter account using your RapidAPI endpoint.
-    Requires user_id – uses hardcoded known IDs for reliability.
+    Handle a few common response shapes:
+      - { "data": [ { "id": "...", ... }, ... ] }            (v2-like)
+      - { "statuses": [ ... ] }                              (v1.1 search)
+      - { "results": [ ... ] } or top-level list
     """
-    account = account.lstrip("@").strip().lower()
-    
+    if isinstance(data, list):
+        return data
+    for key in ("data", "statuses", "results"):
+        val = data.get(key)
+        if isinstance(val, list):
+            return val
+    # fallback: try common nested keys
+    return []
+
+
+def fetch_x_urls(account: str, limit: int = POST_LIMIT, max_retries: int = 3) -> List[str]:
+    """
+    Fetch latest tweet/X URLs for account.
+    - Uses KNOWN_USER_IDS for reliable user_id lookups.
+    - Respects missing RAPIDAPI_KEY by returning empty list (non-fatal).
+    - Retries transient network errors with exponential backoff.
+    """
+    account_clean = account.lstrip("@").strip().lower()
     if not RAPIDAPI_KEY:
-        logging.warning("RAPIDAPI_KEY not set – skipping X fetch")
+        logging.warning("RAPIDAPI_KEY not set – skipping X fetch for @%s", account_clean)
         return []
 
-    user_id = KNOWN_USER_IDS.get(account)
+    user_id = KNOWN_USER_IDS.get(account_clean)
     if not user_id:
         logging.warning(
-            "No known user_id for @%s – add it to KNOWN_USER_IDS dict "
-            "(lookup at https://tweeterid.com or similar)",
-            account
+            "No known user_id for @%s – add it to KNOWN_USER_IDS dict (lookup externally if needed)",
+            account_clean,
         )
         return []
 
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": RAPIDAPI_HOST
+        "x-rapidapi-host": RAPIDAPIHOST or "",
+        "Accept": "application/json",
     }
 
-    urls = []
+    params = {
+        "user_id": user_id,
+        "count": max(limit, 1) + 10,  # fetch a few extra
+    }
 
-    try:
-        params = {
-            "user_id": user_id,
-            "count": limit + 10  # Fetch extra in case of filtering needs
-        }
+    urls: List[str] = []
+    attempt = 0
+    while attempt <= max_retries:
+        try:
+            attempt += 1
+            resp = requests.get(TWEETS_URL, headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            tweets = _extract_tweets_from_response(data)
+            if not tweets:
+                logging.info("No recent tweets found for @%s (response OK but empty).", account_clean)
+                return []
 
-        resp = requests.get(TWEETS_URL, headers=headers, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+            for tweet in tweets:
+                tweet_id = _safe_get_tweet_id(tweet)
+                if not tweet_id:
+                    continue
+                url = f"https://x.com/{account_clean}/status/{tweet_id}"
+                urls.append(url)
+                try:
+                    save_url("x", account_clean, url)  # your seen-tracker; keep as-is
+                except Exception:
+                    # never fail the whole loop because seen-tracker blows up
+                    logging.debug("save_url failed for %s", url, exc_info=True)
 
-        # Flexible tweet extraction (matches your Taylor Swift response format)
-        tweets = data.get("data", []) or []
+                if len(urls) >= limit:
+                    break
 
-        if not tweets:
-            logging.info("No recent tweets found for @%s", account)
-            return []
+            logging.info("Fetched %d posts for @%s (attempt %d).", len(urls), account_clean, attempt)
+            return urls[:limit]
 
-        for tweet in tweets:
-            tweet_id = tweet.get("id_str") or tweet.get("id")
-            if not tweet_id:
-                continue
-
-            url = f"https://x.com/{account}/status/{tweet_id}"
-            urls.append(url)
-            save_url("x", account, url)  # Your existing seen-tracker
-
-            if len(urls) >= limit:
+        except requests.exceptions.HTTPError as http_err:
+            status = http_err.response.status_code if http_err.response else "unknown"
+            body = http_err.response.text[:500] if http_err.response else str(http_err)
+            logging.warning(
+                "RapidAPI HTTP error %s for @%s (user_id %s): %s",
+                status, account_clean, user_id, body,
+            )
+            # some 4xx errors are permanent — don't retry
+            if isinstance(status, int) and 400 <= status < 500 and status != 429:
                 break
+            # if 429 or 5xx, we'll retry below
+        except requests.exceptions.RequestException as e:
+            logging.warning("RapidAPI request failed for @%s (attempt %d): %s", account_clean, attempt, e)
+        except ValueError as e:
+            # resp.json() could throw ValueError if body not json
+            logging.warning("Invalid JSON response for @%s: %s", account_clean, e)
+            break
+        except Exception as e:
+            logging.warning("Unexpected error for @%s: %s", account_clean, e, exc_info=True)
+            break
 
-        logging.info("RapidAPI success: fetched %d posts for @%s", len(urls), account)
+        # backoff before retrying
+        if attempt <= max_retries:
+            sleep_for = 2 ** attempt
+            logging.debug("Retrying in %s seconds (attempt %d/%d)", sleep_for, attempt, max_retries)
+            time.sleep(sleep_for)
 
-    except requests.exceptions.HTTPError as http_err:
-        status = http_err.response.status_code if http_err.response else "unknown"
-        logging.warning(
-            "RapidAPI HTTP error %s for @%s (user_id %s): %s",
-            status, account, user_id, http_err.response.text[:500] if http_err.response else str(http_err)
-        )
-    except requests.exceptions.RequestException as e:
-        logging.warning("RapidAPI request failed for @%s: %s", account, e)
-    except Exception as e:
-        logging.warning("Unexpected error for @%s: %s", account, e)
-
+    logging.info("Giving up fetch for @%s after %d attempts.", account_clean, attempt)
     return urls[:limit]
 
 def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
