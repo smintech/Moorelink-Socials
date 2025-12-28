@@ -111,26 +111,32 @@ def get_invite_link(bot_username: str, user_id: int) -> str:
 
 def normalize_account(account: str, platform: str) -> str:
     acct = (account or "").strip()
-    acct = acct.split('?')[0].rstrip('/')      # remove query + trailing slash
-    if acct.startswith('@'):
-        acct = acct[1:]
-    # If it's a URL, extract the most-likely username segment — KEEP ORIGINAL CASE
+    
+    # 1. Remove query parameters and trailing slashes
+    acct = acct.split('?')[0].rstrip('/')
+    
+    # 2. Extract from URL if necessary
     if acct.startswith('http'):
         parsed = urlparse(acct)
         path = parsed.path.strip('/')
         parts = [p for p in path.split('/') if p]
+        
         if parts:
-            # For ig/x/fb profile URLs username is typically the first segment
             if platform in ('ig', 'x', 'fb'):
+                # For x.com/@user, parts[0] is "@user"
                 acct = parts[0]
-            # For YouTube, if they passed a handle or channel url, take the last segment
             elif platform == 'yt':
+                # For YouTube handles/channels
                 acct = parts[-1]
             else:
                 acct = parts[0]
         else:
             acct = parsed.netloc
-    # DO NOT .lower() — usernames case-insensitive but some scrapers/FB prefer original casing
+            
+    # 3. FINAL CLEANUP: Remove leading @ and whitespace again 
+    # This handles both "@username" and URLs like "x.com/@username"
+    acct = acct.lstrip("@").strip()
+    
     return acct
 
 async def safe_edit(callback_query, text: str, parse_mode=None, reply_markup=None):
