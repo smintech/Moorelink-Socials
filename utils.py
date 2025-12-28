@@ -243,9 +243,9 @@ def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
 
     # Match Actor Input Schema
     payload = {
-        "startUrls": [{"url": profile_url}],
-        "maxTweets": limit,
-        "sort": "Latest"
+        "start_urls": [{"url": f"twitter.com{account}"}],
+        "result_count": str(limit),
+        "since_date": "2024-03-05"
     }
 
     logging.info("Starting Apify run for %s (sent to Apify without @)", account)
@@ -318,9 +318,15 @@ def fetch_x_urls(account: str, limit: int = 10) -> List[str]:
     urls = []
 
     for item in items[:limit]:
-        # 1. Try to get the direct URL provided by the actor
-        tweet_url = item.get("url")
-        
+        scraped_handle = item.get("screen_name") or item.get("user", {}).get("screen_name")
+    
+    # Validation: Skip if the handle doesn't match the target account
+    if scraped_handle and scraped_handle.lower() != account.lower():
+        logging.warning("Unmatched account found: @%s (expected @%s). Skipping.", scraped_handle, account)
+        continue
+
+    tweet_url = item.get("url")
+    
         # 2. Fallback: Try to construct it if only ID is present
         if not tweet_url:
             tweet_id = (
