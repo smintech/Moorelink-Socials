@@ -26,7 +26,7 @@ CACHE_HOURS = 24
 POST_LIMIT = 10
 GROQ_API_KEY=os.getenv("GROQ_KEY")
 RAPIDAPI_KEY = os.getenv("RAPID_API")
-RAPIDAPI_HOST = 'facebook-pages-scraper3.p.rapidapi.com'
+RAPIDAPI_HOST = 'facebook-pages-scraper2.p.rapidapi.com'
 RAPIDAPI_BASE = f"https://{RAPIDAPI_HOST}"
 RAPIDAPIHOST = "twitter-x-api.p.rapidapi.com"
 APIFY_FALLBACK_TIMEOUT = 8
@@ -444,10 +444,7 @@ def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
     return posts
 
 def rapidapi_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20, retries: int = 2) -> Dict[str, Any]:
-    """
-    Call a RapidAPI product endpoint hosted at RAPIDAPI_HOST.
-    Example: rapidapi_get("get-profile-home-page-details", params={"urlSupplier": "..."})
-    """
+    """Call a RapidAPI product endpoint."""
     if not RAPIDAPI_KEY:
         raise RuntimeError("RAPIDAPI_KEY not set in environment")
 
@@ -462,6 +459,8 @@ def rapidapi_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: in
     last_exc = None
     for attempt in range(retries + 1):
         try:
+            # Note: The library 'requests' must be imported
+            import requests
             resp = requests.get(url, headers=headers, params=params or {}, timeout=timeout)
             if resp.status_code != 200:
                 logging.warning(
@@ -469,56 +468,27 @@ def rapidapi_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: in
                     resp.status_code, url, attempt + 1, resp.text[:500]
                 )
             resp.raise_for_status()
-            # return parsed json
             return resp.json()
         except requests.HTTPError as e:
             last_exc = e
             status = getattr(e.response, "status_code", None)
             if status in (429, 502, 503, 504):
                 backoff = 1.5 * (attempt + 1)
-                logging.warning(
-                    "RapidAPI temporary error %s for %s — backing off %.1fs",
-                    status, url, backoff
-                )
                 time.sleep(backoff)
                 continue
-            logging.exception("RapidAPI HTTP error for %s: %s", url, e)
             raise
         except Exception as e:
             last_exc = e
-            logging.exception("RapidAPI request failed for %s (attempt %d): %s", url, attempt + 1, e)
-            # jittered backoff
             time.sleep(1.0 * (attempt + 1))
             continue
 
-    # all retries failed -> raise a clear error
     raise RuntimeError(f"RapidAPI call failed after {retries + 1} attempts")
 
-def extract_og_meta(html: str, name: str) -> Optional[str]:
-    """Extract content of og:name or name meta tags. Returns first match or None."""
-    # look for property="og:image" or name="twitter:image"
-    m = re.search(r'<meta[^>]+(?:property|name)=["\'](?:og:|twitter:)?' + re.escape(name) + r'["\'][^>]*content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-    if m:
-        return unescape(m.group(1))
-    # fallback: generic content attr
-    return None
-
 def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str, Any]]:
-    """
-    Final version for Facebook fetching using RapidAPI (facebook-pages-scraper3).
-    - Accepts @handle, plain handle, or full profile URL
-    - Strips @ completely, uses clean name in URL for accuracy
-    - Dedupes posts by post_id
-    - Uses www.facebook.com links (best for public posts in 2025)
-    - Handles videos properly
-    - Direct high-quality media URLs (no login needed for images/videos)
-    """
     input_str = account_or_url.strip()
 
-    # Handle single post share links separately
-    if ("share/" in input_str or "mibextid=" in input_str or 
-        "/posts/" in input_str or "/photo.php" in input_str or "/reel/" in input_str):
-        # Clean the share link (remove tracking params)
+    # Handle single post share links
+    if any(x in input_str for x in ["share/", "mibextid=", "/posts/", "/photo.php", "/reel/"]):
         clean_url = input_str.split("?")[0].rstrip("/")
         return [{
             "post_id": "",
@@ -532,13 +502,11 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
         }]
 
     # Normal profile fetch
-    # Extract clean account name (no @, no path)
     clean_account = input_str.lstrip("@").split("/")[-1].split("?")[0]
     if not clean_account:
         return []
 
     profile_url = f"https://www.facebook.com/{clean_account}"
-
     path = "get-profile-home-page-details"
     params = {"urlSupplier": profile_url}
 
@@ -546,50 +514,40 @@ def fetch_fb_urls(account_or_url: str, limit: int = POST_LIMIT) -> List[Dict[str
     seen_ids = set()
 
     try:
-        data = rapidapi_get(path, params=params, timeout=30)
+        data = rapidapi_get(path, params=params)
+        # The API typically returns a 'data' or 'posts' list
+        raw_items = data.get("data", []) if isinstance(data, dict) else []
+
+        for item in raw_items:
+            if len(posts) >= limit:
+                break
+
+            post_id = item.get("post_id") or item.get("id")
+            if post_id in seen_ids:
+                continue
+            
+            # Extract content
+            is_video = item.get("is_video", False) or "video" in item.get("type", "").lower()
+            
+            # Media URL logic: prioritize high res
+            media_url = item.get("image_high_res") or item.get("video_url") or item.get("thumbnail") or ""
+
+            posts.append({
+                "post_id": post_id,
+                "post_url": item.get("post_url") or f"https://www.facebook.com/{post_id}",
+                "caption": item.get("text") or item.get("description") or "",
+                "media_url": media_url,
+                "is_video": is_video,
+                "likes": item.get("likes_count", 0),
+                "comments": item.get("comments_count", 0),
+                "shares": item.get("shares_count", 0),
+                "timestamp": item.get("timestamp")
+            })
+            seen_ids.add(post_id)
+
     except Exception as e:
-        logging.warning("RapidAPI FB fetch failed for %s: %s", profile_url, e)
-        return []
+        logging.error("Failed to fetch Facebook posts for %s: %s", profile_url, e)
 
-    if not isinstance(data, dict):
-        return []
-
-    photos = data.get("PHOTOS") or data.get("photos") or []
-
-    for it in photos:
-        if len(posts) >= limit:
-            break
-
-        post_id = it.get("id") or ""
-        if post_id in seen_ids:
-            continue
-        seen_ids.add(post_id)
-
-        media_type = it.get("media", "Photo")
-        is_video = bool(it.get("is_playable")) or media_type.lower() == "video"
-        
-        media_url = it.get("uri") or it.get("thumb") or ""
-        if not media_url:
-            continue
-
-        # Clean post_url without @
-        if post_id:
-            post_url = f"https://www.facebook.com/{clean_account}/posts/{post_id}"
-        else:
-            post_url = profile_url
-
-        posts.append({
-            "post_id": post_id,
-            "post_url": post_url,
-            "caption": "",  # Endpoint doesn't provide text/caption
-            "media_url": media_url,
-            "is_video": is_video,
-            "likes": it.get("likes", 0),
-            "comments": it.get("comments", 0),
-            "shares": it.get("shares", 0),
-        })
-
-    logging.info("fetch_fb_urls -> returned %d unique posts for facebook.com/%s", len(posts), clean_account)
     return posts
 
 def fetch_yt_videos(channel_handle: str, max_results: Optional[int] = None) -> List[Dict[str, Any]]:
