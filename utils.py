@@ -223,7 +223,7 @@ def get_recent_urls(platform: str, account: str) -> list:
 # ================ EXTERNAL FETCHERS (X + IG) ============
 def fetch_x_urls(account: str, limit: int = POST_LIMIT) -> List[str]:
     account = account.lstrip("@")
-    profile_url = f"https://twitter.com/{account}"
+    profile_url = f"https://x.com/{account}"
 
     if not APIFY_API_TOKEN:
         logging.warning("APIFY_API_TOKEN not set – skipping X fetch")
