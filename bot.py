@@ -1297,7 +1297,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_username"] = True
         await query.edit_message_text("Send the X/Twitter <b>user ID</b> (the long numeric ID, not username).\n\n"
         "How to get it:\n"
-        "Go to <a href='https://twiteridfinder.com/'>Twitter Username Converter/</a>\n"
+        "Go to <a href='https://twiteridfinder.com/'>Twitter Username Converter</a>\n"
         "Enter the @username there → it gives you the numeric ID.\n"
         "Copy and send that number here.\n\n",
         parse_mode="HTML",
