@@ -1295,7 +1295,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu_x":
         context.user_data["platform"] = "x"
         context.user_data["awaiting_username"] = True
-        await query.edit_message_text("Send the X username (without @):", reply_markup=build_back_markup("menu_main"))
+        await query.edit_message_text("Send the X/Twitter <b>user ID</b> (the long numeric ID, not username).\n\n"
+        "How to get it:\n"
+        "Go to <a href='https://tweeterid.com/'>https://tweeterid.com/</a>\n"
+        "Enter the @username there → it gives you the numeric ID.\n"
+        "Copy and send that number here.\n\n",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=build_back_markup("menu_main"))
         return
     if data == "menu_fb":
         context.user_data["platform"] = "fb"
@@ -1725,8 +1732,11 @@ Answer in max 6 sentences. Keep it engaging.
                 return
         else:
             # Normal username — strip @
-            account = raw_input.lstrip("@")  # remove .lower()
-
+            cleaned = raw_input.lstrip("@").strip()  # remove .lower()
+            if cleaned.isdigit() and len(cleaned) >= 10:
+                account = cleaned  # keep as numeric string
+            else:
+                account = cleaned
         # Check save limit
         current_count = count_saved_accounts(uid)
         save_slots = badge.get('save_slots')
@@ -1737,17 +1747,26 @@ Answer in max 6 sentences. Keep it engaging.
 
         try:
             saved = save_user_account(uid, platform, account, label)
-
             # Smart display name (no @ on full URLs)
+            # Smart display name for saved accounts
             if account.startswith("http"):
+                # Full URL saved (only for FB and YT)
                 if platform == "fb":
                     display_name = account.split('/')[-1] or "Facebook Page"
                 elif platform == "yt":
-                    display_name = account.split('@')[-1] if '@' in account else account.split('/')[-1]
+                    # Handle both youtube.com/@channel and youtube.com/channel/ID
+                    if '@' in account:
+                        display_name = account.split('@')[-1]
+                    else:
+                        display_name = account.split('/')[-1] or "YouTube Channel"
                 else:
-                    display_name = account
+                    display_name = account  # fallback
             else:
-                display_name = "@" + account
+                # Not a URL → username or numeric ID
+                if platform == "x" and account.isdigit() and len(account) >= 10:
+                    display_name = f"User ID: {account}"  # X numeric ID
+                else:
+                    display_name = f"@{account}"  # normal username with @
 
             await update.effective_message.reply_text(
                 f"✅ Saved {platform.upper()} account:\n"
