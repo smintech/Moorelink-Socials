@@ -239,20 +239,12 @@ def get_recent_urls(platform: str, account: str) -> list:
         conn.close()
 
 # ================ EXTERNAL FETCHERS (X + IG) ============
-
-KNOWN_USER_IDS: Dict[str, str] = {
-    "taylorswift13": "17919972",
-    "kaicenat": "830435768514596866",
-}
-
-
 def _safe_get_tweet_id(tweet: dict) -> Optional[str]:
     """Return a string tweet id from common shapes (id_str, id)."""
     tid = tweet.get("id_str") or tweet.get("id")
     if tid is None:
         return None
     return str(tid)
-
 
 def _extract_tweets_from_response(data: dict) -> List[dict]:
     """
@@ -297,13 +289,13 @@ def _normalize_account_input(account: str) -> str:
     return a
 
 
-def fetch_x_urls(account: str, limit: int = POST_LIMIT, max_retries: int = 3) -> List[str]:
+def fetch_x_urls(account: str, limit: int = 20, max_retries: int = 3) -> List[str]:  # Default limit 20 if POST_LIMIT not defined
     """
     Fetch latest tweet/X URLs for account.
-    Accepts:
-      - username (e.g. "taylorswift13" or "@taylorswift13")
+    Accepts ONLY:
       - numeric user_id (e.g. "17919972" or "@17919972")
-      - full profile/status URL (heuristic extraction)
+      - full profile or status URL – will attempt to extract numeric user_id if present
+    No username lookup anymore – KNOWN_USER_IDS is empty.
     """
     account_raw = account  # keep original for logging
     account_clean = _normalize_account_input(account)
@@ -312,18 +304,21 @@ def fetch_x_urls(account: str, limit: int = POST_LIMIT, max_retries: int = 3) ->
         logging.warning("fetch_x_urls called with empty account argument")
         return []
 
-    # If the caller passed digits, use it directly as user_id
+    # Primary: if pure digits → use as user_id
     if account_clean.isdigit():
         user_id = account_clean
         logging.debug("Using numeric user_id passed directly: %s", user_id)
     else:
-        # normalized username (lowercase)
-        username = account_clean.lower()
-        user_id = KNOWN_USER_IDS.get(username)
-        if not user_id:
+        # Fallback: try to extract a long digit sequence (Twitter user IDs are 10–19 digits)
+        match = re.search(r'\d{10,}', account_clean)
+        if match:
+            user_id = match.group(0)
+            logging.debug("Extracted numeric user_id from input: %s", user_id)
+        else:
             logging.warning(
-                "No known user_id for account '%s' (normalized '%s'). Add to KNOWN_USER_IDS or pass numeric user_id.",
-                account_raw, username
+                "Invalid input: no numeric user_id found in '%s' (normalized '%s'). "
+                "You must now pass the numeric user_id directly.",
+                account_raw, account_clean
             )
             return []
 
@@ -358,9 +353,10 @@ def fetch_x_urls(account: str, limit: int = POST_LIMIT, max_retries: int = 3) ->
                 if not tid:
                     continue
                 tid = str(tid)
-                # prefer to show username when available; fallback to numeric account_clean
-                display_account = account_clean if not account_clean.isdigit() else user_id
-                urls.append(f"https://x.com/{display_account}/status/{tid}")
+                # Use numeric user_id in URL – X will redirect to proper username if needed
+                display_account = user_id
+                TWITTER_FIXER_DOMAIN = "fixupx.com"  # Change to "vxtwitter.com", "fixupx.com", etc.
+                urls.append(f"https://{TWITTER_FIXER_DOMAIN}/{display_account}/status/{tid}")
                 try:
                     save_url("x", display_account, urls[-1])
                 except Exception:
