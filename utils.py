@@ -289,7 +289,7 @@ def _normalize_account_input(account: str) -> str:
     return a
 
 
-def fetch_x_urls(account: str, limit: int = 20, max_retries: int = 3) -> List[str]:  # Default limit 20 if POST_LIMIT not defined
+def fetch_x_urls(account: str, limit: int = 10, max_retries: int = 3) -> List[str]:  # Default limit 20 if POST_LIMIT not defined
     """
     Fetch latest tweet/X URLs for account.
     Accepts ONLY:
@@ -333,7 +333,7 @@ def fetch_x_urls(account: str, limit: int = 20, max_retries: int = 3) -> List[st
         "Accept": "application/json",
     }
 
-    params = {"user_id": user_id, "count": max(limit, 1) + 10}
+    params = {"user_id": user_id, "count": max(limit, 1) + 2}
     urls: List[str] = []
     attempt = 0
 
