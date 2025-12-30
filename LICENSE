@@ -1,25 +1,38 @@
-Software License Agreement
+<section class="license">
+  <h2>Software License Agreement</h2>
 
-Copyright (c) 2025 smintech
+  <p>
+    <strong>Copyright © 2025 smintech</strong>
+  </p>
 
-PERMISSION GRANTED
+  <h3>Permission Granted</h3>
+  <p>
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the
+    <strong>“Software”</strong>), to deal in the Software for
+    <strong>PERSONAL AND NON-COMMERCIAL PURPOSES ONLY</strong>.
+  </p>
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software for PERSONAL AND NON-COMMERCIAL PURPOSES ONLY, including the rights to use, copy, modify, and merge.
+  <h3>Commercial Restrictions</h3>
+  <p><strong>You MAY NOT:</strong></p>
+  <ul>
+    <li>Sell, rent, or lease the Software</li>
+    <li>Charge users to access a bot or service built with this code</li>
+    <li>Use the Software to provide paid scraping or data services</li>
+    <li>Sell the source code or compiled binaries</li>
+  </ul>
 
-COMMERCIAL RESTRICTIONS
+  <h3>Redistribution</h3>
+  <p>
+    Redistributions must retain this copyright notice, license terms,
+    and disclaimer.
+    <strong>Derivative works must use the same Non-Commercial license.</strong>
+  </p>
 
-You MAY NOT sell, rent, lease, or use this Software for any primary commercial purpose or monetary compensation. This includes, but is not limited to:
-
-Selling the source code or compiled binaries.
-
-Charging a fee to access a bot or service running this code.
-
-Using the code to provide paid data-scraping services.
-
-REDISTRIBUTION
-
-Redistributions of the Software must retain the above copyright notice, this list of conditions, and the following disclaimer. Any derivative works must also be distributed under this same "Non-Commercial" license.
-
-NO WARRANTY
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  <h3>No Warranty</h3>
+  <p>
+    <strong>THE SOFTWARE IS PROVIDED “AS IS”</strong>, WITHOUT WARRANTY OF ANY KIND,
+    EXPRESS OR IMPLIED. The authors shall not be liable for any claim, damages,
+    or other liability arising from the use of the Software.
+  </p>
+</section>
