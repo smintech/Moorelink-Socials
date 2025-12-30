@@ -75,7 +75,7 @@ Contributions are welcome to:
 <p>
 <strong>Process:</strong> Open an issue before submitting a Pull Request.<br />
 <strong>Restrictions:</strong> Selling, renting, or monetizing this software or services built on it
-is strictly prohibited under the Non-Commercial License.
+is strictly prohibited under the Non-Commercial <a href="LICENSE">📄 License</a>.
 </p>
 
 <hr />
