@@ -1,38 +1,45 @@
-<section class="license">
-  <h2>Software License Agreement</h2>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Software License Agreement</title>
+<style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; margin: 2rem; }
+    h1, h2 { color: #2c3e50; }
+    strong { color: #c0392b; } /* highlight key parts in red */
+    em { font-style: italic; }
+    mark { background-color: #f9e79f; }
+</style>
+</head>
+<body>
 
-  <p>
-    <strong>Copyright © 2025 smintech</strong>
-  </p>
+<h1>Software License Agreement</h1>
+<p><strong>Copyright (c) 2025 smintech</strong></p>
 
-  <h3>Permission Granted</h3>
-  <p>
-    Permission is hereby granted, free of charge, to any person obtaining a copy
-    of this software and associated documentation files (the
-    <strong>“Software”</strong>), to deal in the Software for
-    <strong>PERSONAL AND NON-COMMERCIAL PURPOSES ONLY</strong>.
-  </p>
+<h2>PERMISSION GRANTED</h2>
+<p>
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software for <strong>PERSONAL AND NON-COMMERCIAL PURPOSES ONLY</strong>, including the rights to <strong>use, copy, modify, and merge</strong>.
+</p>
 
-  <h3>Commercial Restrictions</h3>
-  <p><strong>You MAY NOT:</strong></p>
-  <ul>
-    <li>Sell, rent, or lease the Software</li>
-    <li>Charge users to access a bot or service built with this code</li>
-    <li>Use the Software to provide paid scraping or data services</li>
-    <li>Sell the source code or compiled binaries</li>
-  </ul>
+<h2>COMMERCIAL RESTRICTIONS</h2>
+<p>
+You <strong>MAY NOT</strong> sell, rent, lease, or use this Software for any primary commercial purpose or monetary compensation. This includes, but is not limited to:
+</p>
+<ul>
+    <li>Selling the source code or compiled binaries.</li>
+    <li>Charging a fee to access a bot or service running this code.</li>
+    <li>Using the code to provide paid data-scraping services.</li>
+</ul>
 
-  <h3>Redistribution</h3>
-  <p>
-    Redistributions must retain this copyright notice, license terms,
-    and disclaimer.
-    <strong>Derivative works must use the same Non-Commercial license.</strong>
-  </p>
+<h2>REDISTRIBUTION</h2>
+<p>
+Redistributions of the Software must retain the above copyright notice, this list of conditions, and the following disclaimer. Any derivative works must also be distributed under this same "<strong>Non-Commercial</strong>" license.
+</p>
 
-  <h3>No Warranty</h3>
-  <p>
-    <strong>THE SOFTWARE IS PROVIDED “AS IS”</strong>, WITHOUT WARRANTY OF ANY KIND,
-    EXPRESS OR IMPLIED. The authors shall not be liable for any claim, damages,
-    or other liability arising from the use of the Software.
-  </p>
-</section>
+<h2>NO WARRANTY</h2>
+<p>
+THE SOFTWARE IS PROVIDED "<strong>AS IS</strong>", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. <strong>IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE</strong> FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+</p>
+
+</body>
+</html>
