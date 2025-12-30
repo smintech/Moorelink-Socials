@@ -1,45 +1,25 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Software License Agreement</title>
-<style>
-    body { font-family: Arial, sans-serif; line-height: 1.6; margin: 2rem; }
-    h1, h2 { color: #2c3e50; }
-    strong { color: #c0392b; } /* highlight key parts in red */
-    em { font-style: italic; }
-    mark { background-color: #f9e79f; }
-</style>
-</head>
-<body>
+Software License Agreement
 
-<h1>Software License Agreement</h1>
-<p><strong>Copyright (c) 2025 smintech</strong></p>
+Copyright (c) 2025 smintech
 
-<h2>PERMISSION GRANTED</h2>
-<p>
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software for <strong>PERSONAL AND NON-COMMERCIAL PURPOSES ONLY</strong>, including the rights to <strong>use, copy, modify, and merge</strong>.
-</p>
+PERMISSION GRANTED
 
-<h2>COMMERCIAL RESTRICTIONS</h2>
-<p>
-You <strong>MAY NOT</strong> sell, rent, lease, or use this Software for any primary commercial purpose or monetary compensation. This includes, but is not limited to:
-</p>
-<ul>
-    <li>Selling the source code or compiled binaries.</li>
-    <li>Charging a fee to access a bot or service running this code.</li>
-    <li>Using the code to provide paid data-scraping services.</li>
-</ul>
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software for PERSONAL AND NON-COMMERCIAL PURPOSES ONLY, including the rights to use, copy, modify, and merge.
 
-<h2>REDISTRIBUTION</h2>
-<p>
-Redistributions of the Software must retain the above copyright notice, this list of conditions, and the following disclaimer. Any derivative works must also be distributed under this same "<strong>Non-Commercial</strong>" license.
-</p>
+COMMERCIAL RESTRICTIONS
 
-<h2>NO WARRANTY</h2>
-<p>
-THE SOFTWARE IS PROVIDED "<strong>AS IS</strong>", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. <strong>IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE</strong> FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-</p>
+You MAY NOT sell, rent, lease, or use this Software for any primary commercial purpose or monetary compensation. This includes, but is not limited to:
 
-</body>
-</html>
+Selling the source code or compiled binaries.
+
+Charging a fee to access a bot or service running this code.
+
+Using the code to provide paid data-scraping services.
+
+REDISTRIBUTION
+
+Redistributions of the Software must retain the above copyright notice, this list of conditions, and the following disclaimer. Any derivative works must also be distributed under this same "Non-Commercial" license.
+
+NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
