@@ -1,4 +1,4 @@
-<h1>🛰️ Target-to-Telegram On-Demand Scraper</h1>
+<h1>🛰️ Moorelink Socials Scraper</h1>
 
 <p>
 A <strong>high-precision data extraction engine</strong> designed to deliver
