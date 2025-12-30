@@ -2,7 +2,7 @@
 
 <p>
 A <strong>high-precision data extraction engine</strong> designed to deliver
-<strong>structured intelligence directly to Telegram</strong>.
+<strong>structured data directly to Telegram</strong>.
 This tool streamlines the pipeline from social media targets to actionable JSON data.
 </p>
 
@@ -11,7 +11,7 @@ This tool streamlines the pipeline from social media targets to actionable JSON 
 <h2>📝 User Workflow</h2>
 
 <ol>
-  <li><strong>Platform Selection</strong> — User selects a source platform (X, Instagram, Facebook)</li>
+  <li><strong>Platform Selection</strong> — User selects a platform (X, Instagram, Facebook)</li>
   <li><strong>Target Identification</strong> — User sends the target <code>@username</code></li>
   <li><strong>State Verification</strong> — Database is queried to verify the target and last-seen state</li>
   <li><strong>Live Fetch</strong> — Engine performs a real-time scrape of the latest data</li>
@@ -24,7 +24,7 @@ This tool streamlines the pipeline from social media targets to actionable JSON 
 <h2>🎥 Demo</h2>
 
 <p>
-<a href="https://youtu.be/YOUR_DEMO_LINK" target="_blank">
+<a href="https://www.linkedin.com/posts/israel-timi-99b339360_built-this-python-automation-bot-to-reduce-activity-7411577723371896832-IVzF?utm_medium=ios_app&rcm=ACoAAFnAGUcBUj5MzZln7aHj0BKPcS2K4I5sLwo&utm_source=social_share_video_v2&utm_campaign=copy_link" target="_blank">
 ▶ Watch the video demo
 </a>
 </p>
@@ -34,15 +34,16 @@ This tool streamlines the pipeline from social media targets to actionable JSON 
 
 <h3>1️⃣ Clone the Repository</h3>
 
-<pre><code>git clone https://github.com/your-username/target-to-telegram.git
-cd target-to-telegram</code></pre>
+<pre><code>git clone https://github.com/smintech/Moorelink-Socials.git
+cd Moorelink-Socials</code></pre>
 
 <h3>2️⃣ Environment Configuration</h3>
 
 <p>Create a <code>.env</code> file in the root directory:</p>
 
 <pre><code>TELEGRAM_BOT_TOKEN=your_token_here
-DATABASE_URL=your_database_connection_string</code></pre>
+DATABASE_URL=your_database_connection_string
+Scrapers API= your_api_here</code></pre>
 
 <h3>3️⃣ Install Dependencies</h3>
 
@@ -53,7 +54,7 @@ npm install</code></pre>
 <h3>4️⃣ Launch</h3>
 
 <p>
-Run the bot to initialize the <strong>awaiting username</strong> state.
+Deploy the bot or run local to initialize the <strong>awaiting username</strong> state.
 </p>
 
 <hr />
@@ -83,7 +84,7 @@ is strictly prohibited under the Non-Commercial <a href="LICENSE">📄 License</
 <h2>👤 Author</h2>
 
 <p>
-<strong>Your Name</strong><br />
-<a href="https://github.com/your-username">GitHub</a> ·
-<a href="https://linkedin.com/in/your-profile">LinkedIn</a>
+<strong>smintech</strong><br />
+<a href="https://github.com/smintech">GitHub</a> ·
+<a href="https://www.linkedin.com/in/israel-timi-99b339360?utm_source=share&utm_campaign=share_via&utm_content=profile&utm_medium=ios_app">LinkedIn</a>
 </p>
