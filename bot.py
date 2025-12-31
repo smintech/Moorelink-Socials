@@ -1559,14 +1559,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         prompt = f"""
-You are a sharp Nigerian social media analyst. Use Pidgin-mixed English, short and direct.
+You are a sharp Nigerian social media video analyst. Use Pidgin-mixed English, short, precise, and direct.
 
 Previous posts from @{chat_context['account']} ({chat_context['platform'].upper()}):
 {captions_text}
 
 User follow-up question: {question}
 
-Answer in max 6 sentences. Keep it engaging.
+Answer in max 6 sentences. Keep it engaging and provide a credible comment to make the author think about the comment.
 """
 
         await update.message.chat.send_action(ChatAction.TYPING)
