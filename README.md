@@ -3,34 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Moorelink Socials Scraper</title>
     <meta name="description" content="A Telegram bot that fetches public data from X, Instagram, and Facebook profiles on demand and returns structured JSON. Built for reliability in an arms race.">
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 2rem 1rem;
-            background: #fff;
-        }
-        @media (prefers-color-scheme: dark) {
-            body { background: #0d1117; color: #c9d1d9; }
-            a { color: #58a6ff; }
-            pre, code { background: #161b22; }
-            hr { border-color: #30363d; }
-        }
-        h1 { font-size: 2rem; margin-bottom: 0.5rem; }
-        h2 { font-size: 1.5rem; margin-top: 2.5rem; border-bottom: 1px solid #eee; padding-bottom: 0.5rem; }
-        h3 { font-size: 1.2rem; margin-top: 2rem; }
-        pre { background: #f6f8fa; padding: 1rem; border-radius: 6px; overflow-x: auto; }
-        code { font-family: 'SF Mono', Monaco, Consolas, 'Liberation Mono', Menlo, monospace; }
-        a { color: #0969da; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        ul { padding-left: 1.5rem; }
-        hr { border: none; border-top: 1px solid #eaecef; margin: 2rem 0; }
-    </style>
 </head>
 <body>
 
