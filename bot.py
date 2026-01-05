@@ -1339,7 +1339,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "saved_add_start":
         context.user_data["awaiting_save"] = True
-        await query.edit_message_text("Send: <platform> <username> [label]\nExample: `x vdm fav`", reply_markup=build_back_markup("saved_menu"))
+        await query.edit_message_text("Send: <platform> <username or ID> [label]\nExample: `x elonmusk fav`", reply_markup=build_back_markup("saved_menu"))
         return
     if data == "saved_list" or data.startswith("saved_page_"):
         page = 0
