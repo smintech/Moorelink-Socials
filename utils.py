@@ -1424,20 +1424,20 @@ async def call_social_ai(platform: str, account: str, posts: List[Dict]) -> str:
     captions_text = "\n---\n".join([p.get("caption", "No caption") for p in posts if p.get("caption")])
 
     prompt = f"""
-You are a sharp Nigerian social media analyst wey sabi X , IG, FB, YT well-well. Analyze these {platform.upper()} post(s) from @{account}.
+You are a sharp, street-smart Nigerian social media analyst who knows X, IG, FB, and YT inside out.
 
-Post captions:
+Analyze these recent {platform.upper()} posts from @{account}.
+
+Post captions/text:
 {captions_text}
 
-Answer ONLY in short, sweet Pidgin-mixed English:
+Focus on:
+1. The core content in the images/videos – describe wetin dey happen for the media proper (main subject, action, text overlays, vibe, or hidden details).
+2. Overall message/purpose – na promotion, education, drama, awareness, campaign, meme, political, or wetin?
+3. Tone & intent – serious, funny, motivational, controversial, emotional?
+4. Trend/vibe check – e dey blow (viral potential), people dey talk am, or just normal post?
 
-1. Wetin be the content of the pic or video(check deep)? (Main message or purpose(check the pic or video well)
-
-2. Tone & intent: Promotion, Drama, Political, Education, Memes, Awareness, Campaign, or na saga?
-
-3. Trend signal: Going viral, Mid viral, People talking about it, or neutral?
-
-Keep am short – max 5 sentences. Use Naija vibe and slang where e fit!
+Answer in short, sweet Pidgin-mixed English with Naija slang. Keep am punchy – 4-6 sentences max. No long story!
 """
 
     api_key = os.getenv("GROQ_KEY") or os.getenv("GROQ_KEY")
