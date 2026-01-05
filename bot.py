@@ -2047,45 +2047,52 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset_all_cooldowns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin command: /reset_all_cooldowns
-    Resets rate-limit cooldown counters for every user in the database.
+    Resets ALL rate limit counters and timestamps for every user in tg_rate_limits table.
+    Requires confirmation for safety.
     """
-    # Optional: add a confirmation step for safety
+    # Safety confirmation
     if not context.args or context.args[0].lower() != "confirm":
         await update.effective_message.reply_text(
-            "⚠️ This will reset cooldowns for <b>ALL</b> users.\n\n"
-            "To confirm, type:\n"
+            "⚠️ <b>Dangerous action:</b> This will reset rate limits for <u>ALL users</u>.\n\n"
+            "To proceed, type:\n"
             "<code>/reset_all_cooldowns confirm</code>",
             parse_mode="HTML"
         )
         return
 
-    # Perform the reset
     try:
         conn = get_tg_db()
         cur = conn.cursor()
-        # Assuming you store cooldowns in a separate table or as columns in tg_users
-        # Adjust the query based on your actual schema.
-        # Common patterns:
-        # 1. If you have columns like minute_count, hour_count, day_count in tg_users:
-        cur.execute("""
-            UPDATE tg_users
-            SET minute_count = 0, hour_count = 0, day_count = 0
-        """)
-        # 2. Or if you use a separate rate_limits table with user_id foreign key:
-        # cur.execute("UPDATE rate_limits SET minute_count = 0, hour_count = 0, day_count = 0")
 
+        # Reset all counters to 0 and timestamps to NULL (or current time if your logic requires it)
+        cur.execute("""
+            UPDATE tg_rate_limits
+            SET 
+                minute_count = 0,
+                hour_count = 0,
+                day_count = 0,
+                minute_reset = NULL,
+                hour_reset = NULL,
+                day_reset = NULL
+        """)
+
+        affected = cur.rowcount
         conn.commit()
         cur.close()
         conn.close()
 
-        affected = cur.rowcount  # number of rows updated
         await update.effective_message.reply_text(
-            f"✅ Cooldowns successfully reset for <b>{affected}</b> user(s).",
+            f"✅ <b>Global cooldown reset complete!</b>\n"
+            f"Rate limits cleared for <b>{affected}</b> user(s).",
             parse_mode="HTML"
         )
+
     except Exception as e:
         logging.error(f"reset_all_cooldowns failed: {e}")
-        await update.effective_message.reply_text(f"❌ Error resetting cooldowns: {str(e)}")
+        await update.effective_message.reply_text(
+            f"❌ Failed to reset global cooldowns:\n<code>{str(e)}</code>",
+            parse_mode="HTML"
+        )
 
 async def privacy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed = await record_user_and_check_ban(update, context)
