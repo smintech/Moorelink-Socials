@@ -2043,6 +2043,53 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 )
     await update.effective_message.reply_text(help_text, parse_mode="HTML")
 
+async def privacy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    allowed = await record_user_and_check_ban(update, context)
+    if not allowed:
+        await update.effective_message.reply_text("🚫 You are banned.")
+        return
+
+    privacy_text = (
+        "🔒 <b>Privacy Policy – MooreLinkBot (Social Helper)</b>\n\n"
+        
+        "Your privacy matters. Here's exactly what we do (and don't do):\n\n"
+        
+        "<b>✅ What we collect</b>\n"
+        "• Your Telegram user ID and chat ID – needed to send you updates\n"
+        "• The public usernames/handle you ask us to track (e.g., @elonmusk)\n"
+        "• Optional labels you give saved accounts\n"
+        "• Your invite count and referral data (to unlock benefits)\n\n"
+        
+        "<b>🚫 What we NEVER collect</b>\n"
+        "• No passwords or login credentials\n"
+        "• No access to your private accounts or DMs\n"
+        "• No phone number, email, or personal details beyond Telegram basics\n"
+        "• No browsing history or unrelated chat data\n\n"
+        
+        "<b>🔍 How your data is used</b>\n"
+        "• Solely to fetch and deliver public posts from the accounts you choose\n"
+        "• To manage your saved list, badges, and invite rewards\n"
+        "• Everything stays tied to your Telegram ID – nothing is shared or sold\n\n"
+        
+        "<b>🗄️ Storage & Deletion</b>\n"
+        "• Data is stored securely in an encrypted database\n"
+        "• Remove any saved account anytime with /saved_remove\n"
+        "• Stop using the bot or block it → we automatically clean inactive data\n"
+        "• Want full deletion? Just message the developer from /dashboard\n\n"
+        
+        "<b>🌐 Third parties</b>\n"
+        "We only fetch publicly available posts from X and Instagram. "
+        "No private APIs, no cookies, no logins required from you.\n\n"
+        
+        "<b>✨ Our promise</b>\n"
+        "Built as a non-commercial tool to help you escape the noise – "
+        "not to create more of it. We respect your attention and your privacy.\n\n"
+        
+        "<i>Questions? Reach out anytime via @israelmoorenewcomer → Contact Developer.</i> ❤️"
+    )
+    
+    await update.effective_message.reply_text(privacy_text, parse_mode="HTML", disable_web_page_preview=True)
+
 async def benefits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed = await record_user_and_check_ban(update, context)
     if not allowed:
@@ -2301,7 +2348,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("saved_send", message_handler))
     app.add_handler(CommandHandler("saved_remove", message_handler))
     app.add_handler(CommandHandler("saved_rename", message_handler))
-
+    app.add_handler(CommandHandler("privacy", privacy_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_handler(CommandHandler("forcemode", testmode_command))
