@@ -11,7 +11,7 @@ import logging
 from typing import Optional, List, Dict, Any
 from functools import wraps
 from datetime import datetime
-import tempfile
+import tempfile 
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -2043,6 +2043,50 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 )
     await update.effective_message.reply_text(help_text, parse_mode="HTML")
 
+@admin_only
+async def reset_all_cooldowns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin command: /reset_all_cooldowns
+    Resets rate-limit cooldown counters for every user in the database.
+    """
+    # Optional: add a confirmation step for safety
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.effective_message.reply_text(
+            "⚠️ This will reset cooldowns for <b>ALL</b> users.\n\n"
+            "To confirm, type:\n"
+            "<code>/reset_all_cooldowns confirm</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    # Perform the reset
+    try:
+        conn = get_tg_db()
+        cur = conn.cursor()
+        # Assuming you store cooldowns in a separate table or as columns in tg_users
+        # Adjust the query based on your actual schema.
+        # Common patterns:
+        # 1. If you have columns like minute_count, hour_count, day_count in tg_users:
+        cur.execute("""
+            UPDATE tg_users
+            SET minute_count = 0, hour_count = 0, day_count = 0
+        """)
+        # 2. Or if you use a separate rate_limits table with user_id foreign key:
+        # cur.execute("UPDATE rate_limits SET minute_count = 0, hour_count = 0, day_count = 0")
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        affected = cur.rowcount  # number of rows updated
+        await update.effective_message.reply_text(
+            f"✅ Cooldowns successfully reset for <b>{affected}</b> user(s).",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"reset_all_cooldowns failed: {e}")
+        await update.effective_message.reply_text(f"❌ Error resetting cooldowns: {str(e)}")
+
 async def privacy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed = await record_user_and_check_ban(update, context)
     if not allowed:
@@ -2352,7 +2396,7 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_handler(CommandHandler("forcemode", testmode_command))
-
+    app.add_handler(CommandHandler("reset_all_cooldowns", reset_all_cooldowns_command))
     async def set_command_visibility(application):
         public_cmds = [
             BotCommand("start", "Show welcome / menu"),
@@ -2378,6 +2422,7 @@ if __name__ == "__main__":
             BotCommand("user_stats", "View user stats"),
             BotCommand("broadcast", "Start a broadcast (admin only)"),
             BotCommand("export_csv", "Export users CSV (admin only)"),
+            BotCommand("reset_all_cooldowns", "Reset cooldown for ALL users (admin only)"),
         ]
 
         for admin_id in ADMIN_IDS:
