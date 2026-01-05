@@ -1,111 +1,102 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="A Telegram bot that fetches public data from X, Instagram, and Facebook profiles on demand and returns structured JSON. Built for reliability in an arms race.">
-</head>
-<body>
+# 🛰️ Moorelink Socials Scraper
 
-<h1>Moorelink Socials Scraper</h1>
+> **The Problem:** Social media platforms are engineered to maximize "Time on Site" through endless scrolling and algorithmic noise.  
+> **The Solution:** Moorelink is a high-precision extraction engine that bypasses the feed entirely, delivering structured, actionable data directly to Telegram. 
 
-<p>A Telegram bot that fetches public data from X, Instagram, and Facebook profiles on demand and returns it as structured JSON.</p>
+**Get the signal. Ignore the noise.**
 
-<p>I built this because off-the-shelf scrapers kept breaking every few weeks. Platforms change endpoints, fingerprints, and rate limits constantly. This version prioritizes reliability over feature bloat.</p>
+---
 
-<hr>
+## 🧠 Engineering Philosophy
 
-<h2>What it actually does</h2>
+Most scrapers are built for bulk data hoarding. Moorelink is built for **intentional consumption**.
 
-<ul>
-    <li>User picks a platform and sends a @username</li>
-    <li>Bot checks its local database for cached/recent data</li>
-    <li>If stale or missing, it runs a live fetch using current bypass techniques</li>
-    <li>Parses the raw response into clean JSON (posts, bio, followers, media URLs where available)</li>
-    <li>Sends the JSON back in Telegram</li>
-</ul>
+- **State-Aware Logic:** Instead of blind scraping, the engine queries a database to verify the "last-seen" state. If the data hasn't changed, we don't fetch. This preserves IP health and reduces compute overhead.
+- **Structured-First Delivery:** We don't just dump text. Raw HTML/JS is parsed into strict JSON schemas, ensuring that the Telegram delivery is clean, readable, and free of platform-specific bloat.
+- **Asynchronous Flow:** Built with Python’s `asyncio` to handle multiple platform requests without blocking the user-state verification.
 
-<p>No scheduled crawling. No bulk exports. On-demand only — because anything automated at scale gets blocked fast.</p>
+---
 
-<hr>
+## 📝 User Workflow
 
-<h2>Trade-offs I accepted</h2>
+1. **Platform Selection** — User selects a platform (X, Instagram, Facebook)
+2. **Target Identification** — User sends the target `@username`
+3. **State Verification** — Database is queried to verify the target and last-seen state
+4. **Live Fetch** — Engine performs a real-time scrape of the latest data
+5. **Data Structuring** — Raw content is parsed into clean, structured JSON
+6. **Delivery** — Final output is pushed to the user via Telegram
 
-<ul>
-    <li>Relies on a third-party scrapers API instead of maintaining my own headless browsers.<br>
-        Cheaper and less brittle than rolling Selenium/Playwright clusters, but adds one dependency.</li>
-    <li>Caches results in a simple database to avoid hammering the API on repeats.<br>
-        Means data can be minutes old, not seconds — I chose consistency over perfect freshness.</li>
-    <li>No support for private accounts or logged-in features.<br>
-        Public data only. Trying to do more invites instant bans.</li>
-    <li>Focused on three platforms. Adding more dilutes the bypass logic.</li>
-</ul>
+---
 
-<p>These weren't accidents. They were deliberate restraints to keep the bot running longer than a week.</p>
+## 🎥 Demo
 
-<hr>
+▶ [Watch the video demo on LinkedIn](https://www.linkedin.com/posts/israel-timi-99b339360_built-this-python-automation-bot-to-reduce-activity-7411577723371896832-IVzF?utm_medium=ios_app&rcm=ACoAAFnAGUcBUj5MzZln7aHj0BKPcS2K4I5sLwo&utm_source=social_share_video_v2&utm_campaign=copy_link)
 
-<h2>Setup</h2>
+---
 
-<pre><code>git clone https://github.com/smintech/Moorelink-Socials.git
-cd Moorelink-Socials</code></pre>
+## 🛠️ Technical Architecture
 
-<p>Create <code>.env</code>:</p>
+### 1. State Verification
+Before a fetch is triggered, the engine checks the `DATABASE_URL` to compare the target's current metadata against our records. This prevents redundant API calls and identifies "stale" targets.
 
-<pre><code>TELEGRAM_BOT_TOKEN=your_bot_token
-DATABASE_URL=your_postgres_or_sqlite_url
-SCRAPERS_API_KEY=your_third_party_api_key</code></pre>
+### 2. The Extraction Pipeline
+1. **Selection:** User-defined target (@username).
+2. **Bypass:** Implementation of rotation and header-spoofing to mimic organic traffic.
+3. **Parse:** Extraction of key entities (Post text, Timestamps, Media links).
+4. **Push:** Asynchronous delivery via Telegram Bot API.
 
-<p>Install:</p>
+---
 
-<pre><code>pip install -r requirements.txt</code></pre>
+## 🚀 Deployment & Setup
 
-<p>Run locally or deploy (Heroku, Render, Fly.io, etc.).</p>
+### 1️⃣ Clone the Repository
 
-<p>Bot starts in "awaiting username" mode.</p>
+```bash
+git clone https://github.com/smintech/Moorelink-Socials.git
+cd Moorelink-Socials
+```
 
-<hr>
+### 2️⃣ Environment Configuration
 
-<h2>Current reality (2026)</h2>
+Create a `.env` file in the root directory with the following content:
 
-<p>Scraping social platforms is an arms race. What works today can break tomorrow.</p>
+```env
+TELEGRAM_BOT_TOKEN=your_token_here
+DATABASE_URL=your_database_connection_string
+SCRAPER_API_KEY=your_api_here
+```
 
-<p>This repo stays useful as long as:</p>
-<ul>
-    <li>The third-party API keeps updating their bypasses (most paid ones do)</li>
-    <li>You don't abuse rate limits</li>
-</ul>
+> **Note:** The `SCRAPER_API_KEY` is required for reliable access to third-party scraping services (e.g., Bright Data, ScraperAPI, or Oxylabs) to handle anti-bot measures on platforms like Instagram and Facebook. Sign up for a free trial or paid plan from a reputable provider and insert your actual API key here for seamless operation.
 
-<p>If it stops working, the fix is usually updating the API integration or switching providers — not rewriting the whole scraper.</p>
+### 3️⃣ Install Dependencies
 
-<hr>
+```bash
+pip install -r requirements.txt
+# If any frontend/Node components are included:
+npm install
+```
 
-<h2>Contributing</h2>
+### 4️⃣ Launch
 
-<p>Welcome pulls that:</p>
-<ul>
-    <li>Improve parsing robustness</li>
-    <li>Add better error handling for API changes</li>
-    <li>Optimize caching logic</li>
-</ul>
+Deploy the bot (e.g., on Heroku, VPS, or Render) or run locally. The bot will initialize in the **awaiting username** state.
 
-<p>Open an issue first. No new platforms unless you maintain the bypass code.</p>
+---
 
-<hr>
+## 🤝 Contributing & License
 
-<h2>License</h2>
+**Non-Commercial Use Only**
 
-<p>Non-commercial use only. No selling, no SaaS wrappers, no paid services built on this.</p>
+Contributions are welcome in areas such as:
+- Optimizing fetch logic
+- Improving bypass techniques
+- Refining JSON parsing
 
-<p>See LICENSE file.</p>
+**Process:** Open an issue before submitting a Pull Request.  
+**Restrictions:** Selling, renting, or monetizing this software or services built on it is strictly prohibited under the Non-Commercial [📄 License](LICENSE).
 
-<hr>
+---
 
-<h2>Author</h2>
+## 👤 Author
 
-<p><strong>smintech</strong><br>
-<a href="https://github.com/smintech">GitHub</a> ·
-<a href="https://www.linkedin.com/in/israel-timi-99b339360">LinkedIn: Israel Timi</a></p>
-
-</body>
-</html>
+**smintech**  
+[GitHub](https://github.com/smintech) · [LinkedIn](https://www.linkedin.com/in/israel-timi-99b339360?utm_source=share&utm_campaign=share_via&utm_content=profile&utm_medium=ios_app)
