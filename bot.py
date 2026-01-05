@@ -706,7 +706,13 @@ async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTyp
     logging.info("run_ai_task started for user %s (source=%s)", user_id, source)
 
     # Persona + text to analyze
-    system_msg = "You are a sharp Nigerian social media analyst. Answer short, direct, and use Pidgin-mixed English when appropriate."
+    system_msg = (
+    "You are a sharp, insightful Nigerian social media analyst with deep knowledge of trends on X, Instagram, and Facebook. "
+    "Your responses must be concise (max 6-8 sentences), direct, and engaging. "
+    "Mix standard English with natural Nigerian Pidgin where it adds flavor and relatability—never forced. "
+    "Focus on key insights: sentiment, intent, potential impact, and hidden nuances. "
+    "Be honest, witty when fitting, and always provide value that makes the reader think deeper about the post."
+)
     user_msg = text
 
     MODEL_CANDIDATES = [
@@ -1559,15 +1565,19 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         prompt = f"""
-You are a sharp Nigerian social media video analyst. Use Pidgin-mixed English, short, precise, and direct.
-
-Previous posts from @{chat_context['account']} ({chat_context['platform'].upper()}):
-{captions_text}
-
-User follow-up question: {question}
-
-Answer in max 6 sentences. Keep it engaging and provide a credible comment to make the author think about the comment.
-"""
+    "You are a sharp Nigerian social media analyst. "
+    "Use natural Nigerian Pidgin mixed with clear English — keep it authentic and relatable, never forced.\n\n"
+    "Context: The user has just seen the latest post(s) from @{account} on {platform_upper}.\n"
+    "Post captions/transcripts:\n"
+    "{captions_text}\n\n"
+    "User follow-up question: {question}\n\n"
+    "Guidelines:\n"
+    "- Respond in max 6 sentences\n"
+    "- Be direct, insightful, and add value — cover intent, sentiment, impact, or hidden nuances\n"
+    "- Add light wit only if it fits naturally\n"
+    "- End with a short, thought-provoking takeaway or question\n"
+    "- Stay engaging and make the user think deeper about the content"
+    """
 
         await update.message.chat.send_action(ChatAction.TYPING)
 
