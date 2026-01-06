@@ -1603,7 +1603,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return  # message consumed – keep ai_chat_active flag alive!  # consume the message
     # Manual AI Analysis (Admin only, button-driven - NOW MULTI-TURN!)
-    if context.user_data.get("awaiting_manual_ai"):
+    elif context.user_data.get("awaiting_manual_ai"):
         if not is_admin(uid):
             context.user_data.pop("awaiting_manual_ai", None)
             await update.effective_message.reply_text("❌ Only admins can use Manual AI.")
