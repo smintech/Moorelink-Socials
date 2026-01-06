@@ -1032,33 +1032,33 @@ BADGE_LEVELS = [
         "emoji": "🪪",
         "invites_needed": 0,
         "save_slots": 5,                     # Fair starter
-        "limits": {"min": 2, "hour": 12, "day": 30}   # Stricter: only 2/min, 12/hour
+        "limits": {"min": 2, "hour": 5, "day": 10}   # Stricter: only 2/min, 12/hour
     },
     {
         "name": "Bronze",
         "emoji": "🥉",
-        "invites_needed": 8,
+        "invites_needed": 5,
         "save_slots": 10,
-        "limits": {"min": 4, "hour": 30, "day": 80}
+        "limits": {"min": 4, "hour": 10, "day": 15}
     },
     {
         "name": "Silver",
         "emoji": "🥈",
-        "invites_needed": 25,
+        "invites_needed": 15,
         "save_slots": 15,
-        "limits": {"min": 8, "hour": 70, "day": 200}
+        "limits": {"min": 8, "hour": 15, "day": 20}
     },
     {
         "name": "Gold",
         "emoji": "🥇",
-        "invites_needed": 60,
+        "invites_needed": 25,
         "save_slots": 25,
-        "limits": {"min": 15, "hour": 150, "day": 500}
+        "limits": {"min": 15, "hour": 20, "day": 25}
     },
     {
         "name": "Diamond",
         "emoji": "💎",
-        "invites_needed": 150,
+        "invites_needed": 100,
         "save_slots": float('inf'),          # Unlimited
         "limits": {"min": float('inf'), "hour": float('inf'), "day": float('inf')}
     },
