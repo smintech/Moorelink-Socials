@@ -718,7 +718,7 @@ async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTyp
     MODEL_CANDIDATES = [
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
-        "llama-guard-3-8b",
+        "openai/gpt-oss-120b",
     ]
 
     try:
