@@ -87,6 +87,13 @@ PAGE_SIZE_USERS = 10
 LEADERBOARD_LIMIT = 10
 TEST_MODE = {"enabled": False}
 # ================ HELPERS ================
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
 ai_tasks: Dict[int, asyncio.Task] = {}
 def is_admin(user_id: Optional[int]) -> bool:
     return bool(user_id and user_id in ADMIN_IDS)
