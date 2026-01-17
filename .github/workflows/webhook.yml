@@ -1,0 +1,19 @@
+name: Scheduled Webhook
+
+on:
+  schedule:
+    - cron: "0,10,20,30,40,50 10-22 * * *"
+  workflow_dispatch:
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call webhook
+        run: |
+          curl -X POST https://moorelink-socials-435o.onrender.com/health \
+            -H "Content-Type: application/json" \
+            -d '{
+              "type": "health",
+              "time": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"
+            }'
