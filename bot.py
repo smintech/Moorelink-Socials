@@ -2475,9 +2475,9 @@ if __name__ == "__main__":
         print(f"[startup] init_tg_db() failed or not available: {e}")
 
     print("🤖 MooreLinkBot (full) started — with Groq AI, only new posts, Diamond/Admin unlimited chat!")
-    app.run_polling(
-    drop_pending_updates=True,
-    timeout=60,  # Longer for long-polls
-    poll_interval=1,
-    allowed_updates=["message", "callback_query"]  # Optimize
+    app.run_webhook(
+    listen="0.0.0.0",
+    port=port,
+    url_path=TELEGRAM_TOKEN,
+    webhook_url=f"https://moorelink-socials-435o.onrender.com/{TELEGRAM_TOKEN}"
 )
