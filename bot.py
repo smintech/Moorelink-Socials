@@ -2397,7 +2397,9 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================ REGISTER & RUN ================
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
+    
+    port = int(os.getenv("PORT", "8000"))
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("help", help_command))
