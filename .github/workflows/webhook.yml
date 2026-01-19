@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Call webhook
         run: |
-          curl -X POST https://waha-74hs.onrender.com/api/server/status\
+          curl -X POST https://waha-74hs.onrender.com/api/server/status \
             -H "Content-Type: application/json" \
             -d '{
               "type": "health",
