@@ -6,11 +6,11 @@ from telegram.constants import ChatAction
 from openai import AsyncOpenAI
 import os
 
-from settings import *
-from helpers import *
-from ui import *
-from fetch import *
-from ai import *
+from .settings import *
+from .helpers import *
+from .ui import *
+from .fetch import *
+from .ai import *
 from Utils.utils import *
 
 logger = logging.getLogger(__name__)
