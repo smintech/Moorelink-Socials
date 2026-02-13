@@ -10,30 +10,12 @@ from telegram.ext import (
     filters,
 )
 
-from settings import TELEGRAM_TOKEN
-from commands import (
-    start,
-    menu,
-    help_command,
-    benefits_command,
-    dashboard_command,
-    leaderboard_command,
-    admin_command,
-    ban_command,
-    unban_command,
-    reset_cooldown_command,
-    user_stats_command,
-    export_csv_command,
-    cancel_command,
-    latest_command,
-    testmode_command,
-    reset_all_cooldowns_command,
-    privacy_command,
-    set_command_visibility,
-)
-from callback import callback_handler
-from message import message_handler
-from utils import init_tg_db
+from Bot.settings import *
+from Bot.commands import *
+
+from Bot.callback import *
+from Bot.message import *
+from Utils.utils import *
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
