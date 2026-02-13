@@ -8,7 +8,7 @@ from .helpers import *
 from .ui import *
 from .fetch import *
 from Utils.utils import *
-
+from typing import Dict, Optional, Any, Tuple, Callable, List
 logger = logging.getLogger(__name__)
 
 # Global AI tasks dict (needed for cancellation)
