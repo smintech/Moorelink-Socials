@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 from telegram import Update, Message, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.error import TelegramError
-from Bot.settings import TEST_MODE
+from settings import TEST_MODE
 from Utils.utils import *
 
 logger = logging.getLogger(__name__)
