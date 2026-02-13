@@ -9,11 +9,7 @@ from telegram import Update, Message, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 from Bot.settings import TEST_MODE
-from utils import (
-    add_or_update_tg_user,
-    increment_tg_request_count,
-    get_tg_user,
-)
+from Utils.utils import *
 
 logger = logging.getLogger(__name__)
 
