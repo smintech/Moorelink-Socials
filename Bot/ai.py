@@ -3,7 +3,7 @@ import asyncio
 import logging
 from openai import AsyncOpenAI
 from telegram.ext import ContextTypes
-
+from typing import Dict, Optional, Any, Tuple, Callable, List
 # Global dictionary to track running AI tasks
 ai_tasks: Dict[int, asyncio.Task] = {}
 
