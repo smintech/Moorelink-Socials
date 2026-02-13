@@ -6,11 +6,11 @@ from .config import *
 from .persistence import *
 
 # Import fetchers
-from fetchers.x import *
-from fetchers.ig import *
-from fetchers.fb import *
-from fetchers.yt import *
-from fetchers.ai import *
+from .fetchers.x import *
+from .fetchers.ig import *
+from .fetchers.fb import *
+from .fetchers.yt import *
+from .fetchers.ai import *
 
 logging.basicConfig(level=logging.INFO)
 
