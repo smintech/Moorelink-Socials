@@ -2,8 +2,8 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
-from settings import *
-from helpers import *
+from .settings import *
+from .helpers import *
 from Utils.utils import *
 
 logger = logging.getLogger(__name__)
