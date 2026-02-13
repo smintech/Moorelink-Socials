@@ -7,7 +7,7 @@ from typing import List, Optional, Dict, Any
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from config import * # for DB URLs
+from .config import * # for DB URLs
 
 # ================ DB CONNECTIONS ============
 def get_db():
