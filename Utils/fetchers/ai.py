@@ -3,7 +3,7 @@ from typing import List, Dict
 
 from openai import AsyncOpenAI
 
-from Utils.config import *
+from ..config import *
 
 async def call_social_ai(platform: str, account: str, posts: List[Dict]) -> str:
     if not posts:
