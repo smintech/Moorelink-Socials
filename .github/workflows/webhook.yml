@@ -1,9 +1,9 @@
 name: Scheduled Webhook
 
-on:
-  schedule:
-    - cron: "*/5* * * *"
-  workflow_dispatch:
+#on:
+  #schedule:
+    #- cron: "*/5* * * *"
+  #workflow_dispatch:
 
 jobs:
   heartbeat:
