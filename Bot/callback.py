@@ -6,6 +6,7 @@ from telegram.ext import ContextTypes
 from .settings import *
 from .helpers import *
 from .ui import *
+from .commands import *
 from .fetch import *
 from Utils.utils import *
 from typing import Dict, Optional, Any, Tuple, Callable, List
