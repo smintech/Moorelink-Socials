@@ -5,6 +5,7 @@ from telegram.constants import ChatAction
 from .settings import *
 from .helpers import *
 from Utils.utils import *
+from typing import Dict, Optional, Any, Tuple, Callable, List
 
 logger = logging.getLogger(__name__)
 
