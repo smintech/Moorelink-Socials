@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Optional
+from typing import Dict, Optional, Any, Tuple, Callable, List
 from functools import wraps
 from telegram import Update
 from telegram.ext import ContextTypes
