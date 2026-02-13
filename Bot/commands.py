@@ -1,1841 +1,30 @@
-import urllib.request
-from urllib.parse import urlparse
-import io
-import os
-import asyncio
-import csv
 import math
 import logging
-from typing import Optional, List, Dict, Any
-from functools import wraps
-from datetime import datetime
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputFile,
-    BotCommand,
-    BotCommandScopeDefault,
-    BotCommandScopeChat,
-    Message,
-)
-from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters, CommandHandler
-from telegram.constants import ChatAction
-from telegram.error import TelegramError
-from openai import AsyncOpenAI
-
-# Local imports
-from Utils.utils import (
-    fetch_latest_urls,
-    fetch_ig_urls,
-    add_or_update_tg_user,
-    increment_tg_request_count,
-    get_tg_user,
-    ban_tg_user,
-    unban_tg_user,
-    list_active_tg_users,
-    list_all_tg_users,
-    save_user_account,
-    list_saved_accounts,
-    get_saved_account,
-    remove_saved_account,
-    count_saved_accounts,
-    update_saved_account_label,
-    init_tg_db,
+from telegram import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+from telegram.ext import ContextTypes
+from Bot.settings import ADMIN_IDS, LEADERBOARD_LIMIT, TEST_MODE
+from Bot.helpers import get_invite_link, record_user_and_check_ban, schedule_delete
+from Bot.ui import build_main_menu, build_admin_menu, build_confirm_markup, build_back_markup
+from Bot.fetch import handle_fetch_and_ai
+from Bot.ai import ai_tasks
+from utils import (
     get_user_badge,
-    increment_invite_count,
-    check_and_increment_cooldown,
-    get_user_stats,
-    reset_cooldown,
+    get_tg_user,
+    count_saved_accounts,
     BADGE_LEVELS,
     get_tg_db,
+    ban_tg_user,
+    unban_tg_user,
+    reset_cooldown,
+    get_user_stats,
     create_user_if_missing,
-    extract_post_id,
-    is_post_new,
-    mark_posts_seen,
-    call_social_ai,
-    fetch_fb_urls,
-    POST_LIMIT,
-    fetch_yt_videos,
-)
-from Bot.settings import (
-    TELEGRAM_TOKEN,
-    ADMIN_IDS,
-    POSTS_PER_PAGE,
-    PAGE_SIZE_USERS,
-    LEADERBOARD_LIMIT,
-    TEST_MODE,
-    is_admin,
-    admin_only,
+    increment_invite_count,
+    list_active_tg_users,
+    list_all_tg_users,
 )
 
 logger = logging.getLogger(__name__)
 
-# Global dictionary to track running AI tasks
-ai_tasks: Dict[int, asyncio.Task] = {}
-
-# ================ HELPERS ================
-def get_invite_link(bot_username: str, user_id: int) -> str:
-    return f"https://t.me/{bot_username}?start={user_id}"
-
-def normalize_account(account: str, platform: str) -> str:
-    acct = (account or "").strip()
-    # Remove query parameters and trailing slashes
-    acct = acct.split('?')[0].rstrip('/')
-    # Extract from URL if necessary
-    if acct.startswith('http'):
-        parsed = urlparse(acct)
-        path = parsed.path.strip('/')
-        parts = [p for p in path.split('/') if p]
-        if parts:
-            if platform in ('ig', 'x', 'fb'):
-                acct = parts[0]
-            elif platform == 'yt':
-                acct = parts[-1]
-            else:
-                acct = parts[0]
-        else:
-            acct = parsed.netloc
-    # Final cleanup: remove leading @ and whitespace
-    acct = acct.lstrip("@").strip()
-    return acct
-
-async def safe_edit(callback_query, text: str, parse_mode=None, reply_markup=None):
-    """Safely edit text or caption. Falls back to new message if impossible."""
-    try:
-        msg = callback_query.message
-        if msg.text:
-            await callback_query.edit_message_text(
-                text=text, parse_mode=parse_mode, reply_markup=reply_markup
-            )
-            return
-        if msg.caption:
-            await callback_query.edit_message_caption(
-                caption=text, parse_mode=parse_mode, reply_markup=reply_markup
-            )
-            return
-        await msg.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-    except TelegramError as e:
-        logging.warning("safe_edit failed: %s", e.message)
-        try:
-            await callback_query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-        except Exception:
-            await callback_query.answer("Action completed.", show_alert=True)
-
-async def safe_send_media_or_link(
-    chat: Any,
-    context: ContextTypes.DEFAULT_TYPE,
-    media_url: str,
-    is_video: bool = False,
-    caption: str = "",
-    parse_mode: Optional[str] = None,
-    reply_markup: Optional[InlineKeyboardMarkup] = None
-) -> Optional[Message]:
-    """Robustly send media by URL with fallbacks."""
-    bot = context.bot
-    reply_target = chat if isinstance(chat, Message) else None
-    chat_id = chat.chat.id if isinstance(chat, Message) else getattr(getattr(chat, "chat", None), "id", None)
-    if chat_id is None:
-        logger.error("safe_send_media_or_link: cannot determine chat_id")
-        return None
-
-    media_url = (media_url or "").strip()
-    caption = (caption or "").strip() or "Post preview"
-
-    def is_valid_url(url: str) -> bool:
-        try:
-            parsed = urlparse(url)
-            return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-        except Exception:
-            return False
-
-    async def send(method: str, **kwargs):
-        if reply_target:
-            return await getattr(reply_target, f"reply_{method}")(**kwargs)
-        else:
-            return await getattr(bot, f"send_{method}")(chat_id=chat_id, **kwargs)
-
-    try:
-        if media_url and is_valid_url(media_url):
-            if is_video:
-                try:
-                    return await send("video", video=media_url, caption=caption,
-                                      parse_mode=parse_mode, reply_markup=reply_markup)
-                except Exception as e:
-                    logger.debug("send_video failed: %s → trying document", e)
-            else:
-                try:
-                    return await send("photo", photo=media_url, caption=caption,
-                                      parse_mode=parse_mode, reply_markup=reply_markup)
-                except Exception as e:
-                    logger.debug("send_photo failed: %s → trying document", e)
-
-            # Fallback to document
-            return await send("document", document=media_url, caption=caption,
-                              parse_mode=parse_mode, reply_markup=reply_markup)
-
-    except Exception as e:
-        logger.warning("Media send failed for %s: %s", media_url, e)
-
-    # Final text fallback
-    try:
-        fallback_text = f"{caption}\n\n🔗 <a href='{media_url}'>View original media</a>" if media_url and is_valid_url(media_url) else caption
-        parse_mode_fallback = "HTML" if "<a href" in fallback_text else parse_mode
-        if reply_target:
-            return await reply_target.reply_text(
-                text=fallback_text,
-                parse_mode=parse_mode_fallback,
-                disable_web_page_preview=False,
-                reply_markup=reply_markup
-            )
-        else:
-            return await bot.send_message(
-                chat_id=chat_id,
-                text=fallback_text,
-                parse_mode=parse_mode_fallback,
-                disable_web_page_preview=False,
-                reply_markup=reply_markup
-            )
-    except Exception as e:
-        logger.error("Final text fallback failed: %s", e)
-        return None
-
-async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only toggle for test mode."""
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("❌ Admins only.")
-        return
-    args = context.args or []
-    if not args:
-        status = "ON" if TEST_MODE["enabled"] else "OFF"
-        await update.effective_message.reply_text(
-            f"Test mode is currently: {status}\n\nUsage: /testmode on|off|toggle|status"
-        )
-        return
-
-    cmd = args[0].lower()
-    if cmd in ("on", "enable", "1"):
-        TEST_MODE["enabled"] = True
-        await update.effective_message.reply_text("✅ Test mode ENABLED — bot will force-send posts seen before.")
-    elif cmd in ("off", "disable", "0"):
-        TEST_MODE["enabled"] = False
-        await update.effective_message.reply_text("❌ Test mode DISABLED — normal behavior restored.")
-    elif cmd in ("toggle", "switch"):
-        TEST_MODE["enabled"] = not TEST_MODE["enabled"]
-        await update.effective_message.reply_text(f"Test mode now: {'ON' if TEST_MODE['enabled'] else 'OFF'}")
-    elif cmd == "status":
-        await update.effective_message.reply_text(f"Test mode is {'ON' if TEST_MODE['enabled'] else 'OFF'}")
-    else:
-        await update.effective_message.reply_text("Unknown arg. Use: on|off|toggle|status")
-
-async def send_ai_button(message, count, platform, account, badge, context=None, auto_delete_after: int | None = None):
-    """Send the AI analyze button."""
-    button_text = f"Analyze {count} new post(s) with AI 🤖"
-    if badge['name'] in ('Diamond', 'Admin'):
-        button_text += " (Unlimited)"
-
-    analyze_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(button_text, callback_data=f"ai_analyze_{platform}_{account}")
-    ]])
-
-    final_msg = await message.reply_text(
-        f"✨ {count} new post(s) processed!\nTap below for sharp AI breakdown:",
-        reply_markup=analyze_kb
-    )
-
-    if auto_delete_after and context and getattr(context, "job_queue", None):
-        try:
-            context.job_queue.run_once(
-                lambda c: c.bot.delete_message(chat_id=final_msg.chat.id, message_id=final_msg.message_id),
-                when=auto_delete_after,
-                data=None
-            )
-        except Exception as e:
-            logging.debug("Failed to schedule AI button deletion: %s", e)
-
-    return final_msg
-
-async def send_next_post_with_confirmation(update_or_query, context: ContextTypes.DEFAULT_TYPE, platform: str, account: str):
-    """Robust preview sender: edits previous message if possible, otherwise sends new one."""
-    user_data_key = f"pending_posts_{platform}_{account}"
-    pending = context.user_data.get(user_data_key)
-
-    cq = getattr(update_or_query, "callback_query", None)
-    message = None
-    uid = None
-
-    if cq:
-        try:
-            await cq.answer()
-        except Exception:
-            pass
-        message = cq.message
-        uid = cq.from_user.id
-    elif hasattr(update_or_query, "effective_message") and update_or_query.effective_message:
-        message = update_or_query.effective_message
-        uid = getattr(update_or_query.effective_user, "id", None)
-    elif hasattr(update_or_query, "message") and update_or_query.message:
-        message = update_or_query.message
-        uid = getattr(update_or_query.from_user, "id", None)
-
-    if not pending or pending.get("index", 0) >= pending.get("total", 0):
-        if not uid and message and getattr(message, "from_user", None):
-            uid = message.from_user.id
-        if not uid:
-            logger.warning("Cannot determine user id; clearing pending.")
-            context.user_data.pop(user_data_key, None)
-            return
-
-        badge = get_user_badge(uid)
-        posts_to_store = pending.get("posts", [])[:] if pending else context.user_data.get(f"last_ai_context_{platform}_{account}", [])
-        context.user_data[f"last_ai_context_{platform}_{account}"] = posts_to_store
-
-        processed = pending.get("index", 0) if pending else 0
-        total = pending.get("total", processed) if pending else len(posts_to_store)
-
-        target = message or update_or_query
-        await send_ai_button(target, max(processed, total), platform, account, badge, context=context, auto_delete_after=None)
-        context.user_data.pop(user_data_key, None)
-        return
-
-    chat_for_send = message or getattr(update_or_query, "effective_chat", None)
-    if not chat_for_send:
-        logger.warning("No chat available to send preview.")
-        return
-
-    if not uid and getattr(message, "from_user", None):
-        uid = message.from_user.id
-
-    current_idx = pending.get("index", 0)
-    posts = pending.get("posts", [])
-    if current_idx >= len(posts):
-        logger.warning("Index out of range; clearing pending.")
-        context.user_data.pop(user_data_key, None)
-        return
-
-    post = posts[current_idx]
-
-    view_text = {"x": "View on 𝕏", "fb": "View on Facebook ⓕ", "ig": "View on Instagram 🅮", "yt": "View on YouTube 📺"}.get(platform, "View Post 🔗")
-    link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
-    caption = (post.get("caption") or "")[:1024]
-    full_caption = f"{link_html}\n\n{caption}" if link_html else caption
-    preview_text = (full_caption + "\n\nMove to next post⏭️?") if full_caption else "Move to next post⏭️?"
-
-    total_posts = pending.get("total", len(posts))
-    keyboard_rows = [[
-        InlineKeyboardButton(f"✅ Send this post ({current_idx + 1}/{total_posts})",
-                             callback_data=f"confirm_post_{platform}_{account}_{current_idx}"),
-        InlineKeyboardButton("⏭️ Skip this post", callback_data=f"skip_post_{platform}_{account}_{current_idx}")
-    ]]
-    if not pending.get("has_sent_single", False):
-        remaining = max(0, total_posts - current_idx)
-        if remaining > 1:
-            keyboard_rows.append([InlineKeyboardButton(f"✅ Send all remaining ({remaining})",
-                                                      callback_data=f"send_all_{platform}_{account}")])
-    keyboard_rows.append([InlineKeyboardButton("❌ Cancel remaining", callback_data=f"cancel_posts_{platform}_{account}")])
-    keyboard = InlineKeyboardMarkup(keyboard_rows)
-
-    sent_preview = False
-    preview_msg = None
-    edited = False
-
-    if message and getattr(message, "text", None) is not None:
-        if getattr(message, "from_user", None) and message.from_user.is_bot:
-            try:
-                await asyncio.wait_for(
-                    context.bot.edit_message_text(
-                        chat_id=message.chat.id,
-                        message_id=message.message_id,
-                        text=preview_text,
-                        parse_mode="HTML",
-                        reply_markup=keyboard
-                    ),
-                    timeout=8.0
-                )
-                sent_preview = True
-                preview_msg = message
-                edited = True
-                logger.info("Successfully edited preview message (idx %s)", current_idx)
-            except Exception as e:
-                logger.debug("Edit failed (will send new): %s", e)
-
-    if not sent_preview:
-        preview_msg = await safe_send_media_or_link(
-            chat=chat_for_send,
-            context=context,
-            media_url=post.get("media_url"),
-            is_video=post.get("is_video", False),
-            caption=preview_text,
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
-        if preview_msg:
-            sent_preview = True
-            logger.info("Sent new preview message (idx %s, msg_id %s)", current_idx, preview_msg.message_id)
-        else:
-            logger.error("Failed to send any preview for idx %s", current_idx)
-
-    if not sent_preview:
-        failed_list = pending.setdefault("failed", [])
-        failed_list.append({"index": current_idx, "post_id": post.get("post_id"), "reason": "preview_send_failed"})
-        logger.info("Preview completely failed for idx %s — marking failed and advancing", current_idx)
-    else:
-        logger.info("Preview shown successfully for idx %s", current_idx)
-
-    pending["index"] = current_idx + 1
-    context.user_data[user_data_key] = pending
-
-    try:
-        if preview_msg:
-            await schedule_delete(context, preview_msg.chat.id, preview_msg.message_id)
-        if edited and message:
-            await schedule_delete(context, message.chat.id, message.message_id)
-    except Exception as e:
-        logger.debug("Failed to schedule delete: %s", e)
-
-async def download_media(url: str) -> bytes:
-    """Download media using urllib (no external deps) – async compatible."""
-    loop = asyncio.get_event_loop()
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
-                "Referer": "https://www.facebook.com/"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=30) as response:
-            if response.status == 200:
-                data = response.read()
-                if len(data) > 50 * 1024 * 1024:
-                    logging.warning(f"Media too large ({len(data)/1024/1024:.1f}MB): {url}")
-                    return None
-                return data
-            else:
-                logging.warning(f"Download failed {url} - status {response.status}")
-                return None
-    except Exception as e:
-        logging.error(f"Download error {url}: {e}")
-        return None
-
-# ================ UI BUILDERS ================
-def build_main_menu():
-    keyboard = [
-        [InlineKeyboardButton("X (Twitter)𝕏", callback_data="menu_x")],
-        [InlineKeyboardButton("Instagram🅾", callback_data="menu_ig")],
-        [InlineKeyboardButton("Facebookⓕ", callback_data="menu_fb")],
-        [InlineKeyboardButton("YouTube📹", callback_data="menu_yt")],
-        [InlineKeyboardButton("Saved usernames", callback_data="saved_menu")],
-        [InlineKeyboardButton("👤 Dashboard", callback_data="dashboard")],
-        [InlineKeyboardButton("Help / Guide", callback_data="help")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def build_saved_menu():
-    keyboard = [
-        [InlineKeyboardButton("➕ Add saved username", callback_data="saved_add_start")],
-        [InlineKeyboardButton("📋 My saved usernames", callback_data="saved_list")],
-        [InlineKeyboardButton("↩️ Back", callback_data="menu_main")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def build_admin_menu():
-    keyboard = [
-        [InlineKeyboardButton("👥 List users", callback_data="admin_list_users_0")],
-        [InlineKeyboardButton("📊 Leaderboard", callback_data="admin_leaderboard")],
-        [InlineKeyboardButton("📤 Broadcast", callback_data="admin_broadcast_start")],
-        [InlineKeyboardButton("📥 Export CSV", callback_data="admin_export_csv")],
-        [InlineKeyboardButton("🧠 Manual AI Analyze", callback_data="admin_ai_start")],
-        [InlineKeyboardButton("↩️ Back", callback_data="menu_main")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def build_back_markup(target="menu_main", label="↩️ Back"):
-    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])
-
-def build_cancel_and_back(cancel_cb="admin_broadcast_cancel", back_cb="admin_back"):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Cancel", callback_data=cancel_cb)],
-        [InlineKeyboardButton("↩️ Back", callback_data=back_cb)],
-    ])
-
-def build_confirm_markup(action: str, obj_id: Optional[int] = None, yes_label="Confirm", no_label="Cancel"):
-    if obj_id is None:
-        yes_cb = f"confirm_{action}"
-    else:
-        yes_cb = f"confirm_{action}_{obj_id}"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(yes_label, callback_data=yes_cb)],
-        [InlineKeyboardButton(no_label, callback_data="admin_back")]
-    ])
-
-# ================ UTIL: CSV ================
-def users_to_csv_bytes(users: List[Dict[str, Any]]) -> bytes:
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["telegram_id", "first_name", "is_active", "is_banned", "request_count", "last_request_at", "joined_at", "invite_count"])
-    for u in users:
-        writer.writerow([
-            u.get("telegram_id"),
-            u.get("first_name"),
-            u.get("is_active"),
-            u.get("is_banned"),
-            u.get("request_count"),
-            u.get("last_request_at"),
-            u.get("joined_at"),
-            u.get("invite_count"),
-        ])
-    return buf.getvalue().encode("utf-8")
-
-# ================ RECORD + BAN CHECK ================
-async def record_user_and_check_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    if not user:
-        return True
-    tid = user.id
-    first_name = user.first_name or ""
-    try:
-        add_or_update_tg_user(tid, first_name)
-    except Exception:
-        pass
-    try:
-        increment_tg_request_count(tid)
-    except Exception:
-        pass
-    try:
-        row = get_tg_user(tid)
-        if row and int(row.get("is_banned", 0)) == 1:
-            return False
-    except Exception:
-        pass
-    return True
-
-# ================ DELETE JOB ================
-async def delete_message(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    data = job.data
-    try:
-        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
-    except Exception:
-        pass
-
-async def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_seconds: int = 86400):
-    if context.job_queue:
-        context.job_queue.run_once(
-            delete_message,
-            when=delay_seconds,
-            data={"chat_id": chat_id, "message_id": message_id},
-            name=f"delete_{message_id}"
-        )
-
-# ================ UNIFIED FETCH & AI BUTTON ================
-async def handle_fetch_and_ai(update, context, platform, account, query=None, force: bool = False):
-    uid = update.effective_user.id
-    message = query.message if query else update.effective_message
-
-    if TEST_MODE.get("enabled"):
-        force = True
-
-    force_send = TEST_MODE.get("enabled", False)
-
-    if is_admin(uid):
-        pass  # no cooldown
-    else:
-        cooldown_msg = check_and_increment_cooldown(uid)
-        if cooldown_msg:
-            await message.reply_text(cooldown_msg)
-            return
-
-    await message.chat.send_action(ChatAction.TYPING)
-
-    # Fetch raw posts
-    if platform == "x":
-        raw_posts = fetch_latest_urls("x", account)
-        post_list = [{"post_id": extract_post_id("x", url), "post_url": url, "caption": ""} for url in raw_posts]
-    elif platform == "ig":
-        raw_ig = fetch_ig_urls(account)
-        post_list = []
-        for p in raw_ig:
-            pid = extract_post_id("ig", p['url'])
-            post_list.append({
-                "post_id": pid,
-                "post_url": p['url'],
-                "caption": p.get("caption", ""),
-                "media_url": p.get("media_url"),
-                "is_video": p.get("is_video", False)
-            })
-    elif platform == "fb":
-        raw_fb = fetch_fb_urls(account)
-        post_list = []
-        for p in raw_fb:
-            pid = p.get("post_id") or p.get("post_url", "")
-            post_list.append({
-                "post_id": pid,
-                "post_url": p['post_url'],
-                "caption": p.get("caption", ""),
-                "media_url": p.get("media_url"),
-                "is_video": p.get("is_video", False)
-            })
-    elif platform == "yt":
-        raw_yt = fetch_yt_videos(channel_handle=account)
-        post_list = []
-        for v in raw_yt:
-            post_list.append({
-                "post_id": v["post_id"],
-                "post_url": v["post_url"],
-                "caption": v["caption"],
-                "media_url": v["media_url"],
-                "is_video": True
-            })
-    else:
-        await message.reply_text("Unsupported platform.")
-        return
-
-    clean_account = normalize_account(account, platform)
-
-    new_posts = [p for p in post_list if is_post_new(uid, platform, clean_account, p['post_id'])]
-
-    if force_send:
-        logging.info("🧪 Force mode ACTIVE for user %s — sending latest posts (ignoring seen status)", uid)
-        new_posts = post_list[:POST_LIMIT]
-        mark_posts_seen(uid, platform, clean_account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
-    elif not new_posts:
-        await message.reply_text(f"No new posts from @{clean_account} since your last check.")
-        return
-    else:
-        mark_posts_seen(uid, platform, clean_account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
-
-    context.user_data[f"pending_posts_{platform}_{clean_account}"] = {
-        "posts": new_posts,
-        "index": 0,
-        "total": len(new_posts),
-        "has_sent_single": False
-    }
-    context.user_data[f"last_ai_context_{platform}_{clean_account}"] = new_posts
-
-    if not new_posts:
-        return
-
-    await send_next_post_with_confirmation(update, context, platform, clean_account)
-
-# ================ IMPROVED MANUAL AI TASK ================
-async def run_ai_task(user_id: int, text: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, source: str = "manual"):
-    logging.info("run_ai_task started for user %s (source=%s)", user_id, source)
-
-    system_msg = (
-        "You are a sharp, insightful Nigerian social media analyst with deep knowledge of trends on X, Instagram, and Facebook. "
-        "Your responses must be concise (max 6-8 sentences), direct, and engaging. "
-        "Mix standard English with natural Nigerian Pidgin where it adds flavor and relatability—never forced. "
-        "Focus on key insights: sentiment, intent, potential impact, and hidden nuances. "
-        "Be honest, witty when fitting, and always provide value that makes the reader think deeper about the post."
-    )
-    user_msg = text
-
-    MODEL_CANDIDATES = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "openai/gpt-oss-120b",
-    ]
-
-    try:
-        api_key = os.getenv("GROQ_KEY")
-        if not api_key:
-            logging.error("GROQ_API_KEY not set")
-            await context.bot.send_message(chat_id=chat_id, text="❌ Server misconfigured: missing GROQ_API_KEY.")
-            return
-
-        client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
-
-        working_msg = None
-        try:
-            working_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ AI is thinking... (this may take a few seconds)")
-        except Exception:
-            working_msg = None
-
-        last_exc = None
-        success = False
-
-        for model_id in MODEL_CANDIDATES:
-            try:
-                logging.info("Attempting model '%s' for user %s", model_id, user_id)
-                response = await client.chat.completions.create(
-                    model=model_id,
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg}
-                    ],
-                    temperature=0.7,
-                    max_tokens=700
-                )
-
-                content = None
-                try:
-                    content = response.choices[0].message.content.strip()
-                except Exception:
-                    logging.exception("Malformed response structure from model %s", model_id)
-                    content = None
-
-                if content:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🤖 AI Result (model: {model_id}, source: {source}):\n\n{content}"
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🤖 AI returned no content (model: {model_id})."
-                    )
-
-                logging.info("Model %s succeeded for user %s", model_id, user_id)
-                success = True
-                last_exc = None
-                break
-
-            except asyncio.CancelledError:
-                logging.info("AI task cancelled (model loop) for user %s", user_id)
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text="🛑 AI analysis cancelled.")
-                except Exception:
-                    pass
-                raise
-
-            except Exception as e:
-                last_exc = e
-                emsg = str(e).lower()
-                logging.warning("Model %s failed for user %s: %s", model_id, user_id, emsg)
-
-                if any(tok in emsg for tok in ("decommissioned", "model_decommissioned", "model not found", "not found")):
-                    logging.info("Model %s appears decommissioned or missing; trying next candidate.", model_id)
-                    continue
-                continue
-
-        try:
-            if working_msg:
-                await working_msg.delete()
-        except Exception:
-            pass
-
-        if not success:
-            logging.exception("All model candidates failed for user %s", user_id)
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ AI error (all models failed): {last_exc}")
-            except Exception:
-                pass
-
-    except asyncio.CancelledError:
-        logging.info("run_ai_task cancelled for user %s", user_id)
-        try:
-            await context.bot.send_message(chat_id=chat_id, text="🛑 AI analysis cancelled.")
-        except Exception:
-            pass
-        raise
-
-    except Exception as e:
-        logging.exception("run_ai_task unexpected failure for user %s: %s", user_id, e)
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ AI unexpected error: {e}")
-        except Exception:
-            pass
-
-    finally:
-        try:
-            ai_tasks.pop(user_id, None)
-        except Exception:
-            pass
-        try:
-            if isinstance(context.user_data, dict):
-                context.user_data.pop("ai_task", None)
-        except Exception:
-            pass
-
-    logging.info("run_ai_task finished for user %s", user_id)
-
-# ================ CALLBACK HANDLER ================
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    uid = user.id if user else None
-
-    await record_user_and_check_ban(update, context)
-    data = query.data or ""
-
-    # AI Analysis Button
-    if data.startswith("ai_analyze_"):
-        _, _, plat_acc = data.partition("ai_analyze_")
-        platform, _, account = plat_acc.partition("_")
-
-        badge = get_user_badge(uid)
-
-        if badge['name'] not in ('Diamond', 'Admin'):
-            cooldown_msg = check_and_increment_cooldown(uid)
-            if cooldown_msg:
-                await query.answer("AI limit reached! Invite friends to upgrade.", show_alert=True)
-                return
-
-        await safe_edit(query, text="🤖 Analyzing with Nigerian fire...")
-
-        posts = context.user_data.get(f"last_ai_context_{platform}_{account}", [])
-        analysis = await call_social_ai(platform, account, posts)
-
-        final_text = f"🤖 <b>AI Insight</b>:\n\n{analysis}"
-
-        if badge['name'] in ('Diamond', 'Admin'):
-            final_text += "\n\n💎 <b>You can ask me follow-up questions about these posts!</b>\nJust reply to this message."
-            context.user_data["ai_chat_active"] = {
-                "platform": platform,
-                "account": account,
-                "posts": posts
-            }
-
-        await safe_edit(query, text=final_text, parse_mode="HTML")
-        return
-
-    # Saved quick send
-    if data.startswith("saved_sendcb_"):
-        _, _, sid_s = data.partition("saved_sendcb_")
-        try:
-            sid = int(sid_s)
-        except:
-            await context.bot.edit_message_text(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                text="Invalid saved id."
-            )
-            return
-
-        saved = get_saved_account(uid, sid)
-        if not saved:
-            await context.bot.edit_message_text(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                text="Saved account not found."
-            )
-            return
-
-        await handle_fetch_and_ai(update, context, saved["platform"], saved["account_name"], query)
-        return
-
-    # Confirm (send) single post
-    if data.startswith("confirm_post_"):
-        await query.answer()
-
-        parts = data.split("_")
-        if len(parts) < 5:
-            await query.answer("Invalid callback.", show_alert=True)
-            return
-
-        platform = parts[2]
-        account = "_".join(parts[3:-1])
-        idx = int(parts[-1])
-
-        user_data_key = f"pending_posts_{platform}_{account}"
-        pending = context.user_data.get(user_data_key)
-        if not pending or pending.get("index", 0) != idx:
-            logging.info(f"Stale click detected: expected index {pending.get('index', 'None')}, got {idx} for @{account}")
-            await query.answer("Post expired or out of order.", show_alert=True)
-            await send_next_post_with_confirmation(update, context, platform, account)
-            return
-
-        pending["has_sent_single"] = True
-        context.user_data[user_data_key] = pending
-        logging.info("Flag set: has_sent_single=True for %s/%s", platform, account)
-
-        post = pending["posts"][idx]
-        media_bytes = await download_media(post.get("media_url"))
-        if not media_bytes:
-            try:
-                await context.bot.edit_message_caption(
-                    chat_id=query.message.chat.id,
-                    message_id=query.message.message_id,
-                    caption=(query.message.caption or "") + "\n\n❌ Media failed to load",
-                    reply_markup=None
-                )
-            except Exception:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=query.message.chat.id,
-                        message_id=query.message.message_id,
-                        text=(query.message.text or "") + "\n\n❌ Media failed to load",
-                        reply_markup=None
-                    )
-                except Exception as e:
-                    logging.warning("Failed to mark preview as failed: %s", e)
-
-            pending["index"] += 1
-            context.user_data[user_data_key] = pending
-            await send_next_post_with_confirmation(query, context, platform, account)
-            return
-
-        view_text = {"x": "View on X🐦", "fb": "View on Facebook 🌐", "ig": "View on Instagram 📸"}.get(platform, "View Post 🔗")
-        link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
-        caption = (post.get("caption", "") or "")[:1024]
-        full_caption = f"{link_html}\n\n{caption}" if link_html else caption
-
-        bio = io.BytesIO(media_bytes)
-        if post.get("is_video"):
-            bio.name = "video.mp4"
-            sent = await query.message.reply_video(video=bio, caption=full_caption, parse_mode="HTML")
-        else:
-            bio.name = "photo.jpg"
-            sent = await query.message.reply_photo(photo=bio, caption=full_caption, parse_mode="HTML")
-
-        await schedule_delete(context, sent.chat.id, sent.message_id)
-
-        await safe_edit(query, text=full_caption + "\n\n✅ <b>Sent!</b>", parse_mode="HTML", reply_markup=None)
-
-        pending["index"] += 1
-        context.user_data[user_data_key] = pending
-
-        await send_next_post_with_confirmation(query, context, platform, account)
-        return
-
-    # Send all remaining
-    if data.startswith("send_all_"):
-        query = update.callback_query
-        await query.answer()
-
-        parts = data.split("_")
-        if len(parts) < 4:
-            await query.answer("Invalid callback.", show_alert=True)
-            return
-        platform = parts[2]
-        account = "_".join(parts[3:])
-
-        user_data_key = f"pending_posts_{platform}_{account}"
-        pending = context.user_data.get(user_data_key)
-        if not pending:
-            await query.answer("No pending posts.", show_alert=True)
-            return
-
-        if pending.get("has_sent_single"):
-            await query.answer("Bulk send disabled after single send.", show_alert=True)
-            await send_next_post_with_confirmation(update, context, platform, account)
-            return
-
-        pending["has_sent_single"] = True
-        context.user_data[user_data_key] = pending
-        logging.info("send_all: has_sent_single set for %s/%s", platform, account)
-
-        posts = pending.get("posts", []) or []
-        current_idx = int(pending.get("index", 0))
-        total_posts = int(pending.get("total", len(posts)))
-
-        try:
-            preview_text = (query.message.caption or query.message.text or "") + "\n\n🚀 Sending all remaining..."
-            try:
-                await asyncio.wait_for(
-                    context.bot.edit_message_caption(
-                        chat_id=query.message.chat.id,
-                        message_id=query.message.message_id,
-                        caption=preview_text,
-                        reply_markup=None
-                    ),
-                    timeout=6.0
-                )
-            except (asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(
-                    context.bot.edit_message_text(
-                        chat_id=query.message.chat.id,
-                        message_id=query.message.message_id,
-                        text=preview_text,
-                        reply_markup=None
-                    ),
-                    timeout=6.0
-                )
-        except Exception as e:
-            logging.warning("send_all: could not mark preview as sending: %s", e)
-
-        total_sent = 0
-
-        for idx in range(current_idx, min(total_posts, len(posts))):
-            post = posts[idx]
-            try:
-                media_bytes = await download_media(post.get("media_url"))
-            except Exception as e:
-                logging.warning("send_all: download_media exception for idx %s: %s", idx, e)
-                media_bytes = None
-
-            if not media_bytes:
-                logging.info("send_all: skipping idx %s (media failed)", idx)
-                pending["index"] = idx + 1
-                context.user_data[user_data_key] = pending
-                continue
-
-            view_text = {
-                "x": "View on X🐦",
-                "fb": "View on Facebook 🌐",
-                "ig": "View on Instagram 📸"
-            }.get(platform, "View Post 🔗")
-            link_html = f"<a href='{post.get('post_url','')}'>{view_text}</a>" if post.get('post_url') else ""
-            caption = (post.get("caption") or "")[:1024]
-            full_caption = f"{link_html}\n\n{caption}" if link_html else caption
-
-            bio = io.BytesIO(media_bytes)
-            try:
-                if post.get("is_video"):
-                    bio.name = "video.mp4"
-                    sent = await context.bot.send_video(
-                        chat_id=query.message.chat.id,
-                        video=bio,
-                        caption=full_caption,
-                        parse_mode="HTML"
-                    )
-                else:
-                    bio.name = "photo.jpg"
-                    sent = await context.bot.send_photo(
-                        chat_id=query.message.chat.id,
-                        photo=bio,
-                        caption=full_caption,
-                        parse_mode="HTML"
-                    )
-
-                try:
-                    await schedule_delete(context, sent.chat.id, sent.message_id)
-                except TypeError:
-                    try:
-                        schedule_delete(context, sent.chat.id, sent.message_id)
-                    except Exception:
-                        logging.debug("schedule_delete failed for sent message.")
-                except Exception:
-                    logging.debug("schedule_delete failed for sent message.")
-
-                total_sent += 1
-                logging.info("send_all: sent idx %s for %s/%s", idx, platform, account)
-
-            except Exception as e:
-                logging.exception("send_all: failed to send idx %s: %s", idx, e)
-
-            pending["index"] = idx + 1
-            context.user_data[user_data_key] = pending
-
-            await asyncio.sleep(5)
-
-        pending["index"] = pending.get("total", pending.get("index", 0))
-        context.user_data[user_data_key] = pending
-
-        try:
-            done_text = (query.message.caption or query.message.text or "") + f"\n\n✅ Sent all remaining ({total_sent} posts)!"
-            try:
-                await asyncio.wait_for(
-                    context.bot.edit_message_caption(
-                        chat_id=query.message.chat.id,
-                        message_id=query.message.message_id,
-                        caption=done_text,
-                        reply_markup=None
-                    ),
-                    timeout=6.0
-                )
-            except (asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(
-                    context.bot.edit_message_text(
-                        chat_id=query.message.chat.id,
-                        message_id=query.message.message_id,
-                        text=done_text,
-                        reply_markup=None
-                    ),
-                    timeout=6.0
-                )
-        except Exception as e:
-            logging.warning("send_all: could not mark preview done: %s", e)
-
-        if total_sent > 0:
-            badge = get_user_badge(uid)
-            await send_ai_button(query.message, total_sent, platform, account, badge)
-
-        context.user_data.pop(user_data_key, None)
-        return
-
-    if data.startswith("skip_post_"):
-        _, _, plat_acc_idx = data.partition("skip_post_")
-        platform, _, acc_idx = plat_acc_idx.partition("_")
-        account, _, idx_s = acc_idx.partition("_")
-        try:
-            idx = int(idx_s)
-        except:
-            await query.answer("Invalid index.", show_alert=True)
-            return
-
-        user_data_key = f"pending_posts_{platform}_{account}"
-        pending = context.user_data.get(user_data_key)
-        if not pending or pending.get("index", 0) != idx:
-            await query.answer("Post expired or out of order.", show_alert=True)
-            await send_next_post_with_confirmation(query, context, platform, account)
-            return
-
-        try:
-            await context.bot.edit_message_caption(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                caption=(query.message.caption or "") + "\n\n⏭️ <b>Skipped!</b>",
-                parse_mode="HTML",
-                reply_markup=None
-            )
-        except Exception:
-            await context.bot.edit_message_text(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id,
-                text=(query.message.text or "") + "\n\n⏭️ <b>Skipped!</b>",
-                parse_mode="HTML",
-                reply_markup=None
-            )
-
-        pending["index"] += 1
-        context.user_data[user_data_key] = pending
-
-        await send_next_post_with_confirmation(query, context, platform, account)
-        return
-
-    # Cancel remaining posts
-    if data.startswith("cancel_posts_"):
-        _, _, plat_acc = data.partition("cancel_posts_")
-        platform, _, account = plat_acc.partition("_")
-
-        user_data_key = f"pending_posts_{platform}_{account}"
-        pending = context.user_data.pop(user_data_key, None)
-
-        sent_count = pending["index"] if pending else 0
-        total = pending["total"] if pending else 0
-
-        await safe_edit(query, text=(query.message.caption or "") + f"\n\n❌ Cancelled. Sent {sent_count}/{total} posts.", parse_mode="HTML", reply_markup=None)
-        await query.message.reply_text(f"❌ Sending cancelled. Sent {sent_count}/{total} posts.")
-
-        if pending and pending["index"] > 0:
-            badge = get_user_badge(uid)
-            await send_ai_button(query.message, pending["index"], platform, account, badge)
-        return
-
-    # Admin confirmations
-    if data.startswith("confirm_ban_"):
-        if not is_admin(uid):
-            await query.edit_message_text("❌ Admins only.")
-            return
-        _, _, tid_s = data.partition("confirm_ban_")
-        try:
-            tid = int(tid_s)
-        except:
-            await query.edit_message_text("Invalid id.")
-            return
-        ban_tg_user(tid)
-        await query.edit_message_text(f"User {tid} has been banned.", reply_markup=build_admin_menu())
-        return
-
-    if data.startswith("confirm_reset_cooldown_"):
-        if not is_admin(uid):
-            await query.edit_message_text("❌ Admins only.")
-            return
-        _, _, tid_s = data.partition("confirm_reset_cooldown_")
-        try:
-            tid = int(tid_s)
-        except:
-            await query.edit_message_text("Invalid id.")
-            return
-        reset_cooldown(tid)
-        await query.edit_message_text(f"Cooldown reset for user {tid}.", reply_markup=build_admin_menu())
-        return
-
-    if data.startswith("confirm_unban_"):
-        if not is_admin(uid):
-            await query.edit_message_text("❌ Admins only.")
-            return
-        _, _, tid_s = data.partition("confirm_unban_")
-        try:
-            tid = int(tid_s)
-        except:
-            await query.edit_message_text("Invalid id.")
-            return
-        unban_tg_user(tid)
-        await query.edit_message_text(f"User {tid} unbanned.", reply_markup=build_admin_menu())
-        return
-
-    if data == "confirm_export_csv":
-        if not is_admin(uid):
-            await query.edit_message_text("❌ Admins only.")
-            return
-        await query.edit_message_text("Preparing CSV...")
-        users = list_all_tg_users(limit=10000)
-        csv_bytes = users_to_csv_bytes(users)
-        bio = io.BytesIO(csv_bytes)
-        bio.name = "tg_users.csv"
-        try:
-            await context.bot.send_document(chat_id=uid, document=InputFile(bio))
-            await query.edit_message_text("CSV sent.")
-        except Exception as e:
-            await query.edit_message_text(f"Failed to send CSV: {e}")
-        return
-
-    # Menu navigation
-    if data == "menu_main":
-        await query.edit_message_text("Main menu:", reply_markup=build_main_menu())
-        return
-    if data == "dashboard":
-        await dashboard_command(update, context)
-        return
-    if data == "menu_x":
-        context.user_data["platform"] = "x"
-        context.user_data["awaiting_username"] = True
-        await query.edit_message_text("Send the X/Twitter <b>user ID</b> (the long numeric ID, not username).\n\n"
-        "How to get it:\n"
-        "Go to <a href='https://tweethunter.io/twitter-id-converter'>Twitter Username Converter</a>\n"
-        "Enter the @username there → it gives you the numeric ID.\n"
-        "Copy and send that number here.\n\n",
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        reply_markup=build_back_markup("menu_main"))
-        return
-    if data == "menu_fb":
-        context.user_data["platform"] = "fb"
-        context.user_data["awaiting_username"] = True
-        await query.edit_message_text(
-            "Send the Facebook page username or name (e.g. nike, coca-cola):\n\n"
-            "Note: Only public pages and send direct page link for accuracy(recommended)! only the posted pictures is fetched",
-            reply_markup=build_back_markup("menu_main")
-        )
-        return
-    if data == "menu_ig":
-        context.user_data["platform"] = "ig"
-        context.user_data["awaiting_username"] = True
-        await query.edit_message_text("Send the Instagram username (without @):", reply_markup=build_back_markup("menu_main"))
-        return
-    if data =="help":
-        await help_command(update, context)
-        return
-
-    if data == "menu_yt":
-        context.user_data["platform"] = "yt"
-        context.user_data["awaiting_username"] = True
-        await query.edit_message_text("Send YouTube channel username (e.g. Seyivibe) or search query:", reply_markup=build_back_markup("menu_main"))
-        return
-
-    if data == "saved_menu":
-        await query.edit_message_text("Saved usernames:", reply_markup=build_saved_menu())
-        return
-    if data == "saved_add_start":
-        context.user_data["awaiting_save"] = True
-        await query.edit_message_text("Send: <platform> <username or ID> [label]\nExample: `x elonmusk fav`", reply_markup=build_back_markup("saved_menu"))
-        return
-    if data == "saved_list" or data.startswith("saved_page_"):
-        page = 0
-        if data.startswith("saved_page_"):
-            page = int(data[len("saved_page_"):])
-
-        items = list_saved_accounts(uid)
-        if not items:
-            await query.edit_message_text("You no get any saved account. Save page link when saving in fb", reply_markup=build_saved_menu())
-            return
-
-        per_page = 4
-        start = page * per_page
-        end = start + per_page
-        page_items = items[start:end]
-        total_pages = (len(items) + per_page - 1) // per_page
-
-        text = f"Your saved accounts ({page+1}/{total_pages}):\n\n"
-        rows = []
-        for it in page_items:
-            sid = it["id"]
-            plat = it["platform"].upper()
-            acc = it["account_name"]
-            lbl = it.get("label") or ""
-            display = f"{sid}. [{plat}] @{acc}"
-            if lbl:
-                display += f" — {lbl}"
-            text += display + "\n"
-
-            rows.append([
-                InlineKeyboardButton("Send", callback_data=f"saved_sendcb_{sid}"),
-                InlineKeyboardButton("Rename", callback_data=f"saved_rename_start_{sid}"),
-                InlineKeyboardButton("Remove", callback_data=f"saved_removecb_{sid}")
-            ])
-
-        nav = []
-        if page > 0:
-            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"saved_page_{page-1}"))
-        if end < len(items):
-            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"saved_page_{page+1}"))
-        if nav:
-            rows.append(nav)
-
-        rows.append([InlineKeyboardButton("↩️ Back", callback_data="saved_menu")])
-
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
-        return
-    if data.startswith("saved_removecb_"):
-        _, _, sid_s = data.partition("saved_removecb_")
-        try:
-            sid = int(sid_s)
-        except:
-            await query.edit_message_text("Invalid id.")
-            return
-        ok = remove_saved_account(uid, sid)
-        if ok:
-            await query.edit_message_text(f"Removed saved account {sid}.", reply_markup=build_saved_menu())
-        else:
-            await query.edit_message_text("Could not remove saved account.", reply_markup=build_saved_menu())
-        return
-
-    if data.startswith("saved_rename_start_"):
-        _, _, sid_s = data.partition("saved_rename_start_")
-        try:
-            sid = int(sid_s)
-        except:
-            await query.edit_message_text("Invalid id.")
-            return
-        context.user_data["awaiting_rename_id"] = sid
-        await query.edit_message_text("Send the new label for this saved account (single message):", reply_markup=build_back_markup("saved_list"))
-        return
-
-    # Admin panel callbacks
-    if data.startswith("admin_"):
-        if not is_admin(uid):
-            await query.edit_message_text("❌ Admins only.")
-            return
-
-        if data.startswith("admin_list_users_"):
-            _, _, page_s = data.partition("admin_list_users_")
-            page = int(page_s or "0")
-            users = list_all_tg_users(limit=10000)
-            total = len(users)
-            start = page * PAGE_SIZE_USERS
-            end = start + PAGE_SIZE_USERS
-            page_users = users[start:end]
-            text = f"Users (page {page+1}):\n\n"
-            rows = []
-            for u in page_users:
-                tid = u.get('telegram_id')
-                text += f"- {u.get('first_name') or ''} ({tid}) banned={u.get('is_banned')} reqs={u.get('request_count')} invites={u.get('invite_count')}\n"
-                rows.append([
-                    InlineKeyboardButton(f"Stats {tid}", callback_data=f"admin_user_stats_{tid}"),
-                    InlineKeyboardButton(f"Reset CD {tid}", callback_data=f"admin_reset_cooldown_start_{tid}"),
-                    InlineKeyboardButton(f"Ban {tid}" if not u.get('is_banned') else f"Unban {tid}", callback_data=f"admin_{'ban' if not u.get('is_banned') else 'unban'}_start_{tid}")
-                ])
-            nav_row = []
-            if page > 0:
-                nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin_list_users_{page-1}"))
-            if end < total:
-                nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_list_users_{page+1}"))
-            if nav_row:
-                rows.append(nav_row)
-            rows.append([InlineKeyboardButton("↩️ Back", callback_data="admin_back")])
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
-            return
-
-        if data.startswith("admin_user_stats_"):
-            _, _, tid_s = data.partition("admin_user_stats_")
-            try:
-                tid = int(tid_s)
-            except:
-                await query.edit_message_text("Invalid id.")
-                return
-            stats = get_user_stats(tid)
-            if not stats:
-                await query.edit_message_text("User not found.")
-                return
-            user = stats['user']
-            badge = stats['badge']
-            rl = stats['rate_limits']
-            saves = stats['save_count']
-            text = f"Stats for {user.get('first_name', 'User')} ({tid})\n\n"
-            text += f"Joined: {user.get('joined_at')}\nRequests: {user.get('request_count', 0)}\nInvites: {user.get('invite_count', 0)}\nBanned: {bool(user.get('is_banned'))}\n"
-            text += f"Badge: {badge['emoji']} {badge['name']}\nSaves: {saves}/{badge['save_slots'] if isinstance(badge['save_slots'], int) else '∞'}\n\n"
-            text += "Cooldowns:\n"
-            text += f"Minute: {rl.get('minute_count',0)}/{badge['limits'].get('min','∞')} (reset: {rl.get('minute_reset')})\n"
-            text += f"Hour: {rl.get('hour_count',0)}/{badge['limits'].get('hour','∞')} (reset: {rl.get('hour_reset')})\n"
-            text += f"Day: {rl.get('day_count',0)}/{badge['limits'].get('day','∞')} (reset: {rl.get('day_reset')})\n"
-            await query.edit_message_text(text, reply_markup=build_back_markup("admin_list_users_0"))
-            return
-
-        if data.startswith("admin_reset_cooldown_start_"):
-            _, _, tid_s = data.partition("admin_reset_cooldown_start_")
-            try:
-                tid = int(tid_s)
-            except:
-                await query.edit_message_text("Invalid id.")
-                return
-            await query.edit_message_text(f"Confirm reset cooldown for {tid}?", reply_markup=build_confirm_markup("reset_cooldown", tid))
-            return
-
-        if data == "admin_leaderboard":
-            await query.edit_message_text("Loading leaderboard...", reply_markup=build_back_markup("admin_back"))
-            return
-
-        if data == "admin_back":
-            await query.edit_message_text("Admin panel:", reply_markup=build_admin_menu())
-            return
-
-        if data == "admin_export_csv":
-            await query.edit_message_text("Export users to CSV? Confirm to proceed.", reply_markup=build_confirm_markup("export_csv"))
-            return
-
-        if data == "admin_broadcast_start":
-            context.user_data["admin_broadcast"] = True
-            await query.edit_message_text("Send the message to broadcast. Use /cancel to abort.", reply_markup=build_cancel_and_back("admin_broadcast_cancel", "admin_back"))
-            return
-
-        if data == "admin_broadcast_cancel":
-            context.user_data.pop("admin_broadcast", None)
-            await query.edit_message_text("Broadcast cancelled.", reply_markup=build_admin_menu())
-            return
-
-        if data == "admin_ai_start":
-            context.user_data["awaiting_manual_ai"] = True
-            await query.edit_message_text(
-                "🧠 <b>Manual AI Analysis</b>\n\n"
-                "Send the text/post/caption you want me to analyze with Groq AI.\n"
-                "If you just fetched posts, I can auto-use them if you send nothing.\n\n"
-                "/cancel to abort.",
-                parse_mode="HTML",
-                reply_markup=build_back_markup("admin_back")
-            )
-            return
-
-    if data.startswith("page_"):
-        parts = data.split("_", 3)
-        if len(parts) < 4:
-            await query.edit_message_text("Invalid page data.")
-            return
-        page = int(parts[1])
-        platform = parts[2]
-        account = parts[3]
-        posts = fetch_latest_urls(platform, account) if platform == "x" else fetch_ig_urls(account)
-        start = page * POSTS_PER_PAGE
-        end = start + POSTS_PER_PAGE
-        page_posts = posts[start:end]
-        total_pages = max(1, (len(posts) + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE)
-        msg = f"Page {page+1} of {total_pages}\n\n"
-        for p in page_posts:
-            if isinstance(p, dict):
-                msg += f"{p.get('url')}\n"
-            else:
-                msg += f"{p}\n"
-        keyboard = []
-        if page > 0:
-            keyboard.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page_{page-1}_{platform}_{account}"))
-        if page < total_pages - 1:
-            keyboard.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page+1}_{platform}_{account}"))
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([keyboard]) if keyboard else None)
-        return
-
-    await query.edit_message_text("Unknown action or handled elsewhere.")
-
-# ================ MESSAGE HANDLER ================
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    uid = update.effective_user.id
-    badge = get_user_badge(uid)
-
-    # AI Follow-up Chat (only Diamond & Admin)
-    if context.user_data.get("ai_chat_active") and badge['name'] in ('Diamond', 'Admin'):
-        chat_context = context.user_data["ai_chat_active"]
-        posts = chat_context["posts"]
-        question = update.message.text.strip()
-
-        captions_text = "\n---\n".join([
-            p.get("caption", "No caption") or ""
-            for p in posts
-        ])
-
-        prompt = f"""
-    "You are a sharp Nigerian social media analyst. "
-    "Use natural Nigerian Pidgin mixed with clear English — keep it authentic and relatable, never forced.\n\n"
-    "Context: The user has just seen the latest post(s) from @{account} on {platform_upper}.\n"
-    "Post captions/transcripts:\n"
-    "{captions_text}\n\n"
-    "User follow-up question: {question}\n\n"
-    "Guidelines:\n"
-    "- Respond in max 6 sentences\n"
-    "- Be direct, insightful, and add value — cover intent, sentiment, impact, or hidden nuances\n"
-    "- Add light wit only if it fits naturally\n"
-    "- End with a short, thought-provoking takeaway or question\n"
-    "- Stay engaging and make the user think deeper about the content"
-    """
-
-        await update.message.chat.send_action(ChatAction.TYPING)
-
-        try:
-            client = AsyncOpenAI(
-                api_key=os.getenv("GROQ_KEY"),
-                base_url="https://api.groq.com/openai/v1"
-            )
-            response = await client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.8,
-                max_tokens=500
-            )
-            answer = response.choices[0].message.content.strip()
-            await update.message.reply_text(
-                f"🤖 <b>AI Follow-up</b>:\n\n{answer}\n\n<i>Reply again for more questions!</i>",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logging.error(f"AI follow-up failed: {e}")
-            await update.message.reply_text("🤖 AI temporary unavailable. Try again later.")
-
-        return
-
-    # Manual AI Analysis (Admin only, multi-turn)
-    elif context.user_data.get("awaiting_manual_ai"):
-        if not is_admin(uid):
-            context.user_data.pop("awaiting_manual_ai", None)
-            await update.effective_message.reply_text("❌ Only admins can use Manual AI.")
-            return
-
-        user_text = update.message.text.strip()
-
-        if not user_text:
-            await update.effective_message.reply_text(
-                "📝 Send the text, post, link, or caption you want analyzed.\n"
-                "I go analyze each one sharp-sharp.\n"
-                "/cancel to stop Manual AI mode."
-            )
-            return
-
-        task = asyncio.create_task(
-            run_ai_task(
-                user_id=uid,
-                text=user_text,
-                chat_id=update.effective_chat.id,
-                context=context,
-                source="manual_admin"
-            )
-        )
-        ai_tasks[uid] = task
-        context.user_data["ai_task"] = task
-
-        await update.effective_message.reply_text(
-            "🚀 AI dey think on top your text...\n"
-            "Hold...."
-        )
-        return
-
-    text = update.message.text.strip().lower()
-
-    # Detect Facebook single post share links
-    if ("facebook.com/share/" in text or "mibextid=" in text or 
-        text.startswith("https://www.facebook.com/") or text.startswith("https://fb.watch/")):
-        clean_link = update.message.text.split("?")[0].rstrip("/")
-        await update.message.reply_text(
-            f"🌐 Single Facebook post:\n{clean_link}",
-            disable_web_page_preview=False
-        )
-        return
-
-    # Admin broadcast
-    if context.user_data.get("admin_broadcast"):
-        if not is_admin(uid):
-            context.user_data.pop("admin_broadcast", None)
-            await update.effective_message.reply_text("❌ Only admins can broadcast.")
-            return
-        text_to_send = update.message.text
-        await update.effective_message.reply_text("Broadcast starting... (send /cancel to abort while it runs)")
-        users = list_active_tg_users(limit=10000)
-        sent = 0
-        failed = 0
-        cancelled = False
-        for u in users:
-            if not context.user_data.get("admin_broadcast"):
-                cancelled = True
-                break
-            try:
-                await context.bot.send_message(chat_id=u.get("telegram_id"), text=text_to_send)
-                sent += 1
-                await asyncio.sleep(0.05)
-            except Exception:
-                failed += 1
-        context.user_data.pop("admin_broadcast", None)
-        if cancelled:
-            await update.effective_message.reply_text(f"Broadcast cancelled. Sent so far: {sent}, failed: {failed}")
-        else:
-            await update.effective_message.reply_text(f"Broadcast done. Sent: {sent}, failed: {failed}")
-        return
-
-    # Rename flow
-    if context.user_data.get("awaiting_rename_id"):
-        sid = context.user_data.pop("awaiting_rename_id")
-        new_label = update.message.text.strip()
-        ok = update_saved_account_label(uid, sid, new_label)
-        if ok:
-            await update.effective_message.reply_text(f"Saved account {sid} renamed to: {new_label}", reply_markup=build_saved_menu())
-        else:
-            await update.effective_message.reply_text("Could not rename saved account.", reply_markup=build_saved_menu())
-        return
-
-    # Add saved flow
-    if context.user_data.get("awaiting_save"):
-        text = update.message.text.strip()
-        parts = text.split(maxsplit=2)
-        if len(parts) < 2:
-            await update.effective_message.reply_text("Send: <platform> <username_or_url> [label]")
-            return
-
-        platform_input = parts[0].lower()
-        raw_input = parts[1].strip()
-        label = parts[2] if len(parts) == 3 else None
-
-        if platform_input in ("twitter", "x"):
-            platform = "x"
-        elif platform_input in ("instagram", "ig"):
-            platform = "ig"
-        elif platform_input in ("facebook", "fb"):
-            platform = "fb"
-        elif platform_input in ("youtube", "yt"):
-            platform = "yt"
-        else:
-            await update.effective_message.reply_text("Platform must be: x, ig, fb, or yt (YouTube)")
-            return
-
-        account = raw_input
-
-        if raw_input.startswith("http"):
-            if platform == "fb":
-                if "facebook.com" in raw_input or "fb.com" in raw_input:
-                    account = raw_input.split('?')[0].rstrip('/')
-                else:
-                    await update.effective_message.reply_text("Invalid Facebook URL.")
-                    context.user_data.pop("awaiting_save", None)
-                    return
-            elif platform == "yt":
-                if "youtube.com" in raw_input or "youtu.be" in raw_input:
-                    account = raw_input
-                else:
-                    await update.effective_message.reply_text("Invalid YouTube link.")
-                    context.user_data.pop("awaiting_save", None)
-                    return
-            else:
-                await update.effective_message.reply_text("Full URLs only supported for fb and yt.")
-                context.user_data.pop("awaiting_save", None)
-                return
-        else:
-            cleaned = raw_input.lstrip("@").strip()
-            if cleaned.isdigit() and len(cleaned) >= 10:
-                account = cleaned
-            else:
-                account = cleaned
-
-        current_count = count_saved_accounts(uid)
-        save_slots = badge.get('save_slots')
-        if isinstance(save_slots, (int, float)) and current_count >= save_slots:
-            await update.effective_message.reply_text(f"You've reached your save limit ({int(save_slots)}). Invite friends to upgrade!")
-            context.user_data.pop("awaiting_save", None)
-            return
-
-        try:
-            saved = save_user_account(uid, platform, account, label)
-            if account.startswith("http"):
-                if platform == "fb":
-                    display_name = account.split('/')[-1] or "Facebook Page"
-                elif platform == "yt":
-                    if '@' in account:
-                        display_name = account.split('@')[-1]
-                    else:
-                        display_name = account.split('/')[-1] or "YouTube Channel"
-                else:
-                    display_name = account
-            else:
-                if platform == "x" and account.isdigit() and len(account) >= 10:
-                    display_name = f"User ID: {account}"
-                else:
-                    display_name = f"@{account}"
-
-            await update.effective_message.reply_text(
-                f"✅ Saved {platform.upper()} account:\n"
-                f"{display_name}\n"
-                f"Label: {label or 'None'}\n"
-                f"ID: {saved.get('id')}",
-                reply_markup=build_saved_menu()
-            )
-        except Exception as e:
-            logging.error(f"Save error for user {uid}: {e}")
-            await update.effective_message.reply_text(f"❌ Error saving: {str(e)}", reply_markup=build_saved_menu())
-
-        context.user_data.pop("awaiting_save", None)
-        return
-
-    # Prompted username flow (from menu)
-    if context.user_data.get("awaiting_username"):
-        raw_input = update.message.text.strip()
-        platform = context.user_data.get("platform", "x")
-        context.user_data["awaiting_username"] = False
-
-        account = raw_input
-        if raw_input.startswith("http") and platform in ("fb", "yt"):
-            if platform == "fb" and ("facebook.com" in raw_input or "fb.com" in raw_input):
-                account = raw_input.split('?')[0].rstrip('/')
-            elif platform == "yt" and ("youtube.com" in raw_input or "youtu.be" in raw_input):
-                account = raw_input
-        else:
-            account = raw_input.lstrip("@")
-
-        await handle_fetch_and_ai(update, context, platform, account)
-        return
-
-    # /saved_send command
-    if text.startswith("/saved_send"):
-        parts = text.split()
-        if len(parts) < 2:
-            await update.effective_message.reply_text("Usage: /saved_send <id>")
-            return
-        try:
-            sid = int(parts[1])
-        except:
-            await update.effective_message.reply_text("Invalid id.")
-            return
-        saved = get_saved_account(uid, sid)
-        if not saved:
-            await update.effective_message.reply_text("Saved account not found.")
-            return
-        await handle_fetch_and_ai(update, context, saved["platform"], saved["account_name"])
-        return
-
-    # /saved_remove
-    if text.startswith("/saved_remove"):
-        parts = text.split()
-        if len(parts) < 2:
-            await update.effective_message.reply_text("Usage: /saved_remove <id>")
-            return
-        try:
-            sid = int(parts[1])
-        except:
-            await update.effective_message.reply_text("Invalid id.")
-            return
-        ok = remove_saved_account(uid, sid)
-        await update.effective_message.reply_text(
-            f"Removed saved account {sid}." if ok else "Could not remove account."
-        )
-        return
-
-    # /saved_rename
-    if text.startswith("/saved_rename"):
-        parts = text.split(maxsplit=2)
-        if len(parts) < 3:
-            await update.effective_message.reply_text("Usage: /saved_rename <id> <new label>")
-            return
-        try:
-            sid = int(parts[1])
-        except:
-            await update.effective_message.reply_text("Invalid id.")
-            return
-        new_label = parts[2].strip()
-        ok = update_saved_account_label(uid, sid, new_label)
-        await update.effective_message.reply_text(
-            f"Renamed account {sid} → {new_label}" if ok else "Could not rename account."
-        )
-        return
-
-    # /save command (direct command version)
-    if text.startswith("/save"):
-        parts = text.split(maxsplit=3)
-        if len(parts) < 3:
-            await update.effective_message.reply_text(
-                "Usage: /save <platform> <username_or_url> [label]\n\n"
-                "Examples:\n"
-                "/save x elonmusk\n"
-                "/save ig davido\n"
-                "/save fb https://www.facebook.com/BBCNews BBC News\n"
-                "/save yt @MrBeast"
-            )
-            return
-
-        platform_input = parts[1].lower()
-        raw_input = parts[2].strip()
-        label = parts[3] if len(parts) == 4 else None
-
-        if platform_input in ("twitter", "x"):
-            platform = "x"
-        elif platform_input in ("instagram", "ig"):
-            platform = "ig"
-        elif platform_input in ("facebook", "fb"):
-            platform = "fb"
-        elif platform_input in ("youtube", "yt"):
-            platform = "yt"
-        else:
-            await update.effective_message.reply_text("Platform must be x, ig, fb, or yt")
-            return
-
-        account = raw_input
-        if raw_input.startswith("http"):
-            if platform not in ("fb", "yt"):
-                await update.effective_message.reply_text("Full URLs only for fb and yt")
-                return
-            if platform == "fb" and not ("facebook.com" in raw_input or "fb.com" in raw_input):
-                await update.effective_message.reply_text("Invalid Facebook URL")
-                return
-            if platform == "yt" and not ("youtube.com" in raw_input or "youtu.be" in raw_input):
-                await update.effective_message.reply_text("Invalid YouTube link")
-                return
-            account = raw_input.split('?')[0].rstrip('/') if platform == "fb" else raw_input
-        else:
-            account = raw_input.lstrip('@')
-
-        current_count = count_saved_accounts(uid)
-        save_slots = badge.get('save_slots')
-        if isinstance(save_slots, (int, float)) and current_count >= save_slots:
-            await update.effective_message.reply_text(f"Save limit reached ({int(save_slots)})")
-            return
-
-        try:
-            saved = save_user_account(uid, platform, account, label)
-            if account.startswith("http"):
-                display = account.split('/')[-1] or account
-            else:
-                display = "@" + account
-
-            await update.effective_message.reply_text(
-                f"✅ Saved {platform.upper()}:\n{display}\nLabel: {label or 'None'}\nID: {saved.get('id')}"
-            )
-        except Exception as e:
-            await update.effective_message.reply_text(f"❌ Save failed: {e}")
-        return
-
-    # /saved_list
-    if text.startswith("/saved_list"):
-        items = list_saved_accounts(uid)
-        if not items:
-            await update.effective_message.reply_text("No saved accounts yet. Use /save to add one.")
-            return
-
-        text_out = "Your saved accounts:\n\n"
-        rows = []
-        for it in items:
-            sid = it["id"]
-            plat = it["platform"].upper()
-            acc = it["account_name"]
-            lbl = it.get("label") or ""
-
-            if acc.startswith("http"):
-                if plat == "FB":
-                    name = acc.split('/')[-1] or "Page"
-                elif plat == "YT":
-                    name = acc.split('@')[-1] if '@' in acc else acc.split('/')[-1]
-                else:
-                    name = acc
-                display = f"{sid}. [{plat}] {name}"
-            else:
-                display = f"{sid}. [{plat}] @{acc}"
-
-            if lbl:
-                display += f" — {lbl}"
-
-            text_out += display + "\n"
-
-            rows.append([
-                InlineKeyboardButton(f"Send", callback_data=f"saved_sendcb_{sid}"),
-                InlineKeyboardButton("Rename", callback_data=f"saved_rename_start_{sid}"),
-                InlineKeyboardButton("Remove", callback_data=f"saved_removecb_{sid}")
-            ])
-
-        rows.append([InlineKeyboardButton("↩️ Back to Menu", callback_data="saved_menu")])
-        await update.effective_message.reply_text(text_out, reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    # Default fallback
-    await record_user_and_check_ban(update, context)
-    await update.effective_message.reply_text("Use the menu or /help for commands.")
-
-# ================ COMMAND HANDLERS ================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -1908,88 +97,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     "<i>Best way to use me? Tap the menu button below for one-tap magic! ✨</i>"
 )
     await update.effective_message.reply_text(help_text, parse_mode="HTML")
-
-@admin_only
-async def reset_all_cooldowns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: /reset_all_cooldowns"""
-    if not context.args or context.args[0].lower() != "confirm":
-        await update.effective_message.reply_text(
-            "⚠️ <b>Dangerous action:</b> This will reset rate limits for <u>ALL users</u>.\n\n"
-            "To proceed, type:\n"
-            "<code>/reset_all_cooldowns confirm</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    try:
-        conn = get_tg_db()
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE tg_rate_limits
-            SET 
-                minute_count = 0,
-                hour_count = 0,
-                day_count = 0,
-                minute_reset = NULL,
-                hour_reset = NULL,
-                day_reset = NULL
-        """)
-        affected = cur.rowcount
-        conn.commit()
-        cur.close()
-        conn.close()
-
-        await update.effective_message.reply_text(
-            f"✅ <b>Global cooldown reset complete!</b>\n"
-            f"Rate limits cleared for <b>{affected}</b> user(s).",
-            parse_mode="HTML"
-        )
-
-    except Exception as e:
-        logging.error(f"reset_all_cooldowns failed: {e}")
-        await update.effective_message.reply_text(
-            f"❌ Failed to reset global cooldowns:\n<code>{str(e)}</code>",
-            parse_mode="HTML"
-        )
-
-async def privacy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    allowed = await record_user_and_check_ban(update, context)
-    if not allowed:
-        await update.effective_message.reply_text("🚫 You are banned.")
-        return
-
-    privacy_text = (
-        "🔒 <b>Privacy Policy – MooreLinkBot (Social Helper)</b>\n\n"
-        "Your privacy matters. Here's exactly what we do (and don't do):\n\n"
-        "<b>✅ What we collect</b>\n"
-        "• Your Telegram user ID and chat ID – needed to send you updates\n"
-        "• The public usernames/handle you ask us to track (e.g., @elonmusk)\n"
-        "• Optional labels you give saved accounts\n"
-        "• Your invite count and referral data (to unlock benefits)\n\n"
-        "<b>🚫 What we NEVER collect</b>\n"
-        "• No passwords or login credentials\n"
-        "• No access to your private accounts or DMs\n"
-        "• No phone number, email, or personal details beyond Telegram basics\n"
-        "• No browsing history or unrelated chat data\n\n"
-        "<b>🔍 How your data is used</b>\n"
-        "• Solely to fetch and deliver public posts from the accounts you choose\n"
-        "• To manage your saved list, badges, and invite rewards\n"
-        "• Everything stays tied to your Telegram ID – nothing is shared or sold\n\n"
-        "<b>🗄️ Storage & Deletion</b>\n"
-        "• Data is stored securely in an encrypted database\n"
-        "• Remove any saved account anytime with /saved_remove\n"
-        "• Stop using the bot or block it → we automatically clean inactive data\n"
-        "• Want full deletion? Just message the developer from /dashboard\n\n"
-        "<b>🌐 Third parties</b>\n"
-        "We only fetch publicly available posts from X and Instagram. "
-        "No private APIs, no cookies, no logins required from you.\n\n"
-        "<b>✨ Our promise</b>\n"
-        "Built as a non-commercial tool to help you escape the noise – "
-        "not to create more of it. We respect your attention and your privacy.\n\n"
-        "<i>Questions? Reach out anytime via @israelmoorenewcomer → Contact Developer.</i> ❤️"
-    )
-
-    await update.effective_message.reply_text(privacy_text, parse_mode="HTML", disable_web_page_preview=True)
 
 async def benefits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed = await record_user_and_check_ban(update, context)
@@ -2104,12 +211,16 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         text += f"{i}. {name} - {invites} invites\n"
     await update.effective_message.reply_text(text)
 
-@admin_only
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("❌ Admins only.")
+        return
     await update.effective_message.reply_text("Admin panel:", reply_markup=build_admin_menu())
 
-@admin_only
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("❌ Admins only.")
+        return
     if not context.args:
         await update.effective_message.reply_text("Usage: /ban <telegram_id>")
         return
@@ -2120,8 +231,10 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_text(f"Are you sure you want to ban {tid}?", reply_markup=build_confirm_markup("ban", tid))
 
-@admin_only
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("❌ Admins only.")
+        return
     if not context.args:
         await update.effective_message.reply_text("Usage: /unban <telegram_id>")
         return
@@ -2132,8 +245,10 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_text(f"Are you sure you want to unban {tid}?", reply_markup=build_confirm_markup("unban", tid))
 
-@admin_only
 async def reset_cooldown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("❌ Admins only.")
+        return
     if not context.args:
         await update.effective_message.reply_text("Usage: /reset_cooldown <telegram_id>")
         return
@@ -2145,8 +260,10 @@ async def reset_cooldown_command(update: Update, context: ContextTypes.DEFAULT_T
     reset_cooldown(tid)
     await update.effective_message.reply_text(f"Cooldown reset for {tid}.")
 
-@admin_only
 async def user_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("❌ Admins only.")
+        return
     if not context.args:
         await update.effective_message.reply_text("Usage: /user_stats <telegram_id>")
         return
@@ -2172,8 +289,10 @@ async def user_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text += f"Day: {rl.get('day_count',0)}/{badge['limits'].get('day','∞')}\n"
     await update.effective_message.reply_text(text)
 
-@admin_only
 async def export_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("❌ Admins only.")
+        return
     await update.effective_message.reply_text("Export users to CSV? Confirm to proceed.", reply_markup=build_confirm_markup("export_csv"))
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2223,7 +342,119 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["platform"] = "x"
     await update.effective_message.reply_text("Send username (without @) — default platform X. Use /cancel to abort.", reply_markup=build_back_markup("menu_main"))
 
-# ================ COMMAND VISIBILITY ================
+async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only toggle for test mode."""
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("❌ Admins only.")
+        return
+    args = context.args or []
+    if not args:
+        status = "ON" if TEST_MODE["enabled"] else "OFF"
+        await update.effective_message.reply_text(
+            f"Test mode is currently: {status}\n\nUsage: /testmode on|off|toggle|status"
+        )
+        return
+
+    cmd = args[0].lower()
+    if cmd in ("on", "enable", "1"):
+        TEST_MODE["enabled"] = True
+        await update.effective_message.reply_text("✅ Test mode ENABLED — bot will force-send posts seen before.")
+    elif cmd in ("off", "disable", "0"):
+        TEST_MODE["enabled"] = False
+        await update.effective_message.reply_text("❌ Test mode DISABLED — normal behavior restored.")
+    elif cmd in ("toggle", "switch"):
+        TEST_MODE["enabled"] = not TEST_MODE["enabled"]
+        await update.effective_message.reply_text(f"Test mode now: {'ON' if TEST_MODE['enabled'] else 'OFF'}")
+    elif cmd == "status":
+        await update.effective_message.reply_text(f"Test mode is {'ON' if TEST_MODE['enabled'] else 'OFF'}")
+    else:
+        await update.effective_message.reply_text("Unknown arg. Use: on|off|toggle|status")
+
+async def reset_all_cooldowns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /reset_all_cooldowns"""
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("❌ Admins only.")
+        return
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.effective_message.reply_text(
+            "⚠️ <b>Dangerous action:</b> This will reset rate limits for <u>ALL users</u>.\n\n"
+            "To proceed, type:\n"
+            "<code>/reset_all_cooldowns confirm</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        conn = get_tg_db()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE tg_rate_limits
+            SET 
+                minute_count = 0,
+                hour_count = 0,
+                day_count = 0,
+                minute_reset = NULL,
+                hour_reset = NULL,
+                day_reset = NULL
+        """)
+        affected = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        await update.effective_message.reply_text(
+            f"✅ <b>Global cooldown reset complete!</b>\n"
+            f"Rate limits cleared for <b>{affected}</b> user(s).",
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        logging.error(f"reset_all_cooldowns failed: {e}")
+        await update.effective_message.reply_text(
+            f"❌ Failed to reset global cooldowns:\n<code>{str(e)}</code>",
+            parse_mode="HTML"
+        )
+
+async def privacy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    allowed = await record_user_and_check_ban(update, context)
+    if not allowed:
+        await update.effective_message.reply_text("🚫 You are banned.")
+        return
+
+    privacy_text = (
+        "🔒 <b>Privacy Policy – MooreLinkBot (Social Helper)</b>\n\n"
+        "Your privacy matters. Here's exactly what we do (and don't do):\n\n"
+        "<b>✅ What we collect</b>\n"
+        "• Your Telegram user ID and chat ID – needed to send you updates\n"
+        "• The public usernames/handle you ask us to track (e.g., @elonmusk)\n"
+        "• Optional labels you give saved accounts\n"
+        "• Your invite count and referral data (to unlock benefits)\n\n"
+        "<b>🚫 What we NEVER collect</b>\n"
+        "• No passwords or login credentials\n"
+        "• No access to your private accounts or DMs\n"
+        "• No phone number, email, or personal details beyond Telegram basics\n"
+        "• No browsing history or unrelated chat data\n\n"
+        "<b>🔍 How your data is used</b>\n"
+        "• Solely to fetch and deliver public posts from the accounts you choose\n"
+        "• To manage your saved list, badges, and invite rewards\n"
+        "• Everything stays tied to your Telegram ID – nothing is shared or sold\n\n"
+        "<b>🗄️ Storage & Deletion</b>\n"
+        "• Data is stored securely in an encrypted database\n"
+        "• Remove any saved account anytime with /saved_remove\n"
+        "• Stop using the bot or block it → we automatically clean inactive data\n"
+        "• Want full deletion? Just message the developer from /dashboard\n\n"
+        "<b>🌐 Third parties</b>\n"
+        "We only fetch publicly available posts from X and Instagram. "
+        "No private APIs, no cookies, no logins required from you.\n\n"
+        "<b>✨ Our promise</b>\n"
+        "Built as a non-commercial tool to help you escape the noise – "
+        "not to create more of it. We respect your attention and your privacy.\n\n"
+        "<i>Questions? Reach out anytime via @israelmoorenewcomer → Contact Developer.</i> ❤️"
+    )
+
+    await update.effective_message.reply_text(privacy_text, parse_mode="HTML", disable_web_page_preview=True)
+
+# Command visibility function (kept here or moved to a separate file)
 async def set_command_visibility(application):
     """Set bot commands for public and admin users."""
     public_cmds = [
