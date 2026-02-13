@@ -9,131 +9,94 @@ import random
 import time
 from typing import Dict, Optional, Any, Tuple, Callable, List
 
-from instagrapi import Client
-from instagrapi.exceptions import ClientError, LoginRequired
-from pathlib import Path
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import instaloader
+import logging
 
-def fetch_ig_urls(account: str, cl: Client = None) -> List[Dict[str, Any]]:
+from itertools import islice
+
+def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
     """
-    Fetch Instagram posts using instagrapi.
+    Fetch Instagram post URLs, captions, and media URLs using Instaloader.
     
     Args:
         account: Instagram username (with or without @)
-        cl: Optional pre-authenticated instagrapi Client instance
         
     Returns:
-        List of dictionaries containing post data
+        List of dicts with url, caption, media_url, is_video
     """
+    # Clean username
     account = account.lstrip('@')
     posts = []
     
-    # Create client if not provided
-    if cl is None:
-        cl = Client()
-        
-        # # OPTION 1: Login with credentials
-        # username = "your_ig_username"
-        # password = "your_ig_password"
-        # try:
-        #     cl.login(username, password)
-        # except Exception as e:
-        #     logging.error(f"Instagram login failed: {e}")
-        #     return []
-        
-        # # OPTION 2: Load session from file (recommended for production)
-        # session_file = Path("ig_session.json")
-        # if session_file.exists():
-        #     try:
-        #         cl.load_settings(session_file)
-        #         cl.login(username, password)  # Relogin with saved session
-        #     except Exception as e:
-        #         logging.warning(f"Session load failed, logging in fresh: {e}")
-        #         cl.login(username, password)
-        # else:
-        #     cl.login(username, password)
-        #     cl.dump_settings(session_file)  # Save session for next time
-        
-        # # OPTION 3: Proxy support (if needed)
-        # cl.set_proxy("http://proxy:port")
-        # # or with auth:
-        # # cl.set_proxy("http://user:pass@proxy:port")
+    # Initialize Instaloader (anonymous context, no login required for public profiles)
+    L = instaloader.Instaloader(
+        download_pictures=False,  # We only want metadata, not downloads
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False
+    )
     
     try:
-        # Get user ID from username
-        user_id = cl.user_id_from_username(account)
+        # Get profile
+        profile = instaloader.Profile.from_username(L.context, account)
         
-        # Fetch user's media posts
-        medias = cl.user_medias(user_id, amount=config.POST_LIMIT)
+        # Get posts iterator (lazy loading, memory efficient)
+        posts_iterator = profile.get_posts()
         
-        for media in medias:
-            post_url = f"https://www.instagram.com/p/{media.code}/"
-            caption = media.caption_text or ""
-            is_video = media.media_type == 2  # 1=photo, 2=video, 8=album
-            
-            # Get media URL
-            if is_video:
-                media_url = str(media.video_url) if media.video_url else ""
-            else:
-                # Use thumbnail_url for better quality, or display_url for highest
-                media_url = str(media.thumbnail_url) if media.thumbnail_url else ""
-                # # For highest quality image:
-                # media_url = str(media.display_url) if media.display_url else ""
-            
-            if media_url:
-                posts.append({
-                    "url": post_url,
-                    "caption": caption,
-                    "media_url": media_url,
-                    "is_video": is_video
-                })
+        # Limit posts using islice (efficient, doesn't load all posts into memory)
+        for post in islice(posts_iterator, config.POST_LIMIT):
+            try:
+                # Build post URL from shortcode
+                post_url = f"https://www.instagram.com/p/{post.shortcode}/"
+                
+                # Get caption (None if no caption)
+                caption = post.caption or ""
+                
+                # Determine media URL and type
+                is_video = post.is_video
+                
+                if is_video:
+                    # For videos, get the video URL
+                    media_url = post.video_url or ""
+                else:
+                    # For images, get the highest resolution URL
+                    # post.url gives the display URL for single images
+                    # For sidecars (carousel), we get the first image or you can iterate
+                    if post.typename == 'GraphSidecar':
+                        # Sidecar has multiple media - get first image as representative
+                        # Or iterate through: list(post.get_sidecar_nodes())
+                        sidecar_nodes = list(post.get_sidecar_nodes())
+                        if sidecar_nodes:
+                            media_url = sidecar_nodes[0].display_url
+                        else:
+                            media_url = post.url
+                    else:
+                        media_url = post.url
+                
+                if media_url:
+                    posts.append({
+                        "url": post_url,
+                        "caption": caption,
+                        "media_url": media_url,
+                        "is_video": is_video
+                    })
+                    
+            except Exception as post_error:
+                logging.warning(f"Error processing post for @{account}: {post_error}")
+                continue
         
         logging.info(f"Successfully fetched {len(posts)} IG posts for @{account}")
         
-    except LoginRequired:
-        logging.error(f"Login required to fetch @{account}. Enable authentication above.")
-    except ClientError as e:
-        logging.warning(f"Instagrapi client error for @{account}: {e}")
+    except instaloader.exceptions.ProfileNotExistsException:
+        logging.warning(f"Instagram profile @{account} does not exist")
+    except instaloader.exceptions.ConnectionException as e:
+        logging.warning(f"Connection error fetching @{account}: {e}")
+    except instaloader.exceptions.TooManyRequestsException:
+        logging.warning(f"Rate limited while fetching @{account}")
     except Exception as e:
         logging.warning(f"fetch_ig_urls exception for @{account}: {e}")
     
     return posts
-
-
-# # HELPER FUNCTION: For production use with session management
-# def get_instagram_client(
-#     username: str = "your_username",
-#     password: str = "your_password",
-#     session_file: str = "ig_session.json"
-# ) -> Client:
-#     """
-#     Get an authenticated Instagram client with session persistence.
-#     """
-#     cl = Client()
-#     session_path = Path(session_file)
-#     
-#     if session_path.exists():
-#         try:
-#             cl.load_settings(session_path)
-#             cl.login(username, password)
-#             logging.info("Logged in with existing session")
-#         except Exception as e:
-#             logging.warning(f"Session invalid, logging in fresh: {e}")
-#             cl.login(username, password)
-#             cl.dump_settings(session_path)
-#     else:
-#         cl.login(username, password)
-#         cl.dump_settings(session_path)
-#         logging.info("Fresh login, session saved")
-#     
-#     return cl
-#
-#
-# # USAGE EXAMPLE:
-# # Initialize client once (at app startup)
-# # ig_client = get_instagram_client()
-# #
-# # Then reuse it:
-# # posts = fetch_ig_urls("username", cl=ig_client)
