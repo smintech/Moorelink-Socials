@@ -5,8 +5,8 @@ from typing import List, Optional, Dict, Any
 
 import requests
 
-import config
-import persistence
+from Utils.config import *
+from Utils.persistence import *
 
 def rapidapi_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20, retries: int = 2) -> Dict[str, Any]:
     if not config.RAPIDAPI_KEY:
