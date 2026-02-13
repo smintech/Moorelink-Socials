@@ -12,7 +12,7 @@ from Utils.utils import *
 logger = logging.getLogger(__name__)
 
 # Global AI tasks dict (needed for cancellation)
-from Bot.ai import ai_tasks
+from .ai import ai_tasks
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
