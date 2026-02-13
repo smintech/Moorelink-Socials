@@ -20,8 +20,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = user.id if user else None
 
-    # record_user_and_check_ban is already called in message handler, but we call it here too for safety
-    from helpers import record_user_and_check_ban
+    #from helpers import record_user_and_check_ban
     await record_user_and_check_ban(update, context)
     data = query.data or ""
 
@@ -434,8 +433,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Main menu:", reply_markup=build_main_menu())
         return
     if data == "dashboard":
-        # Import dashboard_command from commands to avoid circular import
-        from Bot.commands import dashboard_command
         await dashboard_command(update, context)
         return
     if data == "menu_x":
@@ -465,8 +462,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Send the Instagram username (without @):", reply_markup=build_back_markup("menu_main"))
         return
     if data =="help":
-        # Import help_command
-        from Bot.commands import help_command
         await help_command(update, context)
         return
 
