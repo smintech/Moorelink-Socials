@@ -5,8 +5,8 @@ from typing import List, Optional, Dict, Any
 
 import requests
 
-from ..config import *
-from ..persistence import *
+from Utils import config
+from Utils import persistence
 
 def _normalize_account_input(account: str) -> str:
     if not account:
