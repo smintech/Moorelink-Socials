@@ -2,8 +2,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
-from config import *
-from persistence import *
+from .config import *
+from .persistence import *
 
 # Import fetchers
 from fetchers.x import *
