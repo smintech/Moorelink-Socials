@@ -3,8 +3,8 @@ from typing import List, Dict, Any
 
 import requests
 
-from Utils.config import *
-from Utils.persistence import *
+from ..config import *
+from ..persistence import *
 
 def fetch_ig_urls(account: str) -> List[Dict[str, Any]]:
     account = account.lstrip('@')
