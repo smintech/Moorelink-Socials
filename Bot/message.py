@@ -5,7 +5,7 @@ from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 from openai import AsyncOpenAI
 import os
-
+from typing import Dict, Optional, Any, Tuple, Callable, List
 from .settings import *
 from .helpers import *
 from .ui import *
