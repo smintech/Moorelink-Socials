@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 from Bot.settings import *
 from Bot.helpers import *
 from Bot.ui import *
-from Bot.fetch import handle_fetch_and_ai, send_next_post_with_confirmation, send_ai_button
+from Bot.fetch import *
 from Utils.utils import *
 
 logger = logging.getLogger(__name__)
