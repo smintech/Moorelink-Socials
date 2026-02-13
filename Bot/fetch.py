@@ -2,19 +2,9 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
-from settings import TEST_MODE, is_admin, POST_LIMIT
-from Bot.helpers import safe_send_media_or_link, schedule_delete, normalize_account
-from Utils.utils import (
-    fetch_latest_urls,
-    fetch_ig_urls,
-    fetch_fb_urls,
-    fetch_yt_videos,
-    extract_post_id,
-    is_post_new,
-    mark_posts_seen,
-    get_user_badge,
-    check_and_increment_cooldown,
-)
+from Bot.settings import *
+from Bot.helpers import *
+from Utils.utils import *
 
 logger = logging.getLogger(__name__)
 
