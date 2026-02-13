@@ -1,7 +1,7 @@
 import logging
 import time
 import re
-from typing import List, Optional, Dict, Any
+from typing import Dict, Optional, Any, Tuple, Callable, List
 
 import requests
 
