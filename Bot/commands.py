@@ -7,7 +7,7 @@ from Bot.helpers import *
 from Bot.ui import *
 from Bot.fetch import *
 from Bot.ai import ai_tasks
-from utils import *
+from Utils.utils import *
 
 logger = logging.getLogger(__name__)
 
