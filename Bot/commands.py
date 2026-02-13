@@ -2,11 +2,11 @@ import math
 import logging
 from telegram import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import ContextTypes
-from settings import *
-from helpers import *
-from ui import *
-from fetch import *
-from ai import ai_tasks
+from .settings import *
+from .helpers import *
+from .ui import *
+from .fetch import *
+from .ai import ai_tasks
 from Utils.utils import *
 
 logger = logging.getLogger(__name__)
