@@ -3,10 +3,10 @@ import logging
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import ContextTypes
-from Bot.settings import *
-from Bot.helpers import *
-from Bot.ui import *
-from Bot.fetch import *
+from settings import *
+from helpers import *
+from ui import *
+from fetch import *
 from Utils.utils import *
 
 logger = logging.getLogger(__name__)
