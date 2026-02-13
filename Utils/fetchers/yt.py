@@ -3,7 +3,7 @@ from typing import List, Optional, Dict, Any
 
 from googleapiclient.discovery import build
 
-from Utils.config import *
+from ..config import *
 
 def fetch_yt_videos(channel_handle: str, max_results: Optional[int] = None) -> List[Dict[str, Any]]:
     if max_results is None:
