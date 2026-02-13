@@ -8,3 +8,4 @@ httpx
 google-api-python-client
 ntscraper
 fastapi
+instagrapi
