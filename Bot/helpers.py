@@ -4,7 +4,7 @@ import io
 import asyncio
 import csv
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Dict, Optional, Any, Tuple, Callable, List
 from telegram import Update, Message, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.error import TelegramError
