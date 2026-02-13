@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Dict, Any
+from typing import Dict, Optional, Any, Tuple, Callable, List
 
 from googleapiclient.discovery import build
 
