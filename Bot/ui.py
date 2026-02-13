@@ -1,5 +1,5 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from typing import Optional
+from typing import Dict, Optional, Any, Tuple, Callable, List
 
 def build_main_menu():
     keyboard = [
