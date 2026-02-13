@@ -2,26 +2,12 @@ import math
 import logging
 from telegram import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import ContextTypes
-from Bot.settings import ADMIN_IDS, LEADERBOARD_LIMIT, TEST_MODE
-from Bot.helpers import get_invite_link, record_user_and_check_ban, schedule_delete
-from Bot.ui import build_main_menu, build_admin_menu, build_confirm_markup, build_back_markup
-from Bot.fetch import handle_fetch_and_ai
+from Bot.settings import *
+from Bot.helpers import *
+from Bot.ui import *
+from Bot.fetch import *
 from Bot.ai import ai_tasks
-from utils import (
-    get_user_badge,
-    get_tg_user,
-    count_saved_accounts,
-    BADGE_LEVELS,
-    get_tg_db,
-    ban_tg_user,
-    unban_tg_user,
-    reset_cooldown,
-    get_user_stats,
-    create_user_if_missing,
-    increment_invite_count,
-    list_active_tg_users,
-    list_all_tg_users,
-)
+from utils import *
 
 logger = logging.getLogger(__name__)
 
