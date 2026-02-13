@@ -10,11 +10,11 @@ from telegram.ext import (
     filters,
 )
 
-from Bot.settings import *
-from Bot.commands import *
+from .settings import *
+from .commands import *
 
-from Bot.callback import *
-from Bot.message import *
+from .callback import *
+from .message import *
 from Utils.utils import *
 
 logger = logging.getLogger(__name__)
