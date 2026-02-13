@@ -1,5 +1,4 @@
 import logging
-from typing import List, Dict, Any
 
 import requests
 
@@ -8,7 +7,7 @@ from Utils import persistence
 
 import random
 import time
-from typing import List, Dict, Any, Optional
+from typing import Dict, Optional, Any, Tuple, Callable, List
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
