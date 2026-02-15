@@ -71,7 +71,7 @@ if __name__ == "__main__":
         listen="0.0.0.0",
         port=port,
         url_path=TELEGRAM_TOKEN,
-        webhook_url=f"https://moorelink-socials-435o.onrender.com/{TELEGRAM_TOKEN}",
+        webhook_url=f"https://moorelink-socials-2.onrender.com/{TELEGRAM_TOKEN}",
         allowed_updates=["message", "callback_query"],
         drop_pending_updates=True
     )
