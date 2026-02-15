@@ -1,33 +1,132 @@
 import logging
-
 import requests
-
 from Utils import config
 from Utils import persistence
-
 import random
 import time
 from typing import Dict, Optional, Any, Tuple, Callable, List
-
 from itertools import islice
-import logging
 import asyncio
 import json
-import random
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from typing import List, Dict, Any
 import datetime
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-def _random_delay(min_sec: float = 0.5, max_sec: float = 2.0):
+# ═══════════════════════════════════════════════════════════════════════════
+# ENHANCED LOGGING SETUP
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _setup_logging():
+    """Setup detailed logging with timestamps and context"""
+    logger = logging.getLogger(__name__)
+    
+    if not logger.handlers:
+        formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)-8s | %(funcName)-20s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+    
+    return logger
+
+logger = _setup_logging()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INSTAGRAM SELECTORS (Updated for 2024)
+# ═══════════════════════════════════════════════════════════════════════════
+
+INSTAGRAM_SELECTORS = {
+    # Posts
+    "post_links": [
+        'a[href^="/p/"]',  # Primary selector
+        'article a[href^="/p/"]',  # Within article
+        'div[role="feed"] a[href^="/p/"]',  # Within feed
+    ],
+    
+    # Captions/Text
+    "caption": [
+        'h2 + div span',  # Caption near username
+        'div[data-testid="post-comment-text"]',  # Comment area caption
+        'span:has-text("liked by")',  # Alternative
+        'article div[role="button"] span',  # Carousel
+    ],
+    
+    # Media
+    "image": [
+        'article img[alt]:not([alt=""])',  # Main image
+        'div[role="img"] img',  # Div-based image
+        'img[alt*="post"]',  # Alt contains post
+        'img[loading="lazy"]',  # Lazy loaded
+    ],
+    
+    "video": [
+        'article video',  # Video element
+        'video[src]',  # With src
+    ],
+    
+    # User Info
+    "username": [
+        'a[title]:not([href*="/"])',  # Username link
+        'span[data-testid="profile-username"]',  # Profile username
+        'h1',  # Heading
+    ],
+    
+    "follower_count": [
+        'button span span',  # Follower info
+        'span:has-text("followers")',  # Follower text
+    ],
+    
+    # Popups/Modals
+    "cookie_accept": [
+        'button:has-text("Allow all")',
+        'button:has-text("Accept")',
+        'button[aria-label*="Allow"]',
+    ],
+    
+    "login_popup": [
+        'div[role="dialog"] button:has-text("Not Now")',
+        'div[role="dialog"]:has-text("Log in")',
+    ],
+    
+    "notification_popup": [
+        'button:has-text("Not Now")',
+        'button:has-text("Turn on Notifications")',
+    ],
+    
+    # Private account
+    "private_notice": [
+        'h2:has-text("This account is private")',
+        'span:has-text("This account is private")',
+    ],
+    
+    # Challenge
+    "challenge_prompt": [
+        'text="It looks like you were misusing"',
+        'text="Confirm it\'s you"',
+        'button:has-text("This was me")',
+    ],
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS WITH ENHANCED LOGGING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _random_delay(min_sec: float = 0.5, max_sec: float = 2.0) -> float:
     """Generate random delay with jitter"""
-    return random.uniform(min_sec, max_sec)
+    delay = random.uniform(min_sec, max_sec)
+    logger.debug(f"Random delay: {delay:.2f}s")
+    return delay
 
 def _get_enhanced_stealth_script() -> str:
     """Generate comprehensive anti-detection JavaScript"""
+    logger.info("Loading enhanced stealth script")
     
     return """
     // ============================================
-    // COMPREHENSIVE STEALTH SCRIPT
+    // COMPREHENSIVE STEALTH SCRIPT v2024
     // ============================================
     
     // 1. WebDriver Detection
@@ -195,16 +294,6 @@ def _get_enhanced_stealth_script() -> str:
     Object.defineProperty(window, 'outerWidth', { value: window.innerWidth });
     Object.defineProperty(window, 'outerHeight', { value: window.innerHeight + 85 });
     
-    // 20. Mouse/Touch events (make them look real)
-    const originalAddEventListener = EventTarget.prototype.addEventListener;
-    EventTarget.prototype.addEventListener = function(type, listener, options) {
-        if (type === 'mouseenter' || type === 'mouseleave') {
-            // Instagram checks for these
-            return originalAddEventListener.apply(this, arguments);
-        }
-        return originalAddEventListener.apply(this, arguments);
-    };
-    
     console.log('🛡️ Stealth mode activated');
     """
 
@@ -217,7 +306,9 @@ def _get_random_viewport() -> Dict[str, int]:
         {'width': 1440, 'height': 900},
         {'width': 1600, 'height': 900},
     ]
-    return random.choice(viewports)
+    selected = random.choice(viewports)
+    logger.info(f"Selected viewport: {selected['width']}x{selected['height']}")
+    return selected
 
 def _get_realistic_user_agent() -> str:
     """Get a realistic, recent user agent"""
@@ -227,20 +318,48 @@ def _get_realistic_user_agent() -> str:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
     ]
-    return random.choice(user_agents)
+    selected = random.choice(user_agents)
+    logger.info(f"Selected user agent: {selected[:60]}...")
+    return selected
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SELECTOR MATCHING WITH FALLBACK
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _find_element(page, selector_list: List[str], timeout: int = 3000, description: str = "element"):
+    """Try multiple selectors with fallback"""
+    logger.debug(f"Looking for {description} with {len(selector_list)} selector(s)")
+    
+    for idx, selector in enumerate(selector_list, 1):
+        try:
+            logger.debug(f"  [{idx}/{len(selector_list)}] Trying: {selector[:60]}")
+            element = page.locator(selector)
+            
+            # Check visibility with short timeout
+            if await element.is_visible(timeout=timeout):
+                logger.debug(f"  ✓ Found {description} with selector #{idx}")
+                return element
+        except Exception as e:
+            logger.debug(f"  ✗ Selector #{idx} failed: {str(e)[:50]}")
+            continue
+    
+    logger.warning(f"⚠️  Could not find {description} with any selector")
+    return None
 
 async def _random_scroll(page):
     """Perform random scrolling to mimic human behavior"""
     try:
         scroll_amount = random.randint(100, 500)
+        logger.debug(f"Scrolling by {scroll_amount}px")
         await page.evaluate(f'window.scrollBy(0, {scroll_amount})')
         await asyncio.sleep(_random_delay(0.3, 0.8))
         await page.evaluate(f'window.scrollBy(0, -{scroll_amount // 2})')
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"Scroll failed: {e}")
 
 async def _human_like_type(page, selector: str, text: str):
     """Type text with human-like random delays"""
+    logger.info(f"Human-like typing into: {selector}")
     await page.click(selector)
     await asyncio.sleep(_random_delay(0.1, 0.3))
     
@@ -249,201 +368,102 @@ async def _human_like_type(page, selector: str, text: str):
         await asyncio.sleep(_random_delay(0.05, 0.15))
     
     await asyncio.sleep(_random_delay(0.3, 0.6))
+    logger.debug("Typing complete")
 
-async def _handle_popups(page):
-    """Handle various popups that Instagram shows, including anonymous browsing popups"""
-    logger = logging.getLogger(__name__)
-    logger.info("Checking for popups...")
+# ═══════════════════════════════════════════════════════════════════════════
+# POPUP HANDLING WITH ENHANCED LOGGING
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _handle_popups(page) -> bool:
+    """Handle various popups with improved logging"""
+    logger.info("🔍 Checking for popups...")
     popup_handled = False
     
-    # Cookie consent popup
-    cookie_selectors = [
-        ('button:has-text("Allow all cookies")', "Allow all cookies"),
-        ('button:has-text("Accept all")', "Accept all"),
-        ('button >> text="Allow all cookies"', "Allow all cookies (text)"),
-    ]
+    popup_types = {
+        "cookie_consent": INSTAGRAM_SELECTORS["cookie_accept"],
+        "login_popup": INSTAGRAM_SELECTORS["login_popup"],
+        "notification": INSTAGRAM_SELECTORS["notification_popup"],
+    }
     
-    for selector, description in cookie_selectors:
+    for popup_name, selectors in popup_types.items():
         try:
-            if await page.locator(selector).is_visible(timeout=1000):
-                logger.info(f"Found cookie consent: {description}")
+            element = await _find_element(page, selectors, timeout=1500, description=f"{popup_name} popup")
+            
+            if element:
+                logger.info(f"  ✓ Found {popup_name} popup - dismissing...")
                 await asyncio.sleep(_random_delay(0.5, 1.0))
-                await page.click(selector)
-                logger.info(f"Clicked '{description}'")
+                await element.click()
+                logger.info(f"  ✓ Dismissed {popup_name}")
                 await asyncio.sleep(_random_delay(2.0, 3.0))
                 popup_handled = True
                 break
-        except:
-            pass
-    
-    # Decline optional cookies
-    if not popup_handled:
-        decline_selectors = [
-            ('button:has-text("Decline optional cookies")', "Decline optional cookies"),
-        ]
-        
-        for selector, description in decline_selectors:
-            try:
-                if await page.locator(selector).is_visible(timeout=1000):
-                    logger.info(f"Found: {description}")
-                    await asyncio.sleep(_random_delay(0.5, 1.0))
-                    await page.click(selector)
-                    logger.info(f"Clicked '{description}'")
-                    await asyncio.sleep(_random_delay(2.0, 3.0))
-                    popup_handled = True
-                    break
-            except:
-                pass
-    
-    # Save login info popup (mostly for logged in)
-    try:
-        if await page.locator('text="Save your login info?"').is_visible(timeout=1000):
-            logger.info("Found 'Save Your Login Info' popup")
-            not_now_buttons = await page.locator('button:has-text("Not Now")').all()
-            if not_now_buttons:
-                await asyncio.sleep(_random_delay(0.5, 1.0))
-                await not_now_buttons[0].click()
-                logger.info("Dismissed 'Save Login Info' popup")
-                await asyncio.sleep(_random_delay(1.0, 2.0))
-                popup_handled = True
-    except:
-        pass
-    
-    # Notifications popup
-    try:
-        if await page.locator('text="Turn on Notifications"').is_visible(timeout=1000):
-            logger.info("Found 'Turn on Notifications' popup")
-            not_now_buttons = await page.locator('button:has-text("Not Now")').all()
-            if not_now_buttons:
-                await asyncio.sleep(_random_delay(0.5, 1.0))
-                await not_now_buttons[-1].click()
-                logger.info("Dismissed notifications popup")
-                await asyncio.sleep(_random_delay(1.0, 2.0))
-                popup_handled = True
-    except:
-        pass
-    
-    # Anonymous login/signup popup (e.g., "Log in to continue" or "Sign up to see more")
-    try:
-        login_popup_indicators = [
-            'text="Log in to continue"',
-            'text="Sign up to see photos and videos from your friends"',
-            'div[role="dialog"] >> text="Log in"',
-        ]
-        for indicator in login_popup_indicators:
-            if await page.locator(indicator).is_visible(timeout=1000):
-                logger.info("Found anonymous login/signup popup")
-                # Try multiple dismiss selectors
-                dismiss_selectors = [
-                    'button:has-text("Not Now")',
-                    'button:has-text("Maybe Later")',
-                    'svg[aria-label="Close"]',
-                    'button[aria-label="Close"]',
-                    'div[role="dialog"] button:has-text("Dismiss")',
-                ]
-                for dismiss_selector in dismiss_selectors:
-                    dismiss_buttons = await page.locator(dismiss_selector).all()
-                    if dismiss_buttons:
-                        await asyncio.sleep(_random_delay(0.5, 1.0))
-                        await dismiss_buttons[0].click()
-                        logger.info(f"Dismissed login popup using {dismiss_selector}")
-                        await asyncio.sleep(_random_delay(1.0, 2.0))
-                        popup_handled = True
-                        break
-                if popup_handled:
-                    break
-                else:
-                    logger.warning("Could not find dismiss button for login popup")
-    except:
-        pass
+        except Exception as e:
+            logger.debug(f"  ✗ {popup_name} check failed: {str(e)[:50]}")
+            continue
     
     if not popup_handled:
-        logger.info("No popups found")
+        logger.info("  ℹ️ No popups found")
     
     return popup_handled
 
-async def _handle_challenge(page):
-    """Handle Instagram challenge"""
-    logger = logging.getLogger(__name__)
-    logger.warning("Handling security challenge...")
+async def _handle_challenge(page) -> bool:
+    """Handle Instagram challenge with logging"""
+    logger.warning("🚨 Challenge detected - attempting recovery...")
     
     await asyncio.sleep(_random_delay(1.0, 2.0))
     
-    # Check for "This was me" button
+    challenge_selectors = [
+        'button:has-text("This was me")',
+        'button[type="button"]:has-text("This was me")',
+    ]
+    
     try:
-        if await page.locator('button:has-text("This was me")').is_visible(timeout=3000):
-            logger.info("Found 'This was me' button")
-            await page.click('button:has-text("This was me")')
-            logger.info("Clicked 'This was me'")
+        element = await _find_element(page, challenge_selectors, timeout=3000, description="'This was me' button")
+        if element:
+            logger.info("  ✓ Found 'This was me' button - clicking...")
+            await element.click()
+            logger.info("  ✓ Challenge button clicked")
             await asyncio.sleep(_random_delay(3.0, 5.0))
             return True
-    except:
-        pass
-    
-    # Check for verification code input
-    try:
-        code_selector = 'input[name="verificationCode"], input[placeholder*="code" i]'
-        if await page.locator(code_selector).is_visible(timeout=3000):
-            logger.info("Verification code required")
-            # Since headless, we can't input, but for completeness, assume manual if possible
-            # In production, this might raise or log
-            raise Exception("Verification code required - manual intervention needed")
-            # code = input("\n📧 Enter verification code: ").strip()
-            # await _human_like_type(page, code_selector, code)
-            # await page.click('button[type="submit"]')
-            # logger.info("Code submitted")
-            # await asyncio.sleep(_random_delay(3.0, 5.0))
-            # return True
     except Exception as e:
-        logger.error(f"Challenge handling error: {e}")
+        logger.error(f"  ✗ Failed to handle challenge: {e}")
     
-    # Unknown challenge type
-    logger.warning("Unknown challenge type - manual intervention needed")
-    # input("⏸️  Complete the challenge manually, then press Enter...")
-    raise Exception("Unknown challenge - manual intervention needed")
-    
-    return False
+    logger.error("  ❌ Could not auto-handle challenge - manual intervention needed")
+    raise Exception("Challenge required - manual intervention needed")
 
-async def _handle_2fa(page):
-    """Handle 2FA"""
-    logger = logging.getLogger(__name__)
-    logger.warning("Handling 2FA...")
-    
-    # Since headless, can't input, raise or log
+async def _handle_2fa(page) -> bool:
+    """Handle 2FA with logging"""
+    logger.error("🔐 2FA code required - cannot proceed in headless mode")
     raise Exception("2FA code required - manual intervention needed")
-    # code = input("\n🔐 Enter 2FA code: ").strip()
-    # await _human_like_type(page, 'input[name="verificationCode"]', code)
-    # await asyncio.sleep(_random_delay(0.5, 1.0))
-    # await page.click('button[type="submit"]')
-    # logger.info("2FA code submitted")
-    # await asyncio.sleep(_random_delay(3.0, 5.0))
-    return True
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN SCRAPING FUNCTION
+# ═══════════════════════════════════════════════════════════════════════════
 
 async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
-    Fetch Instagram post URLs, captions, and media URLs using Playwright with stealth.
+    Fetch Instagram post URLs, captions, and media URLs using Playwright.
+    
     Args:
-    account: Instagram username (with or without @)
-    cookies: Optional list of cookies for logged-in session (for private profiles)
+        account: Instagram username (with or without @)
+        cookies: Optional list of cookies for logged-in session
+    
     Returns:
-    List of dicts with url, caption, media_url, is_video
+        List of dicts with url, caption, media_url, is_video
     """
     account = account.lstrip('@')
     posts = []
     
-    logger = logging.getLogger(__name__)
-    logger.info(f"Fetching posts for @{account}")
+    logger.info("=" * 70)
+    logger.info(f"🚀 Starting Instagram scrape for @{account}")
+    logger.info("=" * 70)
     
-    # Random viewport
     viewport = _get_random_viewport()
-    logger.info(f"Viewport: {viewport['width']}x{viewport['height']}")
-    
-    # User agent
     user_agent = _get_realistic_user_agent()
-    logger.info(f"User agent: {user_agent[:50]}...")
     
     async with async_playwright() as p:
         # Launch browser with stealth args
+        logger.info("📱 Launching browser...")
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -460,8 +480,10 @@ async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None) -> L
                 f'--window-size={viewport["width"]},{viewport["height"]}'
             ]
         )
+        logger.info("  ✓ Browser launched")
         
         # Create context with realistic settings
+        logger.info("🔧 Creating browser context...")
         context = await browser.new_context(
             viewport=viewport,
             locale='en-US',
@@ -482,150 +504,159 @@ async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None) -> L
             }
         )
         
-        # Apply comprehensive stealth script
+        # Apply stealth script
         await context.add_init_script(_get_enhanced_stealth_script())
+        logger.info("  ✓ Stealth script injected")
         
-        logger.info("Browser context configured with stealth")
-        
+        # Add cookies if provided
         if cookies:
             await context.add_cookies(cookies)
-            logger.info("Using logged-in session")
+            logger.info(f"  ✓ Added {len(cookies)} cookies (logged-in session)")
         
         page = await context.new_page()
         
         try:
             # Load profile page
-            await page.goto(f'https://www.instagram.com/{account}/', 
-                            wait_until='networkidle', 
-                            timeout=60000)
+            logger.info(f"🌐 Loading profile: https://www.instagram.com/{account}/")
+            await page.goto(
+                f'https://www.instagram.com/{account}/',
+                wait_until='networkidle',
+                timeout=60000
+            )
             await asyncio.sleep(_random_delay(2.0, 4.0))
+            logger.info("  ✓ Profile page loaded")
             
+            # Check for challenge
             current_url = page.url
             if '/challenge/' in current_url or 'suspicious' in current_url.lower():
-                logger.warning("Challenge detected on profile load")
-                handled = await _handle_challenge(page)
-                if not handled:
-                    raise Exception("Failed to handle challenge")
-                # Reload after handle
-                await page.goto(f'https://www.instagram.com/{account}/', 
-                                wait_until='networkidle', 
-                                timeout=60000)
-            
-            if await page.locator('input[name="verificationCode"], input[aria-label*="code"]').is_visible(timeout=3000):
-                logger.warning("2FA detected on profile load")
-                handled = await _handle_2fa(page)
-                if not handled:
-                    raise Exception("Failed to handle 2FA")
-                # Reload after handle
-                await page.goto(f'https://www.instagram.com/{account}/', 
-                                wait_until='networkidle', 
-                                timeout=60000)
+                logger.warning("⚠️  Challenge detected on profile load")
+                await _handle_challenge(page)
+                await page.goto(f'https://www.instagram.com/{account}/', timeout=60000)
             
             # Handle popups
+            logger.info("🛑 Handling initial popups...")
             popup_attempts = 0
-            max_popup_attempts = 5
+            max_popup_attempts = 3
+            
             while popup_attempts < max_popup_attempts:
                 popup_found = await _handle_popups(page)
                 if popup_found:
                     popup_attempts += 1
-                    logger.info(f"Popup handled, checking for more... (attempt {popup_attempts}/{max_popup_attempts})")
                     await asyncio.sleep(_random_delay(0.5, 1.5))
                 else:
-                    logger.info("All popups handled")
                     break
+            
+            logger.info(f"  ✓ Popup handling complete ({popup_attempts} handled)")
             
             # Simulate human behavior
             await _random_scroll(page)
             await asyncio.sleep(_random_delay(1.0, 2.0))
             
             # Check if private
-            private_selector = 'h2:has-text("This account is private")'
-            if await page.locator(private_selector).is_visible(timeout=5000):
+            logger.info("🔒 Checking if profile is private...")
+            private_element = await _find_element(
+                page,
+                INSTAGRAM_SELECTORS["private_notice"],
+                timeout=5000,
+                description="private notice"
+            )
+            
+            if private_element:
                 if not cookies:
-                    logger.warning("Private profile - need logged-in session")
+                    logger.warning("  ⚠️ Private profile - need logged-in session (cookies)")
                     return []
                 else:
-                    # If cookies provided but still private, perhaps invalid
-                    logger.warning("Private profile detected even with cookies - session may be invalid")
+                    logger.warning("  ⚠️ Private profile detected even with cookies")
                     return []
             
-            # Scroll to load posts (for limited number)
+            logger.info("  ✓ Profile is public")
+            
+            # Scroll and load posts
+            logger.info(f"📸 Loading posts (limit: {config.POST_LIMIT})...")
             loaded_posts = 0
-            max_scroll_attempts = 20  # Prevent infinite loop
+            max_scroll_attempts = 20
             scroll_attempts = 0
             
             while loaded_posts < config.POST_LIMIT and scroll_attempts < max_scroll_attempts:
-                # Handle popups after each scroll (useful for anonymous login popups)
                 await _handle_popups(page)
                 
                 # Find post links
-                post_links_selector = 'a[href^="/p/"]'
-                post_links = await page.locator(post_links_selector).all()
+                post_links = await page.locator(INSTAGRAM_SELECTORS["post_links"][0]).all()
+                logger.debug(f"Found {len(post_links)} post links on page")
                 
                 # Process new links
                 for link in post_links[loaded_posts:]:
                     if loaded_posts >= config.POST_LIMIT:
                         break
+                    
                     try:
                         post_url = await link.get_attribute('href')
                         post_url = f"https://www.instagram.com{post_url}"
+                        
+                        logger.info(f"  [{loaded_posts + 1}/{config.POST_LIMIT}] Processing: {post_url}")
                         
                         # Visit post
                         await page.goto(post_url, wait_until='networkidle', timeout=30000)
                         await asyncio.sleep(_random_delay(1.0, 2.0))
                         
-                        current_url = page.url
-                        if '/challenge/' in current_url or 'suspicious' in current_url.lower():
-                            logger.warning("Challenge detected on post load")
-                            handled = await _handle_challenge(page)
-                            if not handled:
-                                raise Exception("Failed to handle challenge")
-                            # Reload post
-                            await page.goto(post_url, wait_until='networkidle', timeout=30000)
+                        # Check for challenge
+                        if '/challenge/' in page.url:
+                            logger.warning("    ⚠️  Challenge on post - skipping")
+                            await page.goto(f'https://www.instagram.com/{account}/', timeout=30000)
+                            continue
                         
-                        if await page.locator('input[name="verificationCode"], input[aria-label*="code"]').is_visible(timeout=3000):
-                            logger.warning("2FA detected on post load")
-                            handled = await _handle_2fa(page)
-                            if not handled:
-                                raise Exception("Failed to handle 2FA")
-                            # Reload post
-                            await page.goto(post_url, wait_until='networkidle', timeout=30000)
-                        
-                        # Handle popups on post page
+                        # Handle popups
                         await _handle_popups(page)
                         
-                        # Simulate human
-                        await _random_scroll(page)
-                        
                         # Extract caption
-                        caption_selector = 'div[data-testid="post-comment-text"]'  # May need update if IG changes
+                        logger.debug("    Extracting caption...")
                         caption = ""
                         try:
-                            caption_elements = await page.locator(caption_selector).all()
-                            if caption_elements:
-                                caption = await caption_elements[0].inner_text()
-                        except:
-                            pass
+                            caption_element = await _find_element(
+                                page,
+                                INSTAGRAM_SELECTORS["caption"],
+                                timeout=2000,
+                                description="caption"
+                            )
+                            
+                            if caption_element:
+                                caption = await caption_element.inner_text()
+                                logger.debug(f"    ✓ Caption found: {caption[:50]}...")
+                        except Exception as e:
+                            logger.debug(f"    ✗ Caption extraction failed: {e}")
                         
-                        # Extract media URL and type
-                        image_selector = 'img[alt*="image"]'  # Adjust for accuracy
-                        video_selector = 'video[source]'
-                        
+                        # Extract media
+                        logger.debug("    Extracting media...")
                         is_video = False
                         media_url = ""
                         
                         try:
-                            video_elements = await page.locator(video_selector).all()
-                            if video_elements:
+                            video_element = await _find_element(
+                                page,
+                                INSTAGRAM_SELECTORS["video"],
+                                timeout=2000,
+                                description="video"
+                            )
+                            
+                            if video_element:
                                 is_video = True
-                                media_url = await video_elements[0].get_attribute('src')
+                                media_url = await video_element.get_attribute('src')
+                                logger.debug(f"    ✓ Video found: {media_url[:60]}...")
                             else:
-                                image_elements = await page.locator(image_selector).all()
-                                if image_elements:
-                                    media_url = await image_elements[0].get_attribute('src')
-                        except:
-                            pass
+                                image_element = await _find_element(
+                                    page,
+                                    INSTAGRAM_SELECTORS["image"],
+                                    timeout=2000,
+                                    description="image"
+                                )
+                                
+                                if image_element:
+                                    media_url = await image_element.get_attribute('src')
+                                    logger.debug(f"    ✓ Image found: {media_url[:60]}...")
+                        except Exception as e:
+                            logger.debug(f"    ✗ Media extraction failed: {e}")
                         
+                        # Store post
                         if media_url:
                             posts.append({
                                 "url": post_url,
@@ -634,41 +665,43 @@ async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None) -> L
                                 "is_video": is_video
                             })
                             loaded_posts += 1
-                            logger.info(f"Processed post {loaded_posts}: {post_url}")
+                            logger.info(f"    ✓ Post #{loaded_posts} saved")
+                        else:
+                            logger.warning(f"    ⚠️ No media found - skipping")
                         
-                        # Go back to profile with human delay
+                        # Go back with human delay
                         await page.go_back(timeout=30000)
                         await asyncio.sleep(_random_delay(2.0, 3.0))
                         
-                        # Handle any popups after back
-                        await _handle_popups(page)
-                        
                     except Exception as e:
-                        logger.warning(f"Error processing post: {e}")
-                        # Continue to next
+                        logger.error(f"    ✗ Error processing post: {e}")
                         await page.goto(f'https://www.instagram.com/{account}/', timeout=30000)
                         await asyncio.sleep(_random_delay(1.0, 2.0))
                 
                 if loaded_posts >= config.POST_LIMIT:
                     break
                 
-                # Scroll down with human variation
+                # Scroll down
+                logger.debug(f"Scrolling to load more posts... (attempt {scroll_attempts + 1}/{max_scroll_attempts})")
                 await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
                 await asyncio.sleep(_random_delay(2.0, 4.0))
                 scroll_attempts += 1
                 
-                # Random extra scroll
-                if random.random() > 0.5:
+                if random.random() > 0.7:
                     await _random_scroll(page)
             
-            logger.info(f"Fetched {len(posts)} posts")
+            logger.info("=" * 70)
+            logger.info(f"✅ Scrape complete: {len(posts)} posts fetched")
+            logger.info("=" * 70)
         
         except Exception as e:
-            logger.error(f"Error fetching @{account}: {e}")
-            # Optional: screenshot for debug
-            # await page.screenshot(path=f'error_fetch_{account}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+            logger.error("=" * 70)
+            logger.error(f"❌ Fatal error during scrape: {e}")
+            logger.exception("Full traceback:")
+            logger.error("=" * 70)
         
         finally:
             await browser.close()
+            logger.info("🔌 Browser closed")
     
     return posts
