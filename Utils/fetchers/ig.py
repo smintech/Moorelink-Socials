@@ -10,10 +10,11 @@ import time
 from typing import Dict, Optional, Any, Tuple, Callable, List
 
 from itertools import islice
+import logging
 import asyncio
 import json
 import random
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from typing import List, Dict, Any
 import datetime
 
@@ -240,8 +241,19 @@ async def _random_scroll(page):
     except:
         pass
 
+async def _human_like_type(page, selector: str, text: str):
+    """Type text with human-like random delays"""
+    await page.click(selector)
+    await asyncio.sleep(_random_delay(0.1, 0.3))
+    
+    for char in text:
+        await page.keyboard.type(char)
+        await asyncio.sleep(_random_delay(0.05, 0.15))
+    
+    await asyncio.sleep(_random_delay(0.3, 0.6))
+
 async def _handle_popups(page):
-    """Handle various popups that Instagram shows"""
+    """Handle various popups that Instagram shows, including anonymous browsing popups"""
     logger = logging.getLogger(__name__)
     logger.info("Checking for popups...")
     popup_handled = False
@@ -285,7 +297,21 @@ async def _handle_popups(page):
             except:
                 pass
     
-    # Other popups if needed
+    # Save login info popup (mostly for logged in)
+    try:
+        if await page.locator('text="Save your login info?"').is_visible(timeout=1000):
+            logger.info("Found 'Save Your Login Info' popup")
+            not_now_buttons = await page.locator('button:has-text("Not Now")').all()
+            if not_now_buttons:
+                await asyncio.sleep(_random_delay(0.5, 1.0))
+                await not_now_buttons[0].click()
+                logger.info("Dismissed 'Save Login Info' popup")
+                await asyncio.sleep(_random_delay(1.0, 2.0))
+                popup_handled = True
+    except:
+        pass
+    
+    # Notifications popup
     try:
         if await page.locator('text="Turn on Notifications"').is_visible(timeout=1000):
             logger.info("Found 'Turn on Notifications' popup")
@@ -299,10 +325,101 @@ async def _handle_popups(page):
     except:
         pass
     
+    # Anonymous login/signup popup (e.g., "Log in to continue" or "Sign up to see more")
+    try:
+        login_popup_indicators = [
+            'text="Log in to continue"',
+            'text="Sign up to see photos and videos from your friends"',
+            'div[role="dialog"] >> text="Log in"',
+        ]
+        for indicator in login_popup_indicators:
+            if await page.locator(indicator).is_visible(timeout=1000):
+                logger.info("Found anonymous login/signup popup")
+                # Try multiple dismiss selectors
+                dismiss_selectors = [
+                    'button:has-text("Not Now")',
+                    'button:has-text("Maybe Later")',
+                    'svg[aria-label="Close"]',
+                    'button[aria-label="Close"]',
+                    'div[role="dialog"] button:has-text("Dismiss")',
+                ]
+                for dismiss_selector in dismiss_selectors:
+                    dismiss_buttons = await page.locator(dismiss_selector).all()
+                    if dismiss_buttons:
+                        await asyncio.sleep(_random_delay(0.5, 1.0))
+                        await dismiss_buttons[0].click()
+                        logger.info(f"Dismissed login popup using {dismiss_selector}")
+                        await asyncio.sleep(_random_delay(1.0, 2.0))
+                        popup_handled = True
+                        break
+                if popup_handled:
+                    break
+                else:
+                    logger.warning("Could not find dismiss button for login popup")
+    except:
+        pass
+    
     if not popup_handled:
         logger.info("No popups found")
     
     return popup_handled
+
+async def _handle_challenge(page):
+    """Handle Instagram challenge"""
+    logger = logging.getLogger(__name__)
+    logger.warning("Handling security challenge...")
+    
+    await asyncio.sleep(_random_delay(1.0, 2.0))
+    
+    # Check for "This was me" button
+    try:
+        if await page.locator('button:has-text("This was me")').is_visible(timeout=3000):
+            logger.info("Found 'This was me' button")
+            await page.click('button:has-text("This was me")')
+            logger.info("Clicked 'This was me'")
+            await asyncio.sleep(_random_delay(3.0, 5.0))
+            return True
+    except:
+        pass
+    
+    # Check for verification code input
+    try:
+        code_selector = 'input[name="verificationCode"], input[placeholder*="code" i]'
+        if await page.locator(code_selector).is_visible(timeout=3000):
+            logger.info("Verification code required")
+            # Since headless, we can't input, but for completeness, assume manual if possible
+            # In production, this might raise or log
+            raise Exception("Verification code required - manual intervention needed")
+            # code = input("\n📧 Enter verification code: ").strip()
+            # await _human_like_type(page, code_selector, code)
+            # await page.click('button[type="submit"]')
+            # logger.info("Code submitted")
+            # await asyncio.sleep(_random_delay(3.0, 5.0))
+            # return True
+    except Exception as e:
+        logger.error(f"Challenge handling error: {e}")
+    
+    # Unknown challenge type
+    logger.warning("Unknown challenge type - manual intervention needed")
+    # input("⏸️  Complete the challenge manually, then press Enter...")
+    raise Exception("Unknown challenge - manual intervention needed")
+    
+    return False
+
+async def _handle_2fa(page):
+    """Handle 2FA"""
+    logger = logging.getLogger(__name__)
+    logger.warning("Handling 2FA...")
+    
+    # Since headless, can't input, raise or log
+    raise Exception("2FA code required - manual intervention needed")
+    # code = input("\n🔐 Enter 2FA code: ").strip()
+    # await _human_like_type(page, 'input[name="verificationCode"]', code)
+    # await asyncio.sleep(_random_delay(0.5, 1.0))
+    # await page.click('button[type="submit"]')
+    # logger.info("2FA code submitted")
+    # await asyncio.sleep(_random_delay(3.0, 5.0))
+    return True
 
 async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
@@ -359,7 +476,7 @@ async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None) -> L
             color_scheme='light',
             extra_http_headers={
                 'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
+                'Accept-Encoding': 'gzip, deflate',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'DNT': '1',
                 'Connection': 'keep-alive',
@@ -384,6 +501,27 @@ async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None) -> L
                             wait_until='networkidle', 
                             timeout=60000)
             await asyncio.sleep(_random_delay(2.0, 4.0))
+            
+            current_url = page.url
+            if '/challenge/' in current_url or 'suspicious' in current_url.lower():
+                logger.warning("Challenge detected on profile load")
+                handled = await _handle_challenge(page)
+                if not handled:
+                    raise Exception("Failed to handle challenge")
+                # Reload after handle
+                await page.goto(f'https://www.instagram.com/{account}/', 
+                                wait_until='networkidle', 
+                                timeout=60000)
+            
+            if await page.locator('input[name="verificationCode"], input[aria-label*="code"]').is_visible(timeout=3000):
+                logger.warning("2FA detected on profile load")
+                handled = await _handle_2fa(page)
+                if not handled:
+                    raise Exception("Failed to handle 2FA")
+                # Reload after handle
+                await page.goto(f'https://www.instagram.com/{account}/', 
+                                wait_until='networkidle', 
+                                timeout=60000)
             
             # Handle popups
             popup_attempts = 0
@@ -419,6 +557,9 @@ async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None) -> L
             scroll_attempts = 0
             
             while loaded_posts < config.POST_LIMIT and scroll_attempts < max_scroll_attempts:
+                # Handle popups after each scroll (useful for anonymous login popups)
+                await _handle_popups(page)
+                
                 # Find post links
                 post_links_selector = 'a[href^="/p/"]'
                 post_links = await page.locator(post_links_selector).all()
@@ -434,6 +575,26 @@ async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None) -> L
                         # Visit post
                         await page.goto(post_url, wait_until='networkidle', timeout=30000)
                         await asyncio.sleep(_random_delay(1.0, 2.0))
+                        
+                        current_url = page.url
+                        if '/challenge/' in current_url or 'suspicious' in current_url.lower():
+                            logger.warning("Challenge detected on post load")
+                            handled = await _handle_challenge(page)
+                            if not handled:
+                                raise Exception("Failed to handle challenge")
+                            # Reload post
+                            await page.goto(post_url, wait_until='networkidle', timeout=30000)
+                        
+                        if await page.locator('input[name="verificationCode"], input[aria-label*="code"]').is_visible(timeout=3000):
+                            logger.warning("2FA detected on post load")
+                            handled = await _handle_2fa(page)
+                            if not handled:
+                                raise Exception("Failed to handle 2FA")
+                            # Reload post
+                            await page.goto(post_url, wait_until='networkidle', timeout=30000)
+                        
+                        # Handle popups on post page
+                        await _handle_popups(page)
                         
                         # Simulate human
                         await _random_scroll(page)
