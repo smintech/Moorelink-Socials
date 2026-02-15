@@ -18,4 +18,4 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["python", "-m", "Bot.bot:app",]
+CMD ["python", "-m", "Bot.bot",]
