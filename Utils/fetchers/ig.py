@@ -18,8 +18,6 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 from typing import List, Dict, Any
 import datetime
 
-# Assume config.POST_LIMIT exists, e.g., config.POST_LIMIT = 10
-
 def _random_delay(min_sec: float = 0.5, max_sec: float = 2.0):
     """Generate random delay with jitter"""
     return random.uniform(min_sec, max_sec)
