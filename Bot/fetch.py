@@ -198,7 +198,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
         raw_posts = fetch_latest_urls("x", account)
         post_list = [{"post_id": extract_post_id("x", url), "post_url": url, "caption": ""} for url in raw_posts]
     elif platform == "ig":
-        raw_ig = fetch_ig_urls(account)
+        raw_ig = await fetch_ig_urls(account)
         post_list = []
         for p in raw_ig:
             pid = extract_post_id("ig", p['url'])
