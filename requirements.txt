@@ -9,3 +9,4 @@ google-api-python-client
 ntscraper
 fastapi
 instagrapi
+playwright==1.42.0
