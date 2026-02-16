@@ -3,7 +3,7 @@ import json
 import random
 import time
 import re
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, Optional, Any, Tuple, Callable, List
 from playwright.async_api import async_playwright, Page
 import logging
 from urllib.parse import quote
