@@ -241,15 +241,15 @@ class InstagramScraper:
             self.logger.success(f"Context ready with {len(self.cookies)} cookies", indent=1)
             
             page = await context.new_page()
-            page.set_default_navigation_timeout(30000)
-            page.set_default_timeout(15000)
+            page.set_default_navigation_timeout(60000)
+            page.set_default_timeout(30000)
             
             try:
                 profile_url = f"https://www.instagram.com/{username}/"
                 self.logger.step("Load Profile", profile_url)
                 
                 # OPTIMIZED: Use domcontentloaded instead of networkidle
-                await page.goto(profile_url, wait_until='domcontentloaded', timeout=30000)
+                await page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
                 await _log_current_url(page, "[PROFILE_LOADED]")
                 
                 if 'accounts/login' in page.url:
