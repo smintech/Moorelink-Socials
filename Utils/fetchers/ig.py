@@ -562,7 +562,7 @@ class InstagramScraper:
                 user_agent=random.choice(self.user_agents),
                 viewport={'width': 1920, 'height': 1080}
             )
-            self.logger.success(f"Context created with UA: {context.user_agent}", indent=1)
+            self.logger.success(f"Context created", indent=1)
             
             await context.add_cookies(self.cookies)
             self.logger.success(f"Added {len(self.cookies)} cookies", indent=1)
