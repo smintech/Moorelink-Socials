@@ -3,8 +3,8 @@ import json
 import random
 import time
 import re
-from typing import Dict, Optional, Any, Tuple, List
-from playwright.async_api import async_playwright, Page
+from typing import Dict, Optional, Any, Tuple, List, Set
+from playwright.async_api import async_playwright, Page, BrowserContext
 import logging
 from urllib.parse import quote
 import os
@@ -58,9 +58,10 @@ async def _log_current_url(page: Page, context_msg: str = ""):
     return current_url
 
 class InstagramScraper:
-    def __init__(self, cookies: List[Dict], logger: DetailedLogger):
+    def __init__(self, cookies: List[Dict], logger: DetailedLogger, max_concurrent: int = 3):
         self.cookies = cookies
         self.logger = logger
+        self.max_concurrent = max_concurrent
         self.user_agents = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         ]
@@ -68,18 +69,19 @@ class InstagramScraper:
         self.csrf_token = None
         self.ig_app_id = "936619743392459"
         self.post_doc_id = "8845758582119845"
+        self.semaphore = asyncio.Semaphore(max_concurrent)
 
         for cookie in cookies:
             if cookie['name'] == 'csrftoken':
                 self.csrf_token = cookie['value']
                 break
 
-    def get_random_delay(self, min_sec=0.5, max_sec=1.5) -> float:
-        """OPTIMIZED: Reasonable delays to balance speed vs stability"""
+    def get_random_delay(self, min_sec=0.1, max_sec=0.3) -> float:
+        """OPTIMIZED: Minimal random delays"""
         return random.uniform(min_sec, max_sec)
 
     async def dismiss_popups(self, page: Page):
-        """Click popup buttons quickly"""
+        """Click popup buttons quickly without waiting"""
         try:
             selectors = [
                 'button:has-text("Not now")',
@@ -88,10 +90,8 @@ class InstagramScraper:
             for selector in selectors:
                 try:
                     elem = await page.locator(selector).first
-                    if elem and await elem.is_visible(timeout=1000):
+                    if elem and await elem.is_visible(timeout=500):
                         await elem.click()
-                        self.logger.success(f"Dismissed popup", indent=2)
-                        await asyncio.sleep(0.2)
                 except:
                     pass
         except:
@@ -103,14 +103,13 @@ class InstagramScraper:
             url = route.request.url
             if any(x in url for x in ['.mp4', '.m3u8', 'video', 'media']):
                 if not url.startswith('blob'):
-                    self.intercepted_videos[len(self.intercepted_videos)] = url
+                    self.intercepted_videos[id(page)] = url
             try:
                 await route.continue_()
             except:
                 pass
         
         await page.route("**/*", handle_route)
-        self.logger.success("Video interception enabled", indent=1)
 
     async def get_headers(self) -> Dict[str, str]:
         """Get GraphQL headers"""
@@ -136,7 +135,6 @@ class InstagramScraper:
     async def extract_caption_graphql(self, page: Page, shortcode: str) -> Optional[str]:
         """STRATEGY 1: GraphQL API (Most reliable)"""
         try:
-            self.logger.info("GraphQL caption extraction...", indent=2)
             headers = await self.get_headers()
             
             variables = quote(json.dumps({
@@ -165,7 +163,7 @@ class InstagramScraper:
                 }}
             """
             
-            result = await page.evaluate(script)
+            result = await asyncio.wait_for(page.evaluate(script), timeout=10)
             
             if result and 'data' in result and 'xdt_shortcode_media' in result['data']:
                 media = result['data']['xdt_shortcode_media']
@@ -174,23 +172,19 @@ class InstagramScraper:
                 if caption_edges and len(caption_edges) > 0:
                     caption_text = caption_edges[0]['node'].get('text', '')
                     if caption_text:
-                        self.logger.success(f"GraphQL caption: {len(caption_text)} chars", indent=3)
                         return caption_text
                 
                 alt_text = media.get('accessibility_caption', '')
                 if alt_text:
-                    self.logger.success(f"GraphQL alt text: {len(alt_text)} chars", indent=3)
                     return alt_text
             
             return None
         except Exception as e:
-            self.logger.debug(f"GraphQL error: {str(e)[:60]}", indent=3)
+            self.logger.debug(f"GraphQL error: {str(e)[:50]}", indent=3)
             return None
 
     async def extract_caption_from_dom(self, page: Page) -> Optional[str]:
         """STRATEGY 2: DOM extraction with multiple fallbacks"""
-        self.logger.info("DOM caption extraction...", indent=2)
-        
         script = r"""
             () => {
                 const strategies = [];
@@ -200,7 +194,7 @@ class InstagramScraper:
                 if (captionDiv) {
                     const text = captionDiv.innerText?.trim();
                     if (text && text.length > 5) {
-                        strategies.push({text: text, source: '_aacl caption div'});
+                        strategies.push({text: text, source: '_aacl'});
                     }
                 }
                 
@@ -211,7 +205,7 @@ class InstagramScraper:
                     if (text && text.length > 20 && text.length < 5000) {
                         const parent = h1.closest('article, div[role="dialog"], main');
                         if (parent) {
-                            strategies.push({text: text, source: 'h1 in content area'});
+                            strategies.push({text: text, source: 'h1'});
                             break;
                         }
                     }
@@ -222,78 +216,25 @@ class InstagramScraper:
                 for (let span of spans) {
                     const text = span.innerText?.trim();
                     if (text && text.length > 30 && text.length < 5000) {
-                        strategies.push({text: text, source: 'span caption class'});
+                        strategies.push({text: text, source: 'span'});
                         break;
                     }
                 }
                 
-                // Strategy D: Tree walker text nodes
-                const containers = [
-                    document.querySelector('article'),
-                    document.querySelector('div[role="dialog"]'),
-                    document.querySelector('main section')
-                ];
-                
-                for (let container of containers) {
-                    if (container) {
-                        const walker = document.createTreeWalker(
-                            container,
-                            NodeFilter.SHOW_TEXT,
-                            null,
-                            false
-                        );
-                        
-                        let node;
-                        const texts = [];
-                        while (node = walker.nextNode()) {
-                            const text = node.textContent?.trim();
-                            if (text && text.length > 40 && text.length < 2000 && !text.includes('http')) {
-                                texts.push(text);
-                            }
-                        }
-                        
-                        if (texts.length > 0) {
-                            const longest = texts.reduce((a, b) => a.length > b.length ? a : b);
-                            strategies.push({text: longest, source: 'treeWalker text nodes'});
-                            break;
-                        }
-                    }
-                }
-                
-                // Strategy E: Meta description
+                // Strategy D: Meta description
                 const metaDesc = document.querySelector('meta[name="description"], meta[property="og:description"]');
                 if (metaDesc) {
                     const content = metaDesc.getAttribute('content');
                     if (content && content.length > 20) {
                         const cleaned = content.replace(/^[^,]+,\s*/, '').trim();
                         if (cleaned.length > 20) {
-                            strategies.push({text: cleaned, source: 'meta description'});
+                            strategies.push({text: cleaned, source: 'meta'});
                         }
                     }
                 }
                 
-                // Strategy F: JSON-LD
-                const scripts = document.querySelectorAll('script[type="application/ld+json"]');
-                for (let script of scripts) {
-                    try {
-                        const data = JSON.parse(script.innerText);
-                        if (data.caption || data.description) {
-                            const text = data.caption || data.description;
-                            if (text.length > 10) {
-                                strategies.push({text: text, source: 'JSON-LD'});
-                            }
-                        }
-                    } catch (e) {}
-                }
-                
                 if (strategies.length > 0) {
-                    const priorityOrder = ['_aacl', 'h1', 'span', 'treeWalker', 'JSON-LD', 'meta'];
-                    strategies.sort((a, b) => {
-                        const aPriority = priorityOrder.findIndex(p => a.source.includes(p));
-                        const bPriority = priorityOrder.findIndex(p => b.source.includes(p));
-                        if (aPriority !== bPriority) return aPriority - bPriority;
-                        return b.text.length - a.text.length;
-                    });
+                    strategies.sort((a, b) => b.text.length - a.text.length);
                     return strategies[0];
                 }
                 
@@ -302,118 +243,84 @@ class InstagramScraper:
         """
         
         try:
-            result = await page.evaluate(script)
+            result = await asyncio.wait_for(page.evaluate(script), timeout=8)
             if result and result['text']:
                 caption = result['text']
                 caption = re.sub(r'\s*more\s*$', '', caption, flags=re.IGNORECASE).strip()
-                self.logger.success(f"DOM caption via {result['source']}: {len(caption)} chars", indent=3)
                 return caption
         except Exception as e:
-            self.logger.debug(f"DOM error: {str(e)[:60]}", indent=3)
+            self.logger.debug(f"DOM error: {str(e)[:50]}", indent=3)
         
         return None
 
     async def extract_caption_from_shared_data(self, page: Page) -> Optional[str]:
         """STRATEGY 3: SharedData extraction"""
         try:
-            self.logger.info("SharedData extraction...", indent=2)
-            
             script = r"""
                 () => {
-                    // Try _sharedData
                     if (window._sharedData && window._sharedData.entry_data) {
                         const postPage = window._sharedData.entry_data.PostPage;
                         if (postPage && postPage[0] && postPage[0].graphql) {
                             const media = postPage[0].graphql.shortcode_media;
                             if (media && media.edge_media_to_caption && media.edge_media_to_caption.edges.length > 0) {
-                                return {
-                                    text: media.edge_media_to_caption.edges[0].node.text,
-                                    source: '_sharedData'
-                                };
+                                return media.edge_media_to_caption.edges[0].node.text;
                             }
                         }
                     }
-                    
-                    // Try __additionalDataLoaded
-                    if (window.__additionalDataLoaded) {
-                        for (let key in window.__additionalDataLoaded) {
-                            if (key.includes('/p/') || key.includes('/reel/')) {
-                                const data = window.__additionalDataLoaded[key];
-                                if (data && data.graphql && data.graphql.shortcode_media) {
-                                    const media = data.graphql.shortcode_media;
-                                    if (media.edge_media_to_caption && media.edge_media_to_caption.edges.length > 0) {
-                                        return {
-                                            text: media.edge_media_to_caption.edges[0].node.text,
-                                            source: '__additionalDataLoaded'
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
                     return null;
                 }
             """
             
-            result = await page.evaluate(script)
-            if result and result['text']:
-                self.logger.success(f"SharedData caption: {len(result['text'])} chars", indent=3)
-                return result['text']
+            result = await asyncio.wait_for(page.evaluate(script), timeout=5)
+            if result:
+                return result
         except Exception as e:
-            self.logger.debug(f"SharedData error: {str(e)[:60]}", indent=3)
+            self.logger.debug(f"SharedData error: {str(e)[:50]}", indent=3)
         
         return None
 
     async def extract_caption_from_post(self, page: Page, shortcode: str = "") -> str:
-        """Master caption extraction: all strategies"""
+        """Master caption extraction: all strategies with timeout"""
         caption = ""
         
-        await asyncio.sleep(1.5)  # OPTIMIZED: Reduced from 2s
+        await asyncio.sleep(0.3)  # Minimal wait for DOM rendering
         
-        # Strategy 1: GraphQL
-        if shortcode:
-            caption = await self.extract_caption_graphql(page, shortcode) or ""
-        
-        # Strategy 2: DOM
-        if not caption:
-            caption = await self.extract_caption_from_dom(page) or ""
-        
-        # Strategy 3: SharedData
-        if not caption:
-            caption = await self.extract_caption_from_shared_data(page) or ""
-        
-        # Strategy 4: Fallback raw text
-        if not caption:
-            self.logger.info("Raw text fallback...", indent=2)
-            try:
-                raw_text = await page.evaluate('() => document.body.innerText')
-                lines = [l.strip() for l in raw_text.split('\n') if 30 < len(l.strip()) < 1000]
-                if lines:
-                    filtered = [l for l in lines if not any(x in l.lower() for x in ['followers', 'following', 'posts', 'meta', 'privacy', 'terms'])]
-                    if filtered:
-                        caption = filtered[0]
-                        self.logger.success(f"Raw text fallback: {len(caption)} chars", indent=3)
-            except Exception as e:
-                self.logger.debug(f"Raw text error: {str(e)[:60]}", indent=3)
-        
-        if not caption:
-            self.logger.warning("All caption strategies failed", indent=2)
+        # Parallel extraction attempts with timeout
+        try:
+            tasks = []
+            
+            # Strategy 1: GraphQL (if shortcode available)
+            if shortcode:
+                tasks.append(self.extract_caption_graphql(page, shortcode))
+            
+            # Strategy 2: DOM
+            tasks.append(self.extract_caption_from_dom(page))
+            
+            # Strategy 3: SharedData
+            tasks.append(self.extract_caption_from_shared_data(page))
+            
+            # Race - return first successful result
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, str) and result:
+                        return result
+                    elif result and not isinstance(result, Exception):
+                        return str(result)
+        except Exception as e:
+            self.logger.debug(f"Caption extraction timeout: {str(e)[:40]}", indent=2)
         
         return caption
 
     async def extract_media_from_post(self, page: Page, post_url: str) -> Tuple[str, bool]:
-        """Extract media URL (image or video)"""
+        """Extract media URL (image or video) - optimized"""
         is_video = '/reel/' in post_url or '/tv/' in post_url
-        await asyncio.sleep(0.5)  # OPTIMIZED: Reduced from 1s
         
         if is_video:
-            self.logger.debug("Video extraction...", indent=2)
-            
+            # Check intercepted videos first
             if self.intercepted_videos:
                 for video_url in self.intercepted_videos.values():
-                    if video_url and not video_url.startswith('blob') and '.mp4' in video_url:
-                        self.logger.success(f"Intercepted video URL", indent=3)
+                    if video_url and '.mp4' in video_url:
                         self.intercepted_videos.clear()
                         return video_url, True
             
@@ -433,16 +340,13 @@ class InstagramScraper:
             """
             
             try:
-                media_url = await page.evaluate(script)
+                media_url = await asyncio.wait_for(page.evaluate(script), timeout=5)
                 if media_url and not media_url.startswith('blob'):
-                    self.logger.success(f"Video extracted", indent=3)
                     return media_url, True
             except Exception as e:
                 self.logger.debug(f"Video extraction error: {str(e)[:40]}", indent=3)
         
         else:
-            self.logger.debug("Image extraction...", indent=2)
-            
             script = r"""
                 () => {
                     const metaImg = document.querySelector('meta[property="og:image"]');
@@ -471,18 +375,65 @@ class InstagramScraper:
             """
             
             try:
-                media_url = await page.evaluate(script)
+                media_url = await asyncio.wait_for(page.evaluate(script), timeout=5)
                 if media_url and not media_url.startswith('blob'):
-                    self.logger.success(f"Image extracted", indent=3)
                     return media_url, False
             except Exception as e:
                 self.logger.debug(f"Image extraction error: {str(e)[:40]}", indent=3)
         
-        self.logger.warning("No media URL found", indent=2)
         return "", is_video
 
+    async def scrape_post(self, page: Page, post_url: str, shortcode: str, post_index: int) -> Optional[Dict]:
+        """Scrape a single post with concurrency control"""
+        async with self.semaphore:
+            try:
+                self.logger.info(f"[{post_index}] POST: {shortcode}", indent=1)
+                
+                # Navigate to post with optimized timeout
+                await asyncio.wait_for(
+                    page.goto(post_url, wait_until='domcontentloaded', timeout=20000),
+                    timeout=22
+                )
+                
+                # Non-blocking network wait
+                try:
+                    await asyncio.wait_for(
+                        page.wait_for_load_state('networkidle'),
+                        timeout=8
+                    )
+                except asyncio.TimeoutError:
+                    pass  # Continue anyway
+                
+                await asyncio.sleep(0.2)
+                
+                # Parallel extraction
+                caption_task = self.extract_caption_from_post(page, shortcode)
+                media_task = self.extract_media_from_post(page, post_url)
+                
+                caption, (media_url, is_video) = await asyncio.gather(
+                    caption_task,
+                    media_task
+                )
+                
+                if media_url and not media_url.startswith('blob'):
+                    post_data = {
+                        "url": post_url,
+                        "caption": caption,
+                        "media_url": media_url,
+                        "is_video": is_video,
+                    }
+                    self.logger.success(f"{'🎥 VIDEO' if is_video else '📸 IMAGE'} | Caption: {len(caption)} chars", indent=2)
+                    return post_data
+                else:
+                    self.logger.warning("No media URL found", indent=2)
+                    return None
+                
+            except Exception as e:
+                self.logger.error(f"Post error: {str(e)[:50]}", indent=2)
+                return None
+
     async def scrape_profile(self, username: str, post_limit: int = 10) -> List[Dict]:
-        self.logger.step("Start Scraping", f"Target: @{username} | Limit: {post_limit}")
+        self.logger.step("Initialize Scraper", f"Target: @{username} | Limit: {post_limit} | Concurrent: {self.max_concurrent}")
         
         async with async_playwright() as p:
             self.logger.info("Launching browser...", indent=1)
@@ -503,161 +454,144 @@ class InstagramScraper:
             )
             
             await context.add_cookies(self.cookies)
-            self.logger.success(f"Added {len(self.cookies)} cookies", indent=1)
-            
-            page = await context.new_page()
-            page.set_default_navigation_timeout(60000)  # IMPORTANT: Keep at 60s for stability
-            page.set_default_timeout(30000)
-            
-            await self.intercept_video_urls(page)
+            self.logger.success(f"Cookies loaded: {len(self.cookies)}", indent=1)
             
             try:
+                # === PHASE 1: LOAD PROFILE ===
+                self.logger.step("Load Profile", f"https://www.instagram.com/{username}/")
+                
+                profile_page = await context.new_page()
+                profile_page.set_default_navigation_timeout(40000)
+                profile_page.set_default_timeout(20000)
+                
+                await self.intercept_video_urls(profile_page)
+                
                 profile_url = f"https://www.instagram.com/{username}/"
-                self.logger.step("Load Profile", profile_url)
+                await profile_page.goto(profile_url, wait_until='domcontentloaded', timeout=25000)
                 
-                await page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
-                await _log_current_url(page, "[PROFILE_LOADED]")
-                await asyncio.sleep(1)  # OPTIMIZED: Reduced from 3s
-                
-                if 'accounts/login' in page.url:
+                if 'accounts/login' in profile_page.url:
                     self.logger.error("Redirected to login - cookies expired")
                     return []
                 
-                await self.dismiss_popups(page)
+                await self.dismiss_popups(profile_page)
                 
-                # IMPORTANT: Non-blocking networkidle wait
+                # Non-blocking network wait
                 try:
-                    await page.wait_for_load_state('networkidle', timeout=15000)
-                    self.logger.success("Page loaded to networkidle", indent=1)
-                except:
-                    self.logger.warning("Network timeout, continuing", indent=1)
+                    await asyncio.wait_for(
+                        profile_page.wait_for_load_state('networkidle'),
+                        timeout=10
+                    )
+                except asyncio.TimeoutError:
+                    pass
                 
-                # Scroll to load posts
-                self.logger.info("Scrolling to load posts...", indent=1)
+                # === PHASE 2: LOAD POSTS ===
+                self.logger.step("Scroll & Discover Posts", "Loading post links...")
+                
                 last_height = 0
                 no_change_count = 0
                 
-                for i in range(12):  # OPTIMIZED: Reduced from 15-30
-                    links = await page.locator('a[href*="/p/"], a[href*="/reel/"]').all()
-                    self.logger.debug(f"Found {len(links)} posts after scroll {i+1}", indent=2)
+                for scroll_iter in range(8):  # Max 8 scrolls
+                    links = await profile_page.locator('a[href*="/p/"], a[href*="/reel/"]').all()
+                    self.logger.debug(f"Posts found: {len(links)} (scroll {scroll_iter + 1})", indent=2)
+                    
                     if len(links) >= post_limit:
-                        self.logger.success(f"Found {len(links)} posts", indent=2)
                         break
                     
-                    await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                    await asyncio.sleep(0.8)  # OPTIMIZED: Reduced from 2-3s
+                    await profile_page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                    await asyncio.sleep(0.4)  # Minimal scroll delay
                     
-                    new_height = await page.evaluate('document.body.scrollHeight')
+                    new_height = await profile_page.evaluate('document.body.scrollHeight')
                     if new_height == last_height:
                         no_change_count += 1
-                        if no_change_count >= 3:
-                            self.logger.warning("No more posts loading", indent=2)
+                        if no_change_count >= 2:
                             break
                     else:
                         no_change_count = 0
                         last_height = new_height
                 
-                # Extract posts
-                self.logger.step("Extracting Posts", f"Processing up to {post_limit} posts")
-                
-                posts = []
-                processed_urls = set()
+                # === PHASE 3: EXTRACT POST URLS ===
+                self.logger.step("Extract Post URLs", "Gathering unique post links...")
                 
                 script = r"""
                     () => {
                         const links = Array.from(document.querySelectorAll('a[href]'));
-                        return links
-                            .filter(a => a.href.includes('/p/') || a.href.includes('/reel/') || a.href.includes('/tv/'))
-                            .map(a => a.href.split('?')[0])
-                            .filter((url, idx, arr) => arr.indexOf(url) === idx);
+                        return [...new Set(
+                            links
+                                .filter(a => a.href.includes('/p/') || a.href.includes('/reel/') || a.href.includes('/tv/'))
+                                .map(a => a.href.split('?')[0])
+                        )];
                     }
                 """
                 
-                post_urls = await page.evaluate(script)
-                self.logger.info(f"Found {len(post_urls)} unique post URLs", indent=1)
+                post_urls = await profile_page.evaluate(script)
+                post_urls = post_urls[:post_limit]
                 
-                for idx, post_url in enumerate(post_urls[:post_limit]):
-                    if idx >= post_limit:
-                        break
-                    
-                    if post_url in processed_urls:
-                        continue
-                    
-                    processed_urls.add(post_url)
-                    self.logger.info(f"\n[{idx+1}/{post_limit}] Processing: {post_url.split('/')[-2]}", indent=1)
-                    
-                    shortcode = ""
+                self.logger.success(f"Found {len(post_urls)} unique posts", indent=1)
+                await profile_page.close()
+                
+                # === PHASE 4: SCRAPE POSTS CONCURRENTLY ===
+                self.logger.step("Scrape Posts Concurrently", f"Processing {len(post_urls)} posts with {self.max_concurrent} workers")
+                
+                # Create page pool
+                pages = []
+                for i in range(self.max_concurrent):
+                    page = await context.new_page()
+                    page.set_default_navigation_timeout(35000)
+                    page.set_default_timeout(18000)
+                    await self.intercept_video_urls(page)
+                    pages.append(page)
+                
+                # Distribute posts across pages
+                tasks = []
+                for idx, post_url in enumerate(post_urls):
                     try:
                         shortcode = post_url.split('/p/')[-1].split('/')[0]
                         if not shortcode:
                             shortcode = post_url.split('/reel/')[-1].split('/')[0]
-                        self.logger.debug(f"Shortcode: {shortcode}", indent=2)
                     except:
-                        pass
+                        shortcode = f"post_{idx}"
                     
-                    try:
-                        self.intercepted_videos.clear()
-                        
-                        # IMPORTANT: 30s timeout for post navigation
-                        await page.goto(post_url, wait_until='domcontentloaded', timeout=30000)
-                        await _log_current_url(page, "[POST_LOADED]")
-                        await asyncio.sleep(1)  # OPTIMIZED: Reduced from 2s
-                        
-                        # Non-blocking networkidle
-                        try:
-                            await page.wait_for_load_state('networkidle', timeout=15000)
-                            self.logger.success("Post loaded to networkidle", indent=2)
-                        except:
-                            self.logger.warning("Post network timeout, continuing", indent=2)
-                        
-                        # Extract caption and media
-                        caption = await self.extract_caption_from_post(page, shortcode)
-                        media_url, is_video = await self.extract_media_from_post(page, post_url)
-                        
-                        if media_url and not media_url.startswith('blob'):
-                            posts.append({
-                                "url": post_url,
-                                "caption": caption,
-                                "media_url": media_url,
-                                "is_video": is_video,
-                            })
-                            self.logger.success(f"Saved ({'VIDEO 🎥' if is_video else 'IMAGE 📸'}, caption: {len(caption)} chars)", indent=2)
-                        else:
-                            self.logger.warning(f"Invalid media URL, skipping", indent=2)
-                        
-                        self.logger.info("Going back to profile", indent=2)
-                        await page.go_back(wait_until='domcontentloaded', timeout=20000)
-                        await _log_current_url(page, "[BACK_TO_PROFILE]")
-                        await asyncio.sleep(self.get_random_delay(0.5, 1))  # OPTIMIZED: Reduced
-                        
-                    except Exception as e:
-                        self.logger.error(f"Post error: {str(e)[:60]}", indent=2)
-                        try:
-                            await page.goto(profile_url, wait_until='domcontentloaded', timeout=30000)
-                            await _log_current_url(page, "[RECOVERY]")
-                        except:
-                            self.logger.error("Recovery failed", indent=2)
+                    page = pages[idx % self.max_concurrent]
+                    tasks.append(self.scrape_post(page, post_url, shortcode, idx + 1))
                 
-                self.logger.success(f"Scraping complete: {len(posts)} posts", indent=1)
+                # Execute all tasks concurrently
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                posts = [r for r in results if r and not isinstance(r, Exception)]
+                
+                # Close all pages
+                for page in pages:
+                    await page.close()
+                
+                self.logger.step("Scraping Complete", f"✅ Successfully scraped {len(posts)}/{len(post_urls)} posts")
                 return posts
                 
             except Exception as e:
-                self.logger.error(f"Fatal error: {e}", indent=1)
+                self.logger.error(f"Fatal error: {str(e)[:60]}", indent=1)
                 import traceback
                 self.logger.debug(traceback.format_exc(), indent=2)
                 return []
             
             finally:
-                self.logger.info("Closing browser", indent=1)
+                self.logger.info("Closing browser...", indent=1)
                 await browser.close()
-                self.logger.success("Browser closed", indent=1)
+                self.logger.success("Cleanup complete", indent=1)
 
 
-async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """Fetch Instagram posts - OPTIMIZED with proven extraction strategies"""
+async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None, max_concurrent: int = 3) -> List[Dict[str, Any]]:
+    """Fetch Instagram posts - OPTIMIZED for speed and concurrency
+    
+    Args:
+        account: Instagram username (with or without @)
+        cookies: List of cookie dicts. If None, loads from IG_COOKIES env var
+        max_concurrent: Number of concurrent post scraping tasks (default: 3)
+    
+    Returns:
+        List of post dictionaries with url, caption, media_url, is_video
+    """
     account = account.lstrip('@')
     
-    logger.step("Configuration", "Setting up scraper")
+    logger.step("Configuration", f"Max concurrent workers: {max_concurrent}")
     
     if cookies is None:
         cookies_str = os.getenv('IG_COOKIES')
@@ -666,12 +600,12 @@ async def fetch_ig_urls(account: str, cookies: List[Dict[str, Any]] = None) -> L
             return []
         try:
             cookies = json.loads(cookies_str)
-            logger.success(f"Loaded {len(cookies)} cookies")
+            logger.success(f"Loaded {len(cookies)} cookies from env")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid IG_COOKIES JSON: {str(e)}")
             return []
     
-    scraper = InstagramScraper(cookies=cookies, logger=logger)
+    scraper = InstagramScraper(cookies=cookies, logger=logger, max_concurrent=max_concurrent)
     posts = await scraper.scrape_profile(username=account, post_limit=config.POST_LIMIT)
     
     return posts
