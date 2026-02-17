@@ -287,6 +287,44 @@ class InstagramScraper:
     def _jitter(self, lo=0.4, hi=1.2) -> float:
         return random.uniform(lo, hi)
 
+    async def _safe_evaluate(
+        self,
+        page: Page,
+        script: str,
+        timeout: float = 10.0,
+        label: str = "evaluate",
+    ) -> Any:
+        """
+        page.evaluate() with a hard Python-side asyncio timeout.
+
+        WHY THIS EXISTS:
+          Playwright's page.evaluate() has NO built-in timeout.  If the JS
+          Promise never resolves (e.g. XHR dropped silently, page context
+          destroyed mid-flight, Instagram rate-limit intercepting the request),
+          the coroutine hangs indefinitely — freezing the worker.
+
+          asyncio.wait_for() provides the outer kill-switch that Playwright
+          doesn't.  On timeout we log and return None; the caller's fallback
+          strategy then kicks in normally.
+        """
+        try:
+            return await asyncio.wait_for(
+                page.evaluate(script),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                f"[{label}] page.evaluate timed out after {timeout:.0f}s — skipping",
+                indent=3,
+            )
+            return None
+        except Exception as e:
+            self.logger.debug(
+                f"[{label}] evaluate error: {type(e).__name__}: {str(e).split(chr(10))[0][:80]}",
+                indent=3,
+            )
+            return None
+
     # ------------------------------------------------------------------
     #  Navigation — the most resilient part
     # ------------------------------------------------------------------
@@ -381,49 +419,56 @@ class InstagramScraper:
         )
         return False
 
-    async def _wait_for_dom(self, page: Page, timeout: float = 12.0):
+    async def _wait_for_dom(self, page: Page, timeout: float = 6.0):
         """
         Poll for DOM readiness after a "commit" navigation.
-        Tries progressively weaker signals so we always proceed eventually.
+
+        Timeout is intentionally short (6s default) — we proceed even if
+        nothing matches.  Hanging here starves workers.
+
+        Selectors cover both post pages (article) and reel pages (video/section).
         """
         deadline = asyncio.get_event_loop().time() + timeout
 
-        # Signal 1: wait for a meaningful selector
-        meaningful_selectors = ["article", "main", "section", "body > div"]
-        for sel in meaningful_selectors:
-            remaining = (deadline - asyncio.get_event_loop().time()) * 1000
-            if remaining <= 0:
+        # Covers post pages, reel pages, and plain profile pages
+        selectors = [
+            "article",
+            "video",              # reels land with a <video> before article hydrates
+            "main",
+            "section",
+            "div[role='main']",
+            "body > div > div",  # generic SPA shell
+        ]
+
+        for sel in selectors:
+            remaining_ms = (deadline - asyncio.get_event_loop().time()) * 1000
+            if remaining_ms <= 200:
                 break
             try:
                 await page.wait_for_selector(
                     sel,
                     state="attached",
-                    timeout=min(remaining, 5_000),
+                    timeout=min(remaining_ms, 2_000),   # max 2s per selector — was 5s
                 )
-                self.logger.debug(f"DOM ready — matched selector '{sel}'", indent=2)
-                # Light scroll-jitter to trigger lazy loaders
-                await page.evaluate(
-                    "window.scrollBy(0, 100); window.scrollBy(0, -100)"
+                self.logger.debug(f"DOM ready — matched '{sel}'", indent=2)
+                # Micro scroll to nudge lazy loaders
+                await self._safe_evaluate(
+                    page,
+                    "window.scrollBy(0,80); window.scrollBy(0,-80)",
+                    timeout=2.0,
+                    label="scroll-jitter",
                 )
                 return
             except Exception:
                 pass
 
-        # Signal 2: wait for any network quiet (best-effort, short budget)
-        remaining = (deadline - asyncio.get_event_loop().time()) * 1000
-        if remaining > 1000:
-            try:
-                await page.wait_for_load_state(
-                    "domcontentloaded", timeout=min(remaining, 4_000)
-                )
-                self.logger.debug("DOM ready — domcontentloaded fired", indent=2)
-                return
-            except Exception:
-                pass
-
-        # Signal 3: unconditional sleep as absolute last resort
-        self.logger.debug("DOM ready signal not received — falling back to sleep", indent=2)
-        await asyncio.sleep(1.5)
+        # Hard fallback — always proceed after budget expires
+        elapsed = timeout - (deadline - asyncio.get_event_loop().time())
+        self.logger.debug(
+            f"DOM selectors did not match in {elapsed:.1f}s — proceeding anyway",
+            indent=2,
+        )
+        await asyncio.sleep(0.5)
 
     # ------------------------------------------------------------------
     #  Popup dismissal
@@ -475,60 +520,68 @@ class InstagramScraper:
     # ------------------------------------------------------------------
 
     async def extract_caption_graphql(self, page: Page, shortcode: str) -> Optional[str]:
-        headers = self._build_headers()
+        """
+        Strategy 1: fire a GraphQL POST from inside the page via XHR.
+        Hard capped at 9s Python-side (asyncio.wait_for) so it can never hang.
+        XHR self-timeout is 7s so it always resolves before the outer cap.
+        """
+        headers  = self._build_headers()
         variables = {
             "shortcode": shortcode,
             "fetch_tagged_user_count": None,
             "hoisted_comment_id": None,
             "hoisted_reply_id": None,
         }
-        body = (
+        body      = (
             f"variables={quote(json.dumps(variables, separators=(',', ':')))}"
             f"&doc_id={self.post_doc_id}"
         )
-
-        # Escape single quotes for inline JS string
         safe_body = body.replace("'", "\\'")
 
         script = f"""
             () => new Promise((resolve) => {{
                 const xhr = new XMLHttpRequest();
                 xhr.open('POST', 'https://www.instagram.com/graphql/query', true);
-                xhr.setRequestHeader('accept', '{headers["accept"]}');
-                xhr.setRequestHeader('content-type', '{headers["content-type"]}');
+                xhr.setRequestHeader('accept', '*/*');
+                xhr.setRequestHeader('content-type', 'application/x-www-form-urlencoded');
                 xhr.setRequestHeader('x-csrftoken', '{headers["x-csrftoken"]}');
                 xhr.setRequestHeader('x-ig-app-id', '{headers["x-ig-app-id"]}');
                 xhr.setRequestHeader('x-requested-with', 'XMLHttpRequest');
-                xhr.setRequestHeader('referer', '{headers["referer"]}');
-                xhr.timeout = 9000;
-                xhr.onload  = () => {{
+                xhr.setRequestHeader('referer', 'https://www.instagram.com/');
+                xhr.timeout = 7000;
+                xhr.onload    = () => {{
                     try {{ resolve(JSON.parse(xhr.responseText)); }}
-                    catch (e) {{ resolve({{error: 'parse: ' + e.message}}); }}
+                    catch (e) {{ resolve({{_err: 'parse:' + e.message}}); }}
                 }};
-                xhr.onerror   = () => resolve({{error: 'network'}});
-                xhr.ontimeout = () => resolve({{error: 'timeout'}});
+                xhr.onerror   = () => resolve({{_err: 'network'}});
+                xhr.ontimeout = () => resolve({{_err: 'xhr-timeout'}});
                 xhr.send('{safe_body}');
             }})
         """
-        try:
-            result = await page.evaluate(script)
-            if not result or "data" not in result:
-                return None
-            media = result["data"].get("xdt_shortcode_media", {})
-            edges = media.get("edge_media_to_caption", {}).get("edges", [])
-            if edges:
-                return edges[0]["node"].get("text", "") or None
-            return media.get("accessibility_caption") or None
-        except Exception as e:
-            self.logger.debug(f"GraphQL: {str(e)[:60]}", indent=3)
+
+        result = await self._safe_evaluate(page, script, timeout=9.0, label="graphql-xhr")
+        if not result:
+            return None
+        if "_err" in result:
+            self.logger.debug(f"GraphQL XHR: {result['_err']}", indent=3)
             return None
 
+        media = result.get("data", {}).get("xdt_shortcode_media", {})
+        if not media:
+            return None
+        edges = media.get("edge_media_to_caption", {}).get("edges", [])
+        if edges:
+            return edges[0]["node"].get("text") or None
+        return media.get("accessibility_caption") or None
+
     # ------------------------------------------------------------------
-    #  Caption extraction — Strategy 2: DOM
+    #  Caption extraction — Strategy 2: DOM selectors
     # ------------------------------------------------------------------
 
     async def extract_caption_from_dom(self, page: Page) -> Optional[str]:
-        await asyncio.sleep(0.25)
+        """
+        Strategy 2: synchronous DOM scan — runs in <1ms, capped at 4s just in case.
+        """
         script = r"""
             () => {
                 const selectors = [
@@ -555,12 +608,9 @@ class InstagramScraper:
                 return null;
             }
         """
-        try:
-            res = await page.evaluate(script)
-            if res and res.get("text"):
-                return re.sub(r"\s*more\s*$", "", res["text"], flags=re.IGNORECASE).strip()
-        except Exception as e:
-            self.logger.debug(f"DOM: {str(e)[:50]}", indent=3)
+        res = await self._safe_evaluate(page, script, timeout=4.0, label="dom-caption")
+        if res and res.get("text"):
+            return re.sub(r"\s*more\s*$", "", res["text"], flags=re.IGNORECASE).strip()
         return None
 
     # ------------------------------------------------------------------
@@ -568,6 +618,7 @@ class InstagramScraper:
     # ------------------------------------------------------------------
 
     async def extract_caption_from_ldjson(self, page: Page) -> Optional[str]:
+        """Strategy 3: synchronous JSON-LD scan, capped at 4s."""
         script = r"""
             () => {
                 for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
@@ -579,47 +630,37 @@ class InstagramScraper:
                 return null;
             }
         """
-        try:
-            return await page.evaluate(script)
-        except Exception:
-            return None
+        return await self._safe_evaluate(page, script, timeout=4.0, label="ldjson-caption")
 
     # ------------------------------------------------------------------
-    #  Caption extraction — Strategy 4: window.__additionalData / shared
+    #  Caption extraction — Strategy 4: window globals
     # ------------------------------------------------------------------
 
     async def extract_caption_from_window_data(self, page: Page) -> Optional[str]:
-        """Instagram sometimes embeds the full media object in window globals."""
+        """Strategy 4: read Instagram's pre-loaded window globals, capped at 4s."""
         script = r"""
             () => {
-                // Try __additionalData
                 try {
-                    const keys = Object.keys(window.__additionalData || {});
-                    for (const k of keys) {
-                        const media = window.__additionalData[k]?.data?.graphql?.shortcode_media
-                                   || window.__additionalData[k]?.data?.xdt_shortcode_media;
-                        if (media) {
-                            const edges = media.edge_media_to_caption?.edges || [];
+                    for (const k of Object.keys(window.__additionalData || {})) {
+                        const m = window.__additionalData[k]?.data?.graphql?.shortcode_media
+                               || window.__additionalData[k]?.data?.xdt_shortcode_media;
+                        if (m) {
+                            const edges = m.edge_media_to_caption?.edges || [];
                             if (edges.length) return edges[0].node.text;
                         }
                     }
                 } catch (_) {}
-                // Try _sharedData
                 try {
-                    const media = window._sharedData?.entry_data?.PostPage?.[0]
-                                   ?.graphql?.shortcode_media;
-                    if (media) {
-                        const edges = media.edge_media_to_caption?.edges || [];
+                    const m = window._sharedData?.entry_data?.PostPage?.[0]?.graphql?.shortcode_media;
+                    if (m) {
+                        const edges = m.edge_media_to_caption?.edges || [];
                         if (edges.length) return edges[0].node.text;
                     }
                 } catch (_) {}
                 return null;
             }
         """
-        try:
-            return await page.evaluate(script)
-        except Exception:
-            return None
+        return await self._safe_evaluate(page, script, timeout=4.0, label="window-globals")
 
     # ------------------------------------------------------------------
     #  Master caption orchestrator
@@ -627,30 +668,44 @@ class InstagramScraper:
 
     async def extract_caption_from_post(self, page: Page, shortcode: str = "") -> str:
         """
-        Master caption orchestrator — tries four strategies in priority order,
-        logging which one succeeds or why each one failed.
-        """
-        strategies = [
-            ("GraphQL XHR",   lambda: self.extract_caption_graphql(page, shortcode) if shortcode else asyncio.coroutine(lambda: None)()),
-            ("Window data",   lambda: self.extract_caption_from_window_data(page)),
-            ("DOM selectors", lambda: self.extract_caption_from_dom(page)),
-            ("JSON-LD",       lambda: self.extract_caption_from_ldjson(page)),
-        ]
-        for name, fn in strategies:
-            try:
-                result = await fn()
-                if result:
-                    self.logger.debug(
-                        f"Caption via [{name}]  {len(result)} chars", indent=2
-                    )
-                    return result
-                else:
-                    self.logger.debug(f"[{name}] returned empty — trying next", indent=2)
-            except Exception as e:
-                self.logger.debug(f"[{name}] raised {type(e).__name__}: {str(e)[:60]}", indent=2)
+        Master caption orchestrator — tries four strategies in priority order.
 
-        self.logger.warning("All caption strategies exhausted — no caption found", indent=2)
-        return ""
+        Hard outer cap: 30s total.  Even if every strategy hangs at its own
+        sub-timeout, this guarantees the worker is never blocked longer than
+        this.  In practice the inner _safe_evaluate timeouts (4–9s each) mean
+        we exit well before the outer cap.
+        """
+        async def _inner() -> str:
+            strategies = [
+                ("GraphQL XHR",   lambda: self.extract_caption_graphql(page, shortcode) if shortcode else asyncio.coroutine(lambda: None)()),
+                ("Window data",   lambda: self.extract_caption_from_window_data(page)),
+                ("DOM selectors", lambda: self.extract_caption_from_dom(page)),
+                ("JSON-LD",       lambda: self.extract_caption_from_ldjson(page)),
+            ]
+            for name, fn in strategies:
+                try:
+                    result = await fn()
+                    if result:
+                        self.logger.debug(
+                            f"Caption via [{name}]  {len(result)} chars", indent=2
+                        )
+                        return result
+                    else:
+                        self.logger.debug(f"[{name}] returned empty — trying next", indent=2)
+                except Exception as e:
+                    self.logger.debug(
+                        f"[{name}] raised {type(e).__name__}: {str(e)[:60]}", indent=2
+                    )
+            self.logger.warning("All caption strategies exhausted — no caption found", indent=2)
+            return ""
+
+        try:
+            return await asyncio.wait_for(_inner(), timeout=30.0)
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                "Caption extraction hit the 30s hard cap — returning empty", indent=2
+            )
+            return ""
 
     # ------------------------------------------------------------------
     #  Media URL extraction
@@ -697,12 +752,9 @@ class InstagramScraper:
                 }
             """
 
-        try:
-            url = await page.evaluate(script)
-            if url and not url.startswith("blob"):
-                return url, is_video
-        except Exception as e:
-            self.logger.debug(f"Media extract error: {str(e)[:50]}", indent=3)
+        url = await self._safe_evaluate(page, script, timeout=6.0, label="media-url")
+        if url and not url.startswith("blob"):
+            return url, is_video
 
         return "", is_video
 
@@ -820,7 +872,7 @@ class InstagramScraper:
         """
 
         for i in range(MAX_SCROLLS):
-            links: List[str] = await page.evaluate(js_collect)
+            links = await self._safe_evaluate(page, js_collect, timeout=5.0, label="collect-links") or []
             new = [u for u in links if u not in post_urls]
             post_urls.extend(new)
 
@@ -844,12 +896,16 @@ class InstagramScraper:
                 break
 
             # Scroll to bottom
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await self._safe_evaluate(
+                page, "window.scrollTo(0, document.body.scrollHeight)", timeout=3.0, label="scroll"
+            )
 
             # Wait for new content — poll for height change up to ~2s
             for _ in range(4):
                 await asyncio.sleep(0.5)
-                new_height = await page.evaluate("document.body.scrollHeight")
+                new_height = await self._safe_evaluate(
+                    page, "document.body.scrollHeight", timeout=3.0, label="scroll-height"
+                ) or last_height
                 if new_height != last_height:
                     last_height = new_height
                     stale_rounds = 0
