@@ -1,14 +1,20 @@
 import asyncio
 import json
 import random
-import time
 import re
-from typing import Dict, Optional, Any, Tuple, List, Set
-from playwright.async_api import async_playwright, Page, BrowserContext, Error as PlaywrightError
-import logging
+import time
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+from playwright.async_api import (
+    async_playwright,
+    BrowserContext,
+    Page,
+    Error as PlaywrightError,
+)
+import logging
 
 # ─────────────────────────────────────────────
 #  Config guard — works with or without Utils
@@ -24,22 +30,12 @@ except ImportError:
 #  Network Strategy Constants
 # ══════════════════════════════════════════════
 
-# IMPORTANT: Instagram's SPA never resolves "load" or "domcontentloaded"
-# reliably because of infinite background XHRs.  Always navigate with
-# "commit" (first-byte received) and then manually wait for DOM content.
 GOTO_WAIT_UNTIL = "commit"
-
-# Single generous timeout — "commit" is instant so we won't hit this
-# unless the server itself is unreachable
 GOTO_TIMEOUT_MS = 30_000
 
-# URL fragments that must NOT be blocked (CDN media we want)
-CDN_ALLOWLIST = ("cdninstagram", "fbcdn")
-
-# Instagram-specific "slow" paths that need more time for DOM settling
+CDN_ALLOWLIST      = ("cdninstagram", "fbcdn")
 SLOW_PATH_PATTERNS = ("/reel/", "/tv/")
 
-# Resource types to block — evaluated synchronously (no await needed)
 _BLOCK_TYPES   = frozenset({"font", "stylesheet"})
 _BLOCK_DOMAINS = (
     "google-analytics", "doubleclick", "facebook.net/en_US/fbevents",
@@ -52,20 +48,6 @@ _BLOCK_DOMAINS = (
 # ══════════════════════════════════════════════
 
 class DetailedLogger:
-    """
-    Structured logger that produces readable, scannable output.
-
-    Visual hierarchy:
-      ╔══╗  Phase banners   — top-level milestones (browser start, profile load, …)
-      ├──┤  Section headers — named sub-steps inside a phase
-      │      Body lines     — info / success / warning / error
-      └──    Tail lines     — completion of a section
-      ····   Debug lines    — verbose detail, shown only at DEBUG level
-
-    Timing: every phase banner and section header stamps an elapsed time
-    from scraper start so it's easy to spot slow stages at a glance.
-    """
-
     _ICONS = {
         "info":    "·",
         "success": "✓",
@@ -80,27 +62,16 @@ class DetailedLogger:
         self._phase_ts  = self._start_ts
         self._phase_num = 0
 
-        # One-time basicConfig — idempotent if called multiple times
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format="%(message)s",          # we own the full line format
-            datefmt="%H:%M:%S",
-            force=True,
-        )
+        logging.basicConfig(level=logging.DEBUG, format="%(message)s", force=True)
         self._log = logging.getLogger(name)
-        # Silence noisy Playwright / asyncio sub-loggers
         for noisy in ("playwright", "asyncio"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    # ── Internal helpers ────────────────────────────────────────────────
-
     def _elapsed(self) -> str:
-        secs = time.monotonic() - self._start_ts
-        return f"+{secs:5.1f}s"
+        return f"+{time.monotonic() - self._start_ts:5.1f}s"
 
     def _phase_elapsed(self) -> str:
-        secs = time.monotonic() - self._phase_ts
-        return f"{secs:.1f}s"
+        return f"{time.monotonic() - self._phase_ts:.1f}s"
 
     def _ts(self) -> str:
         return time.strftime("%H:%M:%S")
@@ -108,94 +79,57 @@ class DetailedLogger:
     def _emit(self, level: int, line: str):
         self._log.log(level, line)
 
-    # ── Public API ───────────────────────────────────────────────────────
-
     def phase(self, title: str, subtitle: str = ""):
-        """
-        Top-level phase banner. Use for major milestones.
-
-        Example output:
-          ╔══════════════════════════════════════════════════════╗
-          ║  PHASE 2 · Load Profile                   +  2.1s  ║
-          ║  https://www.instagram.com/nasa/                    ║
-          ╚══════════════════════════════════════════════════════╝
-        """
         self._phase_num += 1
         self._phase_ts   = time.monotonic()
-        W = 60
+        W       = 60
         elapsed = self._elapsed()
         header  = f"  PHASE {self._phase_num} · {title}"
         padding = W - len(header) - len(elapsed) - 2
-        top    = "╔" + "═" * W + "╗"
-        mid    = f"║{header}{' ' * max(padding, 1)}{elapsed}  ║"
         self._emit(logging.INFO, "")
-        self._emit(logging.INFO, top)
-        self._emit(logging.INFO, mid)
+        self._emit(logging.INFO, "╔" + "═" * W + "╗")
+        self._emit(logging.INFO, f"║{header}{' ' * max(padding, 1)}{elapsed}  ║")
         if subtitle:
-            sub_line = f"║  {subtitle[:W-2]:<{W-2}}║"
-            self._emit(logging.INFO, sub_line)
+            self._emit(logging.INFO, f"║  {subtitle[:W-2]:<{W-2}}║")
         self._emit(logging.INFO, "╚" + "═" * W + "╝")
 
     def section(self, title: str):
-        """
-        Named sub-step within a phase.
-
-        Example output:
-          ├─ [14:03:22] Navigation ────────────────────────────────
-        """
         ts   = self._ts()
         line = f"  ├─ [{ts}] {title} "
-        fill = max(0, 64 - len(line))
-        self._emit(logging.INFO, line + "─" * fill)
+        self._emit(logging.INFO, line + "─" * max(0, 64 - len(line)))
 
     def section_end(self, summary: str = ""):
-        """
-        Close a section with an optional one-line summary.
-
-        Example output:
-          └─ done in 1.4s  ·  Found 12 post URLs
-        """
         parts = [f"  └─ done in {self._phase_elapsed()}"]
         if summary:
             parts.append(f"  ·  {summary}")
         self._emit(logging.INFO, "".join(parts))
 
     def info(self, msg: str, indent: int = 1):
-        pad = "     " * indent
-        self._emit(logging.INFO,    f"{pad}{self._ICONS['info']}  {msg}")
+        self._emit(logging.INFO,    f"{'     ' * indent}{self._ICONS['info']}  {msg}")
 
     def success(self, msg: str, indent: int = 1):
-        pad = "     " * indent
-        self._emit(logging.INFO,    f"{pad}{self._ICONS['success']}  {msg}")
+        self._emit(logging.INFO,    f"{'     ' * indent}{self._ICONS['success']}  {msg}")
 
     def warning(self, msg: str, indent: int = 1):
-        pad = "     " * indent
-        self._emit(logging.WARNING, f"{pad}{self._ICONS['warning']}  {msg}")
+        self._emit(logging.WARNING, f"{'     ' * indent}{self._ICONS['warning']}  {msg}")
 
     def error(self, msg: str, indent: int = 1):
-        pad = "     " * indent
-        self._emit(logging.ERROR,   f"{pad}{self._ICONS['error']}  {msg}")
+        self._emit(logging.ERROR,   f"{'     ' * indent}{self._ICONS['error']}  {msg}")
 
     def debug(self, msg: str, indent: int = 1):
-        pad = "     " * indent
-        self._emit(logging.DEBUG,   f"{pad}{self._ICONS['debug']}  {msg}")
+        self._emit(logging.DEBUG,   f"{'     ' * indent}{self._ICONS['debug']}  {msg}")
 
     def progress(self, done: int, total: int, label: str = ""):
-        """
-        Inline progress bar.
-
-        Example:  ▓▓▓▓▓▓▓░░░  6/10  captions extracted
-        """
-        bar_w   = 10
-        filled  = round(bar_w * done / max(total, 1))
-        bar     = "▓" * filled + "░" * (bar_w - filled)
-        suffix  = f"  {label}" if label else ""
+        bar_w  = 10
+        filled = round(bar_w * done / max(total, 1))
+        bar    = "▓" * filled + "░" * (bar_w - filled)
+        suffix = f"  {label}" if label else ""
         self._emit(logging.INFO, f"       [{bar}]  {done}/{total}{suffix}")
 
     def separator(self):
         self._emit(logging.INFO, "  " + "─" * 62)
 
-    # Legacy shim — keeps old .step() calls working without crashing
+    # Legacy shim
     def step(self, title: str, details: str = ""):
         self.phase(title, details)
 
@@ -210,8 +144,8 @@ logger = DetailedLogger("Instagram Scraper")
 @dataclass
 class ScrapingResult:
     success: bool
-    data: Optional[Dict] = None
-    error: Optional[str] = None
+    data:    Optional[Dict] = None
+    error:   Optional[str]  = None
 
 
 # ══════════════════════════════════════════════
@@ -220,43 +154,213 @@ class ScrapingResult:
 
 async def smart_route_handler(route):
     """
-    Lean route handler — decision is pure Python (no extra awaits),
-    so it never stalls the browser's network event queue.
-
-    Key rules:
-    • CDN media always allowed (we need those URLs later)
-    • fonts / stylesheets blocked (useless for scraping)
-    • known analytics domains blocked
-    • everything else: continue immediately
-
-    The try/except swallows TargetClosedError — raised when a page is
-    closed while a route handler is still pending, which is harmless.
+    Block fonts, stylesheets, and analytics.  Allow CDN media.
+    Wrapped in try/except so closing a page mid-request never floods
+    the logs with unhandled TargetClosedError futures.
     """
     try:
         url   = route.request.url
         rtype = route.request.resource_type
 
-        # CDN images/video — must flow through so we can read their URLs
         if any(cdn in url for cdn in CDN_ALLOWLIST):
             await route.continue_()
             return
-
-        # Cheap type check first (avoids string scan on most requests)
         if rtype in _BLOCK_TYPES:
             await route.abort()
             return
-
-        # Analytics/tracking
         if any(d in url for d in _BLOCK_DOMAINS):
             await route.abort()
             return
-
         await route.continue_()
     except PlaywrightError:
-        # Page/context was closed while the route was pending — ignore.
-        # Without this, closing a page mid-request floods the logs with
-        # "Future exception was never retrieved: TargetClosedError".
         pass
+
+
+# ══════════════════════════════════════════════
+#  HTML-level data extractor
+# ══════════════════════════════════════════════
+
+class InstagramHtmlParser:
+    """
+    Pure-Python parser for Instagram's server-rendered HTML.
+
+    WHY THIS EXISTS
+    ───────────────
+    Instagram often embeds all post/reel data directly in the initial HTML
+    (inside <script> tags as minified JSON blobs) rather than issuing
+    separate API calls after page load.  This means:
+
+      • Response intercept misses it  — no XHR to catch
+      • page.evaluate() can't read it — JS thread saturated on
+                                        CPU-constrained servers
+
+    Reading the raw response *body bytes* at the network layer and parsing
+    with Python regex+json bypasses both problems entirely.
+
+    Patterns covered
+    ────────────────
+    1. JSON-LD  <script type="application/ld+json">
+    2. og:video / og:image / og:description meta tags
+    3. shortcode_media / xdt_shortcode_media JSON blobs (inline script data)
+    4. Raw video_url / display_url key scan across entire HTML
+    5. edge_media_to_caption pattern
+    """
+
+    _RE_VIDEO_URL    = re.compile(r'"video_url"\s*:\s*"(https://[^"]+\.mp4[^"]*)"')
+    _RE_DISPLAY_URL  = re.compile(r'"display_url"\s*:\s*"(https://[^"]+(?:cdninstagram|fbcdn)[^"]*)"')
+    _RE_OG_VIDEO     = re.compile(r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']', re.I)
+    _RE_OG_IMAGE     = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
+    _RE_OG_DESC      = re.compile(
+        r'<meta[^>]+(?:property=["\']og:description["\']|name=["\']description["\'])'
+        r'[^>]+content=["\']([^"\']{20,})["\']', re.I
+    )
+    _RE_LDJSON       = re.compile(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        re.DOTALL | re.I,
+    )
+    _RE_SHORTCODE_MEDIA = re.compile(
+        r'"(?:shortcode_media|xdt_shortcode_media)"\s*:\s*(\{)',
+    )
+    _RE_EDGE_CAPTION = re.compile(
+        r'"edge_media_to_caption"\s*:\s*\{[^}]*"edges"\s*:\s*\[\s*\{[^}]*"node"\s*:\s*'
+        r'\{[^}]*"text"\s*:\s*"((?:[^"\\]|\\.)+)"',
+        re.DOTALL,
+    )
+
+    @classmethod
+    def _unescape(cls, s: str) -> str:
+        try:
+            return json.loads(f'"{s}"')
+        except Exception:
+            return s.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
+
+    @classmethod
+    def _find_json_object(cls, text: str, start: int) -> Optional[str]:
+        """
+        Extract the complete JSON object whose opening '{' is at `start`.
+        Uses a brace-counter with string-escape awareness.
+        """
+        depth  = 0
+        in_str = False
+        escape = False
+        i      = start
+        n      = len(text)
+        while i < n:
+            c = text[i]
+            if escape:
+                escape = False
+            elif c == "\\" and in_str:
+                escape = True
+            elif c == '"':
+                in_str = not in_str
+            elif not in_str:
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[start : i + 1]
+            i += 1
+        return None
+
+    @classmethod
+    def parse(
+        cls, html: bytes, shortcode: str, is_video: bool
+    ) -> Tuple[Optional[str], Optional[str], bool]:
+        """
+        Parse raw HTML bytes.  Returns (caption, media_url, is_video).
+        Any value may be None if not found.
+        """
+        try:
+            text = html.decode("utf-8", errors="ignore")
+        except Exception:
+            return None, None, is_video
+
+        caption:   Optional[str] = None
+        media_url: Optional[str] = None
+
+        # ── 1. JSON-LD ────────────────────────────────────────────────
+        for m in cls._RE_LDJSON.finditer(text):
+            try:
+                blob = json.loads(m.group(1))
+                if isinstance(blob, list):
+                    blob = blob[0] if blob else {}
+                cap = blob.get("caption") or blob.get("description") or ""
+                vid = blob.get("contentUrl") or blob.get("embedUrl") or ""
+                img = blob.get("thumbnailUrl") or blob.get("image") or ""
+                if isinstance(img, list):
+                    img = img[0] if img else ""
+                if cap and not caption:
+                    caption = cap
+                if vid and not media_url:
+                    media_url = vid
+                    is_video  = True
+                elif img and not media_url:
+                    media_url = img
+                if caption and media_url:
+                    return caption, media_url, is_video
+            except Exception:
+                pass
+
+        # ── 2. og: meta tags ─────────────────────────────────────────
+        if not media_url:
+            m = cls._RE_OG_VIDEO.search(text)
+            if m:
+                media_url = m.group(1)
+                is_video  = True
+        if not media_url:
+            m = cls._RE_OG_IMAGE.search(text)
+            if m and any(cdn in m.group(1) for cdn in CDN_ALLOWLIST):
+                media_url = m.group(1)
+        if not caption:
+            m = cls._RE_OG_DESC.search(text)
+            if m:
+                raw     = cls._unescape(m.group(1))
+                cleaned = re.sub(r"^[^:]+:\s*", "", raw).strip()
+                if len(cleaned) > 10:
+                    caption = cleaned
+
+        # ── 3. shortcode_media JSON blob ──────────────────────────────
+        for m in cls._RE_SHORTCODE_MEDIA.finditer(text):
+            blob_str = cls._find_json_object(text, m.start(1))
+            if not blob_str:
+                continue
+            try:
+                media = json.loads(blob_str)
+            except Exception:
+                continue
+
+            if not caption:
+                edges = media.get("edge_media_to_caption", {}).get("edges", [])
+                if edges:
+                    caption = edges[0].get("node", {}).get("text")
+
+            if not media_url:
+                if media.get("video_url"):
+                    is_video  = True
+                    media_url = media["video_url"]
+                elif media.get("display_url"):
+                    media_url = media["display_url"]
+
+            if caption and media_url:
+                return caption, media_url, is_video
+
+        # ── 4. Raw key scan ───────────────────────────────────────────
+        if not media_url:
+            m = cls._RE_VIDEO_URL.search(text)
+            if m:
+                is_video  = True
+                media_url = cls._unescape(m.group(1))
+        if not media_url:
+            m = cls._RE_DISPLAY_URL.search(text)
+            if m:
+                media_url = cls._unescape(m.group(1))
+        if not caption:
+            m = cls._RE_EDGE_CAPTION.search(text)
+            if m:
+                caption = cls._unescape(m.group(1))
+
+        return caption or None, media_url or None, is_video
 
 
 # ══════════════════════════════════════════════
@@ -265,12 +369,11 @@ async def smart_route_handler(route):
 
 class InstagramScraper:
 
-    # ------------------------------------------------------------------
     def __init__(
         self,
-        cookies: List[Dict],
-        logger: DetailedLogger,
-        max_concurrent: int = 3,
+        cookies:        List[Dict],
+        logger:         DetailedLogger,
+        max_concurrent: int = 2,
     ):
         self.cookies        = cookies
         self.logger         = logger
@@ -293,34 +396,16 @@ class InstagramScraper:
     #  Helpers
     # ------------------------------------------------------------------
 
-    def _jitter(self, lo=0.4, hi=1.2) -> float:
-        return random.uniform(lo, hi)
-
     async def _safe_evaluate(
         self,
-        page: Page,
-        script: str,
+        page:    Page,
+        script:  str,
         timeout: float = 10.0,
-        label: str = "evaluate",
+        label:   str   = "evaluate",
     ) -> Any:
-        """
-        page.evaluate() with a hard Python-side asyncio timeout.
-
-        WHY THIS EXISTS:
-          Playwright's page.evaluate() has NO built-in timeout.  If the JS
-          Promise never resolves (e.g. XHR dropped silently, page context
-          destroyed mid-flight, Instagram rate-limit intercepting the request),
-          the coroutine hangs indefinitely — freezing the worker.
-
-          asyncio.wait_for() provides the outer kill-switch that Playwright
-          doesn't.  On timeout we log and return None; the caller's fallback
-          strategy then kicks in normally.
-        """
+        """page.evaluate() with an asyncio hard timeout (Playwright has none)."""
         try:
-            return await asyncio.wait_for(
-                page.evaluate(script),
-                timeout=timeout,
-            )
+            return await asyncio.wait_for(page.evaluate(script), timeout=timeout)
         except asyncio.TimeoutError:
             self.logger.warning(
                 f"[{label}] page.evaluate timed out after {timeout:.0f}s — skipping",
@@ -329,51 +414,25 @@ class InstagramScraper:
             return None
         except Exception as e:
             self.logger.debug(
-                f"[{label}] evaluate error: {type(e).__name__}: {str(e).split(chr(10))[0][:80]}",
+                f"[{label}] error: {type(e).__name__}: {str(e).split(chr(10))[0][:80]}",
                 indent=3,
             )
             return None
 
     # ------------------------------------------------------------------
-    #  Navigation — the most resilient part
+    #  Navigation
     # ------------------------------------------------------------------
 
-    async def safe_goto(
-        self,
-        page: Page,
-        url: str,
-        max_retries: int = 3,
-    ) -> bool:
-        """
-        Resilient navigation using "commit" wait strategy.
-
-        WHY "commit":
-          Instagram's SPA fires endless background XHRs, so "domcontentloaded"
-          and "load" events may never fire — causing page.goto to hang until
-          timeout even on a perfectly working connection.  "commit" resolves
-          the moment the first byte of the response is received, which is
-          always fast.  We then manually wait for DOM content ourselves.
-
-        Retry strategy:
-          Attempt 1 — commit, 30 s
-          Attempt 2 — commit, 30 s  (after 2 s back-off)
-          Attempt 3 — commit, 30 s  (after 4 s back-off, new page)
-        """
+    async def safe_goto(self, page: Page, url: str, max_retries: int = 3) -> bool:
         for attempt in range(max_retries):
             self.logger.debug(
-                f"goto attempt {attempt + 1}/{max_retries}  "
-                f"timeout={GOTO_TIMEOUT_MS // 1000}s  url={url[:80]}",
-                indent=2,
+                f"goto attempt {attempt + 1}/{max_retries}  url={url[:80]}", indent=2
             )
             try:
                 response = await page.goto(
-                    url,
-                    wait_until=GOTO_WAIT_UNTIL,   # "commit" — never hangs
-                    timeout=GOTO_TIMEOUT_MS,
+                    url, wait_until=GOTO_WAIT_UNTIL, timeout=GOTO_TIMEOUT_MS
                 )
-
                 if response is None:
-                    self.logger.warning(f"attempt {attempt + 1} — goto returned no response, retrying", indent=2)
                     await asyncio.sleep(1.5)
                     continue
 
@@ -382,100 +441,57 @@ class InstagramScraper:
 
                 if status == 429:
                     wait = 5 + attempt * 3
-                    self.logger.warning(f"Rate-limited (HTTP 429) — waiting {wait}s before retry", indent=2)
+                    self.logger.warning(f"Rate-limited — waiting {wait}s", indent=2)
                     await asyncio.sleep(wait)
                     continue
-
                 if status >= 500:
-                    self.logger.warning(f"Server error (HTTP {status}) — retrying in {2 + attempt}s", indent=2)
                     await asyncio.sleep(2 + attempt)
                     continue
-
                 if status < 400:
-                    # Navigation committed — now wait for actual DOM content
-                    # WITHOUT relying on load/domcontentloaded events
                     await self._wait_for_dom(page)
                     self.logger.debug(f"Page ready after attempt {attempt + 1}", indent=2)
                     return True
 
-                # 4xx (not 429) — not retriable
-                self.logger.error(f"Non-retriable HTTP {status} for {url[:60]}", indent=2)
+                self.logger.error(f"Non-retriable HTTP {status}", indent=2)
                 return False
 
             except PlaywrightError as e:
-                err = str(e)
-                # Trim the verbose Playwright call-log from the message
-                short_err = err.split("\n")[0][:120]
-                self.logger.warning(
-                    f"Attempt {attempt + 1}/{max_retries} failed — {short_err}", indent=2
-                )
-
-                is_timeout = "Timeout" in err or "timeout" in err
-                is_net     = "net::ERR_" in err
-
+                short_err = str(e).split("\n")[0][:120]
+                self.logger.warning(f"Attempt {attempt + 1} failed — {short_err}", indent=2)
+                is_timeout = "Timeout" in str(e) or "timeout" in str(e)
+                is_net     = "net::ERR_" in str(e)
                 if (is_timeout or is_net) and attempt < max_retries - 1:
-                    backoff = 2.0 * (attempt + 1) + random.uniform(0, 1)
-                    self.logger.debug(f"Back-off {backoff:.1f}s before retry …", indent=2)
-                    await asyncio.sleep(backoff)
+                    await asyncio.sleep(2.0 * (attempt + 1) + random.uniform(0, 1))
                     continue
-
-                # Non-retriable Playwright error — bubble up
                 raise
 
         self.logger.error(
-            f"Navigation failed — all {max_retries} attempts exhausted for {url[:70]}",
-            indent=1,
+            f"Navigation failed after {max_retries} attempts for {url[:70]}", indent=1
         )
         return False
 
     async def _wait_for_dom(self, page: Page, timeout: float = 6.0):
-        """
-        Poll for DOM readiness after a "commit" navigation.
-
-        Timeout is intentionally short (6s default) — we proceed even if
-        nothing matches.  Hanging here starves workers.
-
-        Selectors cover both post pages (article) and reel pages (video/section).
-        """
         deadline = asyncio.get_event_loop().time() + timeout
-
-        # Covers post pages, reel pages, and plain profile pages
-        selectors = [
-            "article",
-            "video",              # reels land with a <video> before article hydrates
-            "main",
-            "section",
-            "div[role='main']",
-            "body > div > div",  # generic SPA shell
-        ]
-
-        for sel in selectors:
+        for sel in ["article", "video", "main", "section", "div[role='main']", "body > div > div"]:
             remaining_ms = (deadline - asyncio.get_event_loop().time()) * 1000
             if remaining_ms <= 200:
                 break
             try:
                 await page.wait_for_selector(
-                    sel,
-                    state="attached",
-                    timeout=min(remaining_ms, 2_000),   # max 2s per selector
+                    sel, state="attached", timeout=min(remaining_ms, 2_000)
                 )
                 self.logger.debug(f"DOM ready — matched '{sel}'", indent=2)
-                # Micro scroll to nudge lazy loaders
                 await self._safe_evaluate(
-                    page,
-                    "window.scrollBy(0,80); window.scrollBy(0,-80)",
-                    timeout=2.0,
-                    label="scroll-jitter",
+                    page, "window.scrollBy(0,80); window.scrollBy(0,-80)",
+                    timeout=2.0, label="scroll-jitter",
                 )
                 return
             except Exception:
                 pass
 
-        # Hard fallback — always proceed after budget expires
         elapsed = timeout - (deadline - asyncio.get_event_loop().time())
         self.logger.debug(
-            f"DOM selectors did not match in {elapsed:.1f}s — proceeding anyway",
-            indent=2,
+            f"DOM selectors did not match in {elapsed:.1f}s — proceeding anyway", indent=2
         )
         await asyncio.sleep(0.5)
 
@@ -484,14 +500,13 @@ class InstagramScraper:
     # ------------------------------------------------------------------
 
     async def dismiss_popups(self, page: Page):
-        dismissable = [
+        for sel in [
             'button:has-text("Not now")',
             'button:has-text("Allow all cookies")',
             'button:has-text("Accept")',
             '[role="dialog"] button:has-text("Not Now")',
             'button:has-text("Allow essential and optional cookies")',
-        ]
-        for sel in dismissable:
+        ]:
             try:
                 el = page.locator(sel).first
                 if await el.is_visible(timeout=800):
@@ -501,234 +516,146 @@ class InstagramScraper:
                 pass
 
     # ------------------------------------------------------------------
-    #  Headers
+    #  JS-based caption / media fallbacks
     # ------------------------------------------------------------------
 
-    def _build_headers(self) -> Dict[str, str]:
-        return {
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
-            "content-type": "application/x-www-form-urlencoded",
-            "origin": "https://www.instagram.com",
-            "referer": "https://www.instagram.com/",
-            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="124", "Google Chrome";v="124"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": self.user_agents[0],
-            "x-csrftoken": self.csrf_token or "",
-            "x-ig-app-id": self.ig_app_id,
-            "x-ig-www-claim": "0",
-            "x-requested-with": "XMLHttpRequest",
-        }
-
-    # ------------------------------------------------------------------
-    #  Caption extraction — Strategy 1: GraphQL XHR (in-page)
-    # ------------------------------------------------------------------
-
-    async def extract_caption_graphql(self, page: Page, shortcode: str) -> Optional[str]:
+    async def _js_extract_caption(self, page: Page, shortcode: str) -> Optional[str]:
         """
-        Strategy 1: fire a GraphQL POST from inside the page via XHR.
-        Hard capped at 9s Python-side (asyncio.wait_for) so it can never hang.
-        XHR self-timeout is 7s so it always resolves before the outer cap.
+        JS fallback strategies — only used when HTML body parse yields nothing.
+
+        Key differences from the original version:
+        ─────────────────────────────────────────
+        1. GraphQL uses fetch() with credentials:'include' instead of XHR
+           with manually-set headers.  credentials:'include' auto-attaches
+           ALL browser cookies (including httpOnly ones JS can't read),
+           making the request indistinguishable from the browser's own calls.
+
+        2. Window globals checks __additionalDataLoaded (correct name) and
+           __additionalData (legacy fallback), plus _sharedData for old posts.
         """
-        headers   = self._build_headers()
-        variables = {
-            "shortcode": shortcode,
-            "fetch_tagged_user_count": None,
-            "hoisted_comment_id": None,
-            "hoisted_reply_id": None,
-        }
-        body      = (
-            f"variables={quote(json.dumps(variables, separators=(',', ':')))}"
-            f"&doc_id={self.post_doc_id}"
-        )
-        safe_body = body.replace("'", "\\'")
+        # ── Strategy 1: GraphQL via fetch with credentials:include ────
+        # Use JSON.stringify to safely embed variables — avoids shell-escaping
+        # issues that plagued the old body.replace("'", "\\'") approach.
+        gql_script = f"""
+            async () => {{
+                try {{
+                    const vars = {{
+                        shortcode: {json.dumps(shortcode)},
+                        fetch_tagged_user_count: null,
+                        hoisted_comment_id: null,
+                        hoisted_reply_id: null
+                    }};
+                    const body = 'variables=' + encodeURIComponent(JSON.stringify(vars))
+                               + '&doc_id={self.post_doc_id}';
 
-        script = f"""
-            () => new Promise((resolve) => {{
-                const xhr = new XMLHttpRequest();
-                xhr.open('POST', 'https://www.instagram.com/graphql/query', true);
-                xhr.setRequestHeader('accept', '*/*');
-                xhr.setRequestHeader('content-type', 'application/x-www-form-urlencoded');
-                xhr.setRequestHeader('x-csrftoken', '{headers["x-csrftoken"]}');
-                xhr.setRequestHeader('x-ig-app-id', '{headers["x-ig-app-id"]}');
-                xhr.setRequestHeader('x-requested-with', 'XMLHttpRequest');
-                xhr.setRequestHeader('referer', 'https://www.instagram.com/');
-                xhr.timeout = 7000;
-                xhr.onload    = () => {{
-                    try {{ resolve(JSON.parse(xhr.responseText)); }}
-                    catch (e) {{ resolve({{_err: 'parse:' + e.message}}); }}
-                }};
-                xhr.onerror   = () => resolve({{_err: 'network'}});
-                xhr.ontimeout = () => resolve({{_err: 'xhr-timeout'}});
-                xhr.send('{safe_body}');
-            }})
+                    const resp = await fetch('https://www.instagram.com/graphql/query', {{
+                        method: 'POST',
+                        headers: {{
+                            'content-type': 'application/x-www-form-urlencoded',
+                            'x-csrftoken': {json.dumps(self.csrf_token or '')},
+                            'x-ig-app-id': '{self.ig_app_id}',
+                            'x-requested-with': 'XMLHttpRequest'
+                        }},
+                        credentials: 'include',
+                        body: body
+                    }});
+
+                    if (!resp.ok) return {{_err: 'http:' + resp.status}};
+                    return await resp.json();
+                }} catch (e) {{
+                    return {{_err: e.message}};
+                }}
+            }}
         """
+        result = await self._safe_evaluate(page, gql_script, timeout=12.0, label="graphql-fetch")
+        if result and not result.get("_err"):
+            media = result.get("data", {}).get("xdt_shortcode_media", {})
+            if media:
+                edges = media.get("edge_media_to_caption", {}).get("edges", [])
+                cap = edges[0]["node"].get("text") if edges else media.get("accessibility_caption")
+                if cap:
+                    self.logger.debug(f"Caption via [GraphQL fetch]  {len(cap)} chars", indent=2)
+                    return cap
+        elif result and result.get("_err"):
+            self.logger.debug(f"GraphQL fetch: {result['_err']}", indent=3)
 
-        result = await self._safe_evaluate(page, script, timeout=9.0, label="graphql-xhr")
-        if not result:
-            return None
-        if "_err" in result:
-            self.logger.debug(f"GraphQL XHR: {result['_err']}", indent=3)
-            return None
-
-        media = result.get("data", {}).get("xdt_shortcode_media", {})
-        if not media:
-            return None
-        edges = media.get("edge_media_to_caption", {}).get("edges", [])
-        if edges:
-            return edges[0]["node"].get("text") or None
-        return media.get("accessibility_caption") or None
-
-    # ------------------------------------------------------------------
-    #  Caption extraction — Strategy 2: DOM selectors
-    # ------------------------------------------------------------------
-
-    async def extract_caption_from_dom(self, page: Page) -> Optional[str]:
-        """
-        Strategy 2: synchronous DOM scan — runs in <1ms, capped at 4s just in case.
-        """
-        script = r"""
+        # ── Strategy 2: Window globals ────────────────────────────────
+        # Checks __additionalDataLoaded (current), __additionalData (legacy),
+        # and _sharedData (very old posts).
+        window_script = r"""
             () => {
-                const selectors = [
-                    'div._aacl._a9zr._a9zo._a9z9',
-                    'div._aacl._a9zr',
-                    'div[data-testid="post-caption"]',
-                    'article div[role="button"] + div span',
-                    'h1 + div span',
-                    'span._aacl',
-                ];
-                for (const s of selectors) {
-                    const el = document.querySelector(s);
-                    if (el) {
-                        const t = el.innerText?.trim();
-                        if (t && t.length > 5) return { text: t, src: s };
-                    }
-                }
-                const meta = document.querySelector('meta[property="og:description"]');
-                if (meta) {
-                    const c = meta.getAttribute('content') || '';
-                    const cleaned = c.replace(/^[^,]+,\s*/, '').trim();
-                    if (cleaned.length > 20) return { text: cleaned, src: 'og:description' };
-                }
-                return null;
-            }
-        """
-        res = await self._safe_evaluate(page, script, timeout=4.0, label="dom-caption")
-        if res and res.get("text"):
-            return re.sub(r"\s*more\s*$", "", res["text"], flags=re.IGNORECASE).strip()
-        return None
-
-    # ------------------------------------------------------------------
-    #  Caption extraction — Strategy 3: JSON-LD
-    # ------------------------------------------------------------------
-
-    async def extract_caption_from_ldjson(self, page: Page) -> Optional[str]:
-        """Strategy 3: synchronous JSON-LD scan, capped at 4s."""
-        script = r"""
-            () => {
-                for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
-                    try {
-                        const d = JSON.parse(s.textContent);
-                        if (d.caption || d.description) return d.caption || d.description;
-                    } catch (_) {}
-                }
-                return null;
-            }
-        """
-        return await self._safe_evaluate(page, script, timeout=4.0, label="ldjson-caption")
-
-    # ------------------------------------------------------------------
-    #  Caption extraction — Strategy 4: window globals
-    # ------------------------------------------------------------------
-
-    async def extract_caption_from_window_data(self, page: Page) -> Optional[str]:
-        """Strategy 4: read Instagram's pre-loaded window globals, capped at 4s."""
-        script = r"""
-            () => {
+                // __additionalDataLoaded — current Instagram global (2024+)
                 try {
-                    for (const k of Object.keys(window.__additionalData || {})) {
-                        const m = window.__additionalData[k]?.data?.graphql?.shortcode_media
-                               || window.__additionalData[k]?.data?.xdt_shortcode_media;
+                    const dl = window.__additionalDataLoaded || {};
+                    for (const key of Object.keys(dl)) {
+                        const d = dl[key];
+                        const m = d?.data?.xdt_shortcode_media
+                               || d?.data?.shortcode_media
+                               || d?.graphql?.shortcode_media;
                         if (m) {
-                            const edges = m.edge_media_to_caption?.edges || [];
-                            if (edges.length) return edges[0].node.text;
+                            const e = m.edge_media_to_caption?.edges || [];
+                            if (e.length) return e[0].node.text;
                         }
                     }
                 } catch (_) {}
+
+                // __additionalData — older global (2022-2023)
                 try {
-                    const m = window._sharedData?.entry_data?.PostPage?.[0]?.graphql?.shortcode_media;
-                    if (m) {
-                        const edges = m.edge_media_to_caption?.edges || [];
-                        if (edges.length) return edges[0].node.text;
+                    const ad = window.__additionalData || {};
+                    for (const key of Object.keys(ad)) {
+                        const m = ad[key]?.data?.xdt_shortcode_media
+                               || ad[key]?.data?.shortcode_media;
+                        if (m) {
+                            const e = m.edge_media_to_caption?.edges || [];
+                            if (e.length) return e[0].node.text;
+                        }
                     }
                 } catch (_) {}
+
+                // _sharedData — legacy global (pre-2022)
+                try {
+                    const m = window._sharedData?.entry_data?.PostPage?.[0]
+                                ?.graphql?.shortcode_media;
+                    if (m) {
+                        const e = m.edge_media_to_caption?.edges || [];
+                        if (e.length) return e[0].node.text;
+                    }
+                } catch (_) {}
+
                 return null;
             }
         """
-        return await self._safe_evaluate(page, script, timeout=4.0, label="window-globals")
+        cap = await self._safe_evaluate(page, window_script, timeout=4.0, label="window-globals")
+        if cap:
+            self.logger.debug(f"Caption via [window globals]  {len(cap)} chars", indent=2)
+            return cap
 
-    # ------------------------------------------------------------------
-    #  Master caption orchestrator
-    # ------------------------------------------------------------------
-
-    async def extract_caption_from_post(self, page: Page, shortcode: str = "") -> str:
+        # ── Strategy 3: DOM selectors ─────────────────────────────────
+        dom_script = r"""
+            () => {
+                for (const s of [
+                    'div._aacl._a9zr._a9zo._a9z9',
+                    'div._aacl._a9zr',
+                    'div[data-testid="post-caption"]',
+                    'h1 + div span',
+                    'span._aacl'
+                ]) {
+                    const el = document.querySelector(s);
+                    const t  = el?.innerText?.trim();
+                    if (t && t.length > 5) return t;
+                }
+                return null;
+            }
         """
-        Master caption orchestrator — tries four strategies in priority order.
+        cap = await self._safe_evaluate(page, dom_script, timeout=4.0, label="dom-caption")
+        if cap:
+            self.logger.debug(f"Caption via [DOM selectors]  {len(cap)} chars", indent=2)
+            return cap
 
-        Hard outer cap: 30s total.  Even if every strategy hangs at its own
-        sub-timeout, this guarantees the worker is never blocked longer than
-        this.  In practice the inner _safe_evaluate timeouts (4–9s each) mean
-        we exit well before the outer cap.
+        return None
 
-        NOTE: This is now a FALLBACK path.  The primary path is the response
-        interceptor in scrape_single_post which reads data at the network
-        layer before the JS thread ever touches it.
-        """
-        async def _inner() -> str:
-            strategies = [
-                ("GraphQL XHR",   lambda: self.extract_caption_graphql(page, shortcode) if shortcode else asyncio.coroutine(lambda: None)()),
-                ("Window data",   lambda: self.extract_caption_from_window_data(page)),
-                ("DOM selectors", lambda: self.extract_caption_from_dom(page)),
-                ("JSON-LD",       lambda: self.extract_caption_from_ldjson(page)),
-            ]
-            for name, fn in strategies:
-                try:
-                    result = await fn()
-                    if result:
-                        self.logger.debug(
-                            f"Caption via [{name}]  {len(result)} chars", indent=2
-                        )
-                        return result
-                    else:
-                        self.logger.debug(f"[{name}] returned empty — trying next", indent=2)
-                except Exception as e:
-                    self.logger.debug(
-                        f"[{name}] raised {type(e).__name__}: {str(e)[:60]}", indent=2
-                    )
-            self.logger.warning("All caption strategies exhausted — no caption found", indent=2)
-            return ""
-
-        try:
-            return await asyncio.wait_for(_inner(), timeout=30.0)
-        except asyncio.TimeoutError:
-            self.logger.warning(
-                "Caption extraction hit the 30s hard cap — returning empty", indent=2
-            )
-            return ""
-
-    # ------------------------------------------------------------------
-    #  Media URL extraction
-    # ------------------------------------------------------------------
-
-    async def extract_media_from_post(
-        self, page: Page, post_url: str
-    ) -> Tuple[str, bool]:
+    async def _js_extract_media(self, page: Page, post_url: str) -> Tuple[str, bool]:
         is_video = any(p in post_url for p in ("/reel/", "/tv/"))
-
         if is_video:
             script = r"""
                 () => {
@@ -739,8 +666,12 @@ class InstagramScraper:
                     const mv = document.querySelector('meta[property="og:video"]');
                     if (mv) return mv.getAttribute('content');
                     try {
-                        const keys = Object.keys(window.__additionalData || {});
-                        for (const k of keys) {
+                        const dl = window.__additionalDataLoaded || {};
+                        for (const k of Object.keys(dl)) {
+                            const m = dl[k]?.data?.xdt_shortcode_media;
+                            if (m?.video_url) return m.video_url;
+                        }
+                        for (const k of Object.keys(window.__additionalData || {})) {
                             const m = window.__additionalData[k]?.data?.xdt_shortcode_media;
                             if (m?.video_url) return m.video_url;
                         }
@@ -758,135 +689,106 @@ class InstagramScraper:
                     }
                     const imgs = Array.from(document.querySelectorAll('article img[src]'));
                     const cands = imgs
-                        .filter(i => (i.src.includes('cdninstagram') || i.src.includes('fbcdn'))
-                                  && !i.src.includes('profile') && i.naturalWidth > 300)
+                        .filter(i =>
+                            (i.src.includes('cdninstagram') || i.src.includes('fbcdn'))
+                            && !i.src.includes('profile') && i.naturalWidth > 300)
                         .sort((a, b) => b.naturalWidth - a.naturalWidth);
                     return cands[0]?.src || '';
                 }
             """
-
         url = await self._safe_evaluate(page, script, timeout=6.0, label="media-url")
-        if url and not url.startswith("blob"):
-            return url, is_video
-
-        return "", is_video
+        return (url if url and not url.startswith("blob") else ""), is_video
 
     # ------------------------------------------------------------------
-    #  Single post scraper — response-intercept primary path
+    #  Single post scraper — three-layer strategy
     # ------------------------------------------------------------------
 
     async def scrape_single_post(
         self,
-        context: BrowserContext,
-        post_url: str,
-        shortcode: str,
+        context:    BrowserContext,
+        post_url:   str,
+        shortcode:  str,
         post_index: int,
     ) -> ScrapingResult:
         """
-        Scrape one post using a two-phase strategy:
+        Three-layer data extraction strategy, in priority order:
 
-        PRIMARY — Response intercept (network layer)
-          Register a response listener BEFORE navigating.  As Instagram
-          loads the page it makes its own GraphQL / v1 API calls.  We read
-          those exact responses — bypassing the JS evaluation layer entirely.
-          This is critical on CPU-constrained servers (e.g. Render free tier)
-          where Chromium's JS thread is saturated by Instagram's ~10 MB bundle
-          and page.evaluate() hangs indefinitely.
+        LAYER 1 — Network-layer capture + Python parse (primary)
+        ─────────────────────────────────────────────────────────
+        A response listener is registered before navigation.  It captures:
 
-        FALLBACK — JS evaluate strategies (4 chained methods)
-          Used only when the intercept produces no data (e.g. Instagram
-          returns a cached/preloaded page with no fresh API calls).
+          (a) The raw HTML bytes of the main document response
+              → parsed by InstagramHtmlParser in pure Python
+              → covers pages where data is embedded inline in <script> tags
+                (dominant pattern for Instagram reels / older posts)
+
+          (b) Any JSON API responses (graphql / v1 media endpoints)
+              → parsed directly as dicts in Python
+              → covers pages that fetch data via XHR after initial load
+
+        Neither (a) nor (b) touches the Chromium JS runtime — both work
+        correctly even when the JS thread is saturated.
+
+        LAYER 2 — JS evaluate fallback
+        ────────────────────────────────
+        Only reached when Layer 1 yields no media_url.
+
+          • GraphQL via fetch() with credentials:'include'
+            (auto-sends all cookies including httpOnly — more reliable
+            than manually setting headers)
+          • window.__additionalDataLoaded  (correct 2024+ global)
+          • window.__additionalData        (legacy 2022-2023 global)
+          • window._sharedData             (very old posts)
+          • DOM selector scan
+
+        LAYER 3 — Failure
+        ──────────────────
+        Return ScrapingResult(success=False).
         """
-        page        = None
-        t0          = time.monotonic()
-        post_type   = "REEL" if any(p in post_url for p in SLOW_PATH_PATTERNS) else "POST"
+        page      = None
+        t0        = time.monotonic()
+        post_type = "REEL" if any(p in post_url for p in SLOW_PATH_PATTERNS) else "POST"
 
-        # Mutable state shared with the response listener closure
-        caption_ref:   list = [None]
-        media_url_ref: list = [None]
-        is_video_ref:  list = [any(p in post_url for p in SLOW_PATH_PATTERNS)]
-        data_ready          = asyncio.Event()
+        html_body_ref: list = [None]   # bytes — main page HTML
+        api_data_ref:  list = [None]   # dict  — first matching JSON API response
+        api_ready           = asyncio.Event()
+
+        is_video_default = any(p in post_url for p in SLOW_PATH_PATTERNS)
 
         self.logger.info(f"[{post_index:>2}] {post_type}  {shortcode}", indent=1)
 
         # ── Response listener ─────────────────────────────────────────
-        # Defined here so it can be removed in the finally block even if
-        # page creation fails.
         async def on_response(response):
             url = response.url
 
-            # Only care about Instagram's own data endpoints
-            if not any(sig in url for sig in (
-                "graphql/query", "/api/v1/media/", "/api/graphql"
-            )):
+            # Capture main page HTML
+            if html_body_ref[0] is None and response.request.resource_type == "document":
+                try:
+                    if response.status == 200:
+                        body = await asyncio.wait_for(response.body(), timeout=8.0)
+                        html_body_ref[0] = body
+                        self.logger.debug(
+                            f"[{post_index}] HTML captured  {len(body):,} bytes", indent=2
+                        )
+                except Exception:
+                    pass
                 return
 
+            # Capture JSON API responses
+            if api_data_ref[0] is not None:
+                return
+            if not any(sig in url for sig in ("graphql/query", "/api/v1/media/", "/api/graphql")):
+                return
             try:
                 if response.status != 200:
                     return
-                ct = response.headers.get("content-type", "")
-                if "json" not in ct:
+                if "json" not in response.headers.get("content-type", ""):
                     return
                 data = await asyncio.wait_for(response.json(), timeout=3.0)
+                api_data_ref[0] = data
+                api_ready.set()
             except Exception:
-                return
-
-            # ── Try GraphQL shapes (xdt / legacy) ────────────────────
-            media = None
-            for extractor in [
-                lambda d: d.get("data", {}).get("xdt_shortcode_media"),
-                lambda d: d.get("data", {}).get("shortcode_media"),
-                lambda d: d.get("graphql", {}).get("shortcode_media"),
-            ]:
-                try:
-                    media = extractor(data)
-                    if media:
-                        break
-                except Exception:
-                    pass
-
-            # ── Try v1 items[] shape ──────────────────────────────────
-            if not media:
-                try:
-                    items = data.get("items") or []
-                    if items:
-                        item = items[0]
-                        cap  = item.get("caption") or {}
-                        text = cap.get("text") if isinstance(cap, dict) else None
-                        if text and not caption_ref[0]:
-                            caption_ref[0] = text
-                        if not media_url_ref[0]:
-                            if item.get("video_versions"):
-                                is_video_ref[0]  = True
-                                media_url_ref[0] = item["video_versions"][0].get("url")
-                            elif item.get("image_versions2"):
-                                cands = item["image_versions2"].get("candidates", [])
-                                if cands:
-                                    media_url_ref[0] = cands[0].get("url")
-                        if caption_ref[0] or media_url_ref[0]:
-                            data_ready.set()
-                        return
-                except Exception:
-                    pass
-
-            if not media:
-                return
-
-            # ── Extract from GraphQL media object ─────────────────────
-            if not caption_ref[0]:
-                edges = media.get("edge_media_to_caption", {}).get("edges", [])
-                if edges:
-                    caption_ref[0] = edges[0].get("node", {}).get("text")
-
-            if not media_url_ref[0]:
-                if media.get("video_url"):
-                    is_video_ref[0]  = True
-                    media_url_ref[0] = media["video_url"]
-                elif media.get("display_url"):
-                    media_url_ref[0] = media["display_url"]
-
-            if caption_ref[0] or media_url_ref[0]:
-                data_ready.set()
+                pass
 
         # ── Page setup ────────────────────────────────────────────────
         try:
@@ -895,7 +797,6 @@ class InstagramScraper:
             page.set_default_timeout(15_000)
             await page.route("**/*", smart_route_handler)
 
-            # Attach listener BEFORE navigation so we don't miss early responses
             page.on("response", on_response)
 
             # ── Navigate ──────────────────────────────────────────────
@@ -904,35 +805,90 @@ class InstagramScraper:
                 return ScrapingResult(success=False, error="Navigation failed after all retries")
 
             if "accounts/login" in page.url:
-                self.logger.error(f"[{post_index}] redirected to login — session expired", indent=2)
+                self.logger.error(
+                    f"[{post_index}] redirected to login — session expired", indent=2
+                )
                 return ScrapingResult(success=False, error="Redirected to login")
 
             await self.dismiss_popups(page)
 
-            # ── Wait for intercepted data (primary path) ──────────────
-            self.logger.debug(f"[{post_index}] waiting for API response intercept …", indent=2)
+            # Brief window for any post-load API XHRs
             try:
-                await asyncio.wait_for(data_ready.wait(), timeout=20.0)
-                self.logger.debug(f"[{post_index}] API data intercepted ✓", indent=2)
+                await asyncio.wait_for(api_ready.wait(), timeout=5.0)
+                self.logger.debug(f"[{post_index}] API JSON intercepted", indent=2)
             except asyncio.TimeoutError:
-                self.logger.warning(
-                    f"[{post_index}] intercept timeout (20s) — falling back to JS evaluate",
-                    indent=2,
+                self.logger.debug(
+                    f"[{post_index}] no API JSON in 5s — relying on HTML parse", indent=2
                 )
 
-            caption   = caption_ref[0] or ""
-            media_url = media_url_ref[0] or ""
-            is_video  = is_video_ref[0]
+            # ── LAYER 1 ───────────────────────────────────────────────
+            caption:   Optional[str] = None
+            media_url: Optional[str] = None
+            is_video:  bool          = is_video_default
 
-            # ── JS-based fallback (only when intercept got nothing) ───
-            if not media_url:
+            # 1a — JSON API response
+            if api_data_ref[0]:
+                api   = api_data_ref[0]
+                media = (
+                    api.get("data", {}).get("xdt_shortcode_media")
+                    or api.get("data", {}).get("shortcode_media")
+                    or api.get("graphql", {}).get("shortcode_media")
+                )
+                if not media:
+                    items = api.get("items") or []
+                    if items:
+                        item  = items[0]
+                        cap   = item.get("caption") or {}
+                        caption = cap.get("text") if isinstance(cap, dict) else None
+                        if item.get("video_versions"):
+                            is_video  = True
+                            media_url = item["video_versions"][0].get("url")
+                        elif item.get("image_versions2"):
+                            cands = item["image_versions2"].get("candidates", [])
+                            media_url = cands[0].get("url") if cands else None
+                else:
+                    edges = media.get("edge_media_to_caption", {}).get("edges", [])
+                    if edges:
+                        caption = edges[0].get("node", {}).get("text")
+                    if media.get("video_url"):
+                        is_video  = True
+                        media_url = media["video_url"]
+                    elif media.get("display_url"):
+                        media_url = media["display_url"]
+
+                if media_url:
+                    self.logger.debug(
+                        f"[{post_index}] Layer 1a (API JSON) ✓", indent=2
+                    )
+
+            # 1b — HTML body parse
+            if not media_url and html_body_ref[0]:
                 self.logger.debug(
-                    f"[{post_index}] intercept empty — trying JS fallback strategies",
+                    f"[{post_index}] Layer 1b — HTML parse "
+                    f"({len(html_body_ref[0]):,} bytes) …",
+                    indent=2,
+                )
+                h_cap, h_url, h_vid = InstagramHtmlParser.parse(
+                    html_body_ref[0], shortcode, is_video
+                )
+                if h_url:
+                    media_url = h_url
+                    is_video  = h_vid
+                    self.logger.debug(
+                        f"[{post_index}] Layer 1b (HTML parse) ✓", indent=2
+                    )
+                if not caption and h_cap:
+                    caption = h_cap
+
+            # ── LAYER 2: JS evaluate fallback ─────────────────────────
+            if not media_url:
+                self.logger.warning(
+                    f"[{post_index}] Layers 1a+1b empty — trying JS fallback",
                     indent=2,
                 )
                 if not caption:
-                    caption = await self.extract_caption_from_post(page, shortcode)
-                media_url, is_video = await self.extract_media_from_post(page, post_url)
+                    caption = await self._js_extract_caption(page, shortcode) or ""
+                media_url, is_video = await self._js_extract_media(page, post_url)
 
             # ── Result ────────────────────────────────────────────────
             elapsed = time.monotonic() - t0
@@ -950,14 +906,15 @@ class InstagramScraper:
                     data={
                         "url":       post_url,
                         "shortcode": shortcode,
-                        "caption":   caption,
+                        "caption":   caption or "",
                         "media_url": media_url,
                         "is_video":  is_video,
                     },
                 )
 
             self.logger.warning(
-                f"[{post_index:>2}] no media URL found  shortcode={shortcode}  {elapsed:.1f}s",
+                f"[{post_index:>2}] no media URL found  "
+                f"shortcode={shortcode}  {elapsed:.1f}s",
                 indent=1,
             )
             return ScrapingResult(success=False, error="No media URL found")
@@ -965,8 +922,8 @@ class InstagramScraper:
         except Exception as e:
             elapsed = time.monotonic() - t0
             self.logger.error(
-                f"[{post_index:>2}] {type(e).__name__}: {str(e).split(chr(10))[0][:80]}  "
-                f"{elapsed:.1f}s",
+                f"[{post_index:>2}] {type(e).__name__}: "
+                f"{str(e).split(chr(10))[0][:80]}  {elapsed:.1f}s",
                 indent=1,
             )
             return ScrapingResult(success=False, error=str(e)[:80])
@@ -986,16 +943,10 @@ class InstagramScraper:
     #  Profile scraper (scroll + collect post URLs)
     # ------------------------------------------------------------------
 
-    async def _collect_post_urls(
-        self, page: Page, post_limit: int
-    ) -> List[str]:
-        """
-        Scroll the profile grid, collecting post URLs.
-        Handles Instagram's lazy-loaded infinite scroll robustly.
-        """
-        post_urls:   List[str] = []
-        last_height: int       = 0
-        stale_rounds: int      = 0
+    async def _collect_post_urls(self, page: Page, post_limit: int) -> List[str]:
+        post_urls:    List[str] = []
+        last_height:  int       = 0
+        stale_rounds: int       = 0
         MAX_STALE   = 3
         MAX_SCROLLS = 15
 
@@ -1009,50 +960,55 @@ class InstagramScraper:
         """
 
         for i in range(MAX_SCROLLS):
-            links = await self._safe_evaluate(page, js_collect, timeout=5.0, label="collect-links") or []
-            new   = [u for u in links if u not in post_urls]
+            links = (
+                await self._safe_evaluate(page, js_collect, timeout=5.0, label="collect-links")
+                or []
+            )
+            new = [u for u in links if u not in post_urls]
             post_urls.extend(new)
 
-            newly = len(new)
-            total = len(post_urls)
-            if newly:
+            if new:
                 self.logger.info(
                     f"Scroll {i+1:>2}/{MAX_SCROLLS}  "
-                    f"+{newly} new  →  {total} total",
+                    f"+{len(new)} new  →  {len(post_urls)} total",
                     indent=2,
                 )
             else:
                 self.logger.debug(
-                    f"Scroll {i+1:>2}/{MAX_SCROLLS}  no new posts  "
+                    f"Scroll {i+1:>2}/{MAX_SCROLLS}  no new  "
                     f"(stale {stale_rounds + 1}/{MAX_STALE})",
                     indent=2,
                 )
 
-            if total >= post_limit:
-                self.logger.info(f"Post limit ({post_limit}) reached — stopping scroll", indent=2)
+            if len(post_urls) >= post_limit:
+                self.logger.info(
+                    f"Post limit ({post_limit}) reached — stopping scroll", indent=2
+                )
                 break
 
-            # Scroll to bottom
             await self._safe_evaluate(
-                page, "window.scrollTo(0, document.body.scrollHeight)", timeout=3.0, label="scroll"
+                page, "window.scrollTo(0, document.body.scrollHeight)",
+                timeout=3.0, label="scroll",
             )
-
-            # Wait for new content — poll for height change up to ~2s
             for _ in range(4):
                 await asyncio.sleep(0.5)
-                new_height = await self._safe_evaluate(
-                    page, "document.body.scrollHeight", timeout=3.0, label="scroll-height"
-                ) or last_height
+                new_height = (
+                    await self._safe_evaluate(
+                        page, "document.body.scrollHeight",
+                        timeout=3.0, label="scroll-height",
+                    )
+                    or last_height
+                )
                 if new_height != last_height:
-                    last_height   = new_height
-                    stale_rounds  = 0
+                    last_height  = new_height
+                    stale_rounds = 0
                     break
             else:
                 stale_rounds += 1
 
             if stale_rounds >= MAX_STALE:
                 self.logger.info(
-                    f"Page end reached — no new content after {MAX_STALE} consecutive scrolls",
+                    f"Page end — no new content after {MAX_STALE} consecutive scrolls",
                     indent=2,
                 )
                 break
@@ -1063,9 +1019,7 @@ class InstagramScraper:
     #  Main entry point
     # ------------------------------------------------------------------
 
-    async def scrape_profile(
-        self, username: str, post_limit: int = 10
-    ) -> List[Dict]:
+    async def scrape_profile(self, username: str, post_limit: int = 10) -> List[Dict]:
         t_total = time.monotonic()
 
         self.logger.phase(
@@ -1095,7 +1049,6 @@ class InstagramScraper:
             self.logger.success("Browser ready", indent=2)
             self.logger.section_end()
 
-            # ── Profile context ───────────────────────────────────────
             main_ctx = await browser.new_context(
                 user_agent=random.choice(self.user_agents),
                 viewport={"width": 1920, "height": 1080},
@@ -1121,31 +1074,40 @@ class InstagramScraper:
 
                 if "accounts/login" in profile_page.url:
                     self.logger.error(
-                        "Redirected to login page — cookies are expired or invalid", indent=1
+                        "Redirected to login — cookies are expired or invalid", indent=1
                     )
                     await profile_page.close()
                     return []
 
-                self.logger.success(f"Profile page loaded: {profile_page.url[:70]}", indent=2)
+                self.logger.success(f"Profile loaded: {profile_page.url[:70]}", indent=2)
                 self.logger.section_end()
 
                 await self.dismiss_popups(profile_page)
                 await self._wait_for_dom(profile_page)
 
                 # ── Phase: Discover posts ─────────────────────────────
-                self.logger.phase("Discover Posts", f"Scrolling grid — target: {post_limit} posts")
+                self.logger.phase(
+                    "Discover Posts", f"Scrolling grid — target: {post_limit} posts"
+                )
                 self.logger.section("Grid scroll")
                 post_urls = await self._collect_post_urls(profile_page, post_limit)
                 await profile_page.close()
                 self.logger.section_end(f"{len(post_urls)} unique post URLs collected")
 
                 if not post_urls:
-                    self.logger.error("No post URLs found — profile may be private or empty", indent=1)
+                    self.logger.error(
+                        "No post URLs found — profile may be private or empty", indent=1
+                    )
                     return []
 
                 self.logger.separator()
                 for i, u in enumerate(post_urls, 1):
-                    sc = u.split("/p/")[-1].split("/reel/")[-1].split("/tv/")[-1].split("/")[0]
+                    sc = (
+                        u.split("/p/")[-1]
+                         .split("/reel/")[-1]
+                         .split("/tv/")[-1]
+                         .split("/")[0]
+                    )
                     self.logger.debug(f"  {i:>2}.  {sc:<20}  {u}", indent=1)
                 self.logger.separator()
 
@@ -1155,10 +1117,9 @@ class InstagramScraper:
                     f"{len(post_urls)} posts  ·  {self.max_concurrent} concurrent workers",
                 )
 
-                # One isolated context per worker
                 self.logger.section("Worker contexts")
                 worker_contexts: List[BrowserContext] = []
-                for w in range(self.max_concurrent):
+                for _ in range(self.max_concurrent):
                     wctx = await browser.new_context(
                         user_agent=random.choice(self.user_agents),
                         viewport={"width": 1920, "height": 1080},
@@ -1167,9 +1128,7 @@ class InstagramScraper:
                     )
                     await wctx.add_cookies(self.cookies)
                     worker_contexts.append(wctx)
-                self.logger.success(
-                    f"{self.max_concurrent} worker contexts ready", indent=2
-                )
+                self.logger.success(f"{self.max_concurrent} worker contexts ready", indent=2)
                 self.logger.section_end()
 
                 semaphore = asyncio.Semaphore(self.max_concurrent)
@@ -1201,7 +1160,9 @@ class InstagramScraper:
                     elif isinstance(res, ScrapingResult):
                         failures.append(f"  post {i+1}: {res.error}")
                     elif isinstance(res, Exception):
-                        failures.append(f"  post {i+1}: {type(res).__name__}: {str(res)[:60]}")
+                        failures.append(
+                            f"  post {i+1}: {type(res).__name__}: {str(res)[:60]}"
+                        )
 
                 for wctx in worker_contexts:
                     try:
@@ -1211,10 +1172,7 @@ class InstagramScraper:
 
                 # ── Final summary ─────────────────────────────────────
                 elapsed_total = time.monotonic() - t_total
-                self.logger.phase(
-                    "Summary",
-                    f"Total time: {elapsed_total:.1f}s",
-                )
+                self.logger.phase("Summary", f"Total time: {elapsed_total:.1f}s")
                 self.logger.separator()
                 self.logger.success(
                     f"Scraped:  {len(posts)}/{len(post_urls)} posts", indent=1
@@ -1233,16 +1191,18 @@ class InstagramScraper:
                 self.logger.info(f"Videos:       {videos}", indent=1)
                 self.logger.info(f"With caption: {captioned}/{len(posts)}", indent=1)
                 self.logger.separator()
-
                 self.logger.progress(len(posts), len(post_urls), "posts scraped")
 
                 return posts
 
             except Exception as e:
                 import traceback
-                self.logger.error(f"Fatal error: {type(e).__name__}: {str(e)[:80]}", indent=1)
+                self.logger.error(
+                    f"Fatal error: {type(e).__name__}: {str(e)[:80]}", indent=1
+                )
                 self.logger.debug(traceback.format_exc(), indent=1)
                 return []
+
             finally:
                 self.logger.section("Cleanup")
                 try:
@@ -1262,15 +1222,18 @@ class InstagramScraper:
 # ══════════════════════════════════════════════
 
 async def fetch_ig_urls(
-    account: str,
-    cookies: List[Dict[str, Any]] = None,
+    account:        str,
+    cookies:        List[Dict[str, Any]] = None,
     max_concurrent: int = 2,
 ) -> List[Dict[str, Any]]:
     """
     Scrape an Instagram profile and return post data.
 
     Returns:
-        List of dicts with keys: url, shortcode, caption, media_url, is_video
+        List of dicts: url, shortcode, caption, media_url, is_video
+
+    max_concurrent=2 is the safe default for Render's free tier.
+    Drop to 1 if you still see JS timeouts in the fallback path.
     """
     account = account.lstrip("@")
 
@@ -1292,17 +1255,23 @@ async def fetch_ig_urls(
     else:
         logger.success(f"Using {len(cookies)} caller-supplied cookies", indent=2)
 
-    csrf_ok    = any(c.get("name") == "csrftoken"  for c in cookies)
-    session_ok = any(c.get("name") == "sessionid"  for c in cookies)
-    logger.info(f"csrftoken present: {csrf_ok}  |  sessionid present: {session_ok}", indent=2)
+    csrf_ok    = any(c.get("name") == "csrftoken" for c in cookies)
+    session_ok = any(c.get("name") == "sessionid" for c in cookies)
+    logger.info(
+        f"csrftoken present: {csrf_ok}  |  sessionid present: {session_ok}", indent=2
+    )
     if not csrf_ok:
-        logger.warning("csrftoken missing — GraphQL caption fallback will likely fail", indent=2)
+        logger.warning("csrftoken missing — GraphQL JS fallback will likely fail", indent=2)
     if not session_ok:
-        logger.warning("sessionid missing — profile may not load as authenticated", indent=2)
+        logger.warning(
+            "sessionid missing — profile may not load as authenticated", indent=2
+        )
 
     logger.section_end()
 
-    scraper = InstagramScraper(cookies=cookies, logger=logger, max_concurrent=max_concurrent)
+    scraper = InstagramScraper(
+        cookies=cookies, logger=logger, max_concurrent=max_concurrent
+    )
     return await scraper.scrape_profile(
         username=account,
         post_limit=getattr(config, "POST_LIMIT", 10),
