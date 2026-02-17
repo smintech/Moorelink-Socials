@@ -9,7 +9,6 @@ import logging
 from urllib.parse import quote
 import os
 from dataclasses import dataclass, field
-from enum import Enum
 
 # ─────────────────────────────────────────────
 #  Config guard — works with or without Utils
@@ -22,27 +21,30 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════
-#  Network Strategy Enums & Constants
+#  Network Strategy Constants
 # ══════════════════════════════════════════════
 
-class WaitStrategy(Enum):
-    DOMCONTENTLOADED = "domcontentloaded"
-    LOAD             = "load"
-    NETWORKIDLE      = "networkidle"
-    COMMIT           = "commit"   # fastest — just first byte
+# IMPORTANT: Instagram's SPA never resolves "load" or "domcontentloaded"
+# reliably because of infinite background XHRs.  Always navigate with
+# "commit" (first-byte received) and then manually wait for DOM content.
+GOTO_WAIT_UNTIL = "commit"
 
-
-# Progressive timeout ladder (ms) — faster first, patient last
-TIMEOUT_LADDER = [10_000, 20_000, 35_000]
-
-# Resources that are safe to block entirely
-BLOCKED_RESOURCE_TYPES = {"font", "stylesheet", "media"}
+# Single generous timeout — "commit" is instant so we won't hit this
+# unless the server itself is unreachable
+GOTO_TIMEOUT_MS = 30_000
 
 # URL fragments that must NOT be blocked (CDN media we want)
 CDN_ALLOWLIST = ("cdninstagram", "fbcdn")
 
-# Instagram-specific "slow" paths that need more time
+# Instagram-specific "slow" paths that need more time for DOM settling
 SLOW_PATH_PATTERNS = ("/reel/", "/tv/")
+
+# Resource types to block — evaluated synchronously (no await needed)
+_BLOCK_TYPES  = frozenset({"font", "stylesheet"})
+_BLOCK_DOMAINS = (
+    "google-analytics", "doubleclick", "facebook.net/en_US/fbevents",
+    "scorecardresearch", "omtrdc.net",
+)
 
 
 # ══════════════════════════════════════════════
@@ -50,29 +52,152 @@ SLOW_PATH_PATTERNS = ("/reel/", "/tv/")
 # ══════════════════════════════════════════════
 
 class DetailedLogger:
-    def __init__(self, name: str = "Instagram Scraper"):
-        self.name = name
-        self.step_count = 0
+    """
+    Structured logger that produces readable, scannable output.
+
+    Visual hierarchy:
+      ╔══╗  Phase banners   — top-level milestones (browser start, profile load, …)
+      ├──┤  Section headers — named sub-steps inside a phase
+      │      Body lines     — info / success / warning / error
+      └──    Tail lines     — completion of a section
+      ····   Debug lines    — verbose detail, shown only at DEBUG level
+
+    Timing: every phase banner and section header stamps an elapsed time
+    from scraper start so it's easy to spot slow stages at a glance.
+    """
+
+    _ICONS = {
+        "info":    "·",
+        "success": "✓",
+        "warning": "⚠",
+        "error":   "✗",
+        "debug":   "…",
+    }
+
+    def __init__(self, name: str = "IG Scraper"):
+        self.name       = name
+        self._start_ts  = time.monotonic()
+        self._phase_ts  = self._start_ts
+        self._phase_num = 0
+
+        # One-time basicConfig — idempotent if called multiple times
         logging.basicConfig(
             level=logging.DEBUG,
-            format="[%(asctime)s.%(msecs)03d] %(levelname)-8s | %(message)s",
+            format="%(message)s",          # we own the full line format
             datefmt="%H:%M:%S",
+            force=True,
         )
-        self.logger = logging.getLogger(name)
+        self._log = logging.getLogger(name)
+        # Silence noisy Playwright / asyncio sub-loggers
+        for noisy in ("playwright", "asyncio"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    # ── Internal helpers ────────────────────────────────────────────────
+
+    def _elapsed(self) -> str:
+        secs = time.monotonic() - self._start_ts
+        return f"+{secs:5.1f}s"
+
+    def _phase_elapsed(self) -> str:
+        secs = time.monotonic() - self._phase_ts
+        return f"{secs:.1f}s"
+
+    def _ts(self) -> str:
+        return time.strftime("%H:%M:%S")
+
+    def _emit(self, level: int, line: str):
+        self._log.log(level, line)
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def phase(self, title: str, subtitle: str = ""):
+        """
+        Top-level phase banner. Use for major milestones.
+
+        Example output:
+          ╔══════════════════════════════════════════════════════╗
+          ║  PHASE 2 · Load Profile                   +  2.1s  ║
+          ║  https://www.instagram.com/nasa/                    ║
+          ╚══════════════════════════════════════════════════════╝
+        """
+        self._phase_num += 1
+        self._phase_ts   = time.monotonic()
+        W = 60
+        elapsed = self._elapsed()
+        header  = f"  PHASE {self._phase_num} · {title}"
+        padding = W - len(header) - len(elapsed) - 2
+        top    = "╔" + "═" * W + "╗"
+        mid    = f"║{header}{' ' * max(padding, 1)}{elapsed}  ║"
+        self._emit(logging.INFO, "")
+        self._emit(logging.INFO, top)
+        self._emit(logging.INFO, mid)
+        if subtitle:
+            sub_line = f"║  {subtitle[:W-2]:<{W-2}}║"
+            self._emit(logging.INFO, sub_line)
+        self._emit(logging.INFO, "╚" + "═" * W + "╝")
+
+    def section(self, title: str):
+        """
+        Named sub-step within a phase.
+
+        Example output:
+          ├─ [14:03:22] Navigation ────────────────────────────────
+        """
+        ts   = self._ts()
+        line = f"  ├─ [{ts}] {title} "
+        fill = max(0, 64 - len(line))
+        self._emit(logging.INFO, line + "─" * fill)
+
+    def section_end(self, summary: str = ""):
+        """
+        Close a section with an optional one-line summary.
+
+        Example output:
+          └─ done in 1.4s  ·  Found 12 post URLs
+        """
+        parts = [f"  └─ done in {self._phase_elapsed()}"]
+        if summary:
+            parts.append(f"  ·  {summary}")
+        self._emit(logging.INFO, "".join(parts))
+
+    def info(self, msg: str, indent: int = 1):
+        pad = "     " * indent
+        self._emit(logging.INFO,    f"{pad}{self._ICONS['info']}  {msg}")
+
+    def success(self, msg: str, indent: int = 1):
+        pad = "     " * indent
+        self._emit(logging.INFO,    f"{pad}{self._ICONS['success']}  {msg}")
+
+    def warning(self, msg: str, indent: int = 1):
+        pad = "     " * indent
+        self._emit(logging.WARNING, f"{pad}{self._ICONS['warning']}  {msg}")
+
+    def error(self, msg: str, indent: int = 1):
+        pad = "     " * indent
+        self._emit(logging.ERROR,   f"{pad}{self._ICONS['error']}  {msg}")
+
+    def debug(self, msg: str, indent: int = 1):
+        pad = "     " * indent
+        self._emit(logging.DEBUG,   f"{pad}{self._ICONS['debug']}  {msg}")
+
+    def progress(self, done: int, total: int, label: str = ""):
+        """
+        Inline progress bar.
+
+        Example:  ▓▓▓▓▓▓▓░░░  6/10  captions extracted
+        """
+        bar_w   = 10
+        filled  = round(bar_w * done / max(total, 1))
+        bar     = "▓" * filled + "░" * (bar_w - filled)
+        suffix  = f"  {label}" if label else ""
+        self._emit(logging.INFO, f"       [{bar}]  {done}/{total}{suffix}")
+
+    def separator(self):
+        self._emit(logging.INFO, "  " + "─" * 62)
+
+    # Legacy shim — keeps old .step() calls working without crashing
     def step(self, title: str, details: str = ""):
-        self.step_count += 1
-        self.logger.info("=" * 70)
-        self.logger.info(f"📍 STEP {self.step_count}: {title}")
-        if details:
-            self.logger.info(f"   {details}")
-        self.logger.info("=" * 70)
-
-    def info(self, msg: str, indent: int = 1):    self.logger.info   (f"{'   ' * indent}ℹ️  {msg}")
-    def success(self, msg: str, indent: int = 1): self.logger.info   (f"{'   ' * indent}✅  {msg}")
-    def warning(self, msg: str, indent: int = 1): self.logger.warning(f"{'   ' * indent}⚠️  {msg}")
-    def error(self, msg: str, indent: int = 1):   self.logger.error  (f"{'   ' * indent}❌  {msg}")
-    def debug(self, msg: str, indent: int = 1):   self.logger.debug  (f"{'   ' * indent}🐛  {msg}")
+        self.phase(title, details)
 
 
 logger = DetailedLogger("Instagram Scraper")
@@ -95,30 +220,30 @@ class ScrapingResult:
 
 async def smart_route_handler(route):
     """
-    Block heavy resources that we don't need while allowing CDN media.
-    Images from Instagram/Facebook CDNs are explicitly allowed because
-    we later read their URLs for the post media.
-    """
-    req  = route.request
-    rtype = req.resource_type
-    url   = req.url
+    Lean route handler — decision is pure Python (no extra awaits),
+    so it never stalls the browser's network event queue.
 
-    # Always allow CDN media (we need the URLs)
+    Key rules:
+    • CDN media always allowed (we need those URLs later)
+    • fonts / stylesheets blocked (useless for scraping)
+    • known analytics domains blocked
+    • everything else: continue immediately
+    """
+    url   = route.request.url
+    rtype = route.request.resource_type
+
+    # CDN images/video — must flow through so we can read their URLs
     if any(cdn in url for cdn in CDN_ALLOWLIST):
         await route.continue_()
         return
 
-    # Block heavy-but-useless types
-    if rtype in BLOCKED_RESOURCE_TYPES:
+    # Cheap type check first (avoids string scan on most requests)
+    if rtype in _BLOCK_TYPES:
         await route.abort()
         return
 
-    # Block analytics / tracking
-    tracking_domains = (
-        "google-analytics", "doubleclick", "facebook.net/en_US/fbevents",
-        "connect.facebook.net", "scorecardresearch", "omtrdc.net",
-    )
-    if any(t in url for t in tracking_domains):
+    # Analytics/tracking
+    if any(d in url for d in _BLOCK_DOMAINS):
         await route.abort()
         return
 
@@ -162,9 +287,6 @@ class InstagramScraper:
     def _jitter(self, lo=0.4, hi=1.2) -> float:
         return random.uniform(lo, hi)
 
-    def _is_slow_url(self, url: str) -> bool:
-        return any(p in url for p in SLOW_PATH_PATTERNS)
-
     # ------------------------------------------------------------------
     #  Navigation — the most resilient part
     # ------------------------------------------------------------------
@@ -176,123 +298,131 @@ class InstagramScraper:
         max_retries: int = 3,
     ) -> bool:
         """
-        Multi-strategy navigation with progressive timeout ladder.
+        Resilient navigation using "commit" wait strategy.
 
-        Strategy order per attempt:
-          1. domcontentloaded  (fast, sufficient for SPA hydration)
-          2. load              (waits for window.onload)
-          3. commit            (just first byte — last resort)
+        WHY "commit":
+          Instagram's SPA fires endless background XHRs, so "domcontentloaded"
+          and "load" events may never fire — causing page.goto to hang until
+          timeout even on a perfectly working connection.  "commit" resolves
+          the moment the first byte of the response is received, which is
+          always fast.  We then manually wait for DOM content ourselves.
 
-        Timeouts increase with each retry: 10s → 20s → 35s
+        Retry strategy:
+          Attempt 1 — commit, 30 s
+          Attempt 2 — commit, 30 s  (after 2 s back-off)
+          Attempt 3 — commit, 30 s  (after 4 s back-off, new page)
         """
-        # Give reels / TV extra base time
-        timeout_base = TIMEOUT_LADDER[:]
-        if self._is_slow_url(url):
-            timeout_base = [t + 10_000 for t in timeout_base]
-
-        wait_strategies: List[WaitStrategy] = [
-            WaitStrategy.DOMCONTENTLOADED,
-            WaitStrategy.LOAD,
-            WaitStrategy.COMMIT,
-        ]
-
         for attempt in range(max_retries):
-            timeout   = timeout_base[min(attempt, len(timeout_base) - 1)]
-            wait_strat = wait_strategies[min(attempt, len(wait_strategies) - 1)]
-
             self.logger.debug(
-                f"Goto attempt {attempt + 1}/{max_retries} | "
-                f"wait={wait_strat.value} timeout={timeout // 1000}s | {url[:60]}",
-                indent=3,
+                f"goto attempt {attempt + 1}/{max_retries}  "
+                f"timeout={GOTO_TIMEOUT_MS // 1000}s  url={url[:80]}",
+                indent=2,
             )
-
             try:
                 response = await page.goto(
                     url,
-                    wait_until=wait_strat.value,
-                    timeout=timeout,
+                    wait_until=GOTO_WAIT_UNTIL,   # "commit" — never hangs
+                    timeout=GOTO_TIMEOUT_MS,
                 )
 
                 if response is None:
-                    self.logger.warning("goto returned None response", indent=3)
+                    self.logger.warning(f"attempt {attempt + 1} — goto returned no response, retrying", indent=2)
+                    await asyncio.sleep(1.5)
                     continue
 
-                if response.status < 400:
-                    # For commit strategy, explicitly wait for DOM
-                    if wait_strat == WaitStrategy.COMMIT:
-                        try:
-                            await page.wait_for_load_state(
-                                "domcontentloaded", timeout=10_000
-                            )
-                        except Exception:
-                            pass  # best-effort
+                status = response.status
+                self.logger.debug(f"HTTP {status} received", indent=2)
 
-                    self.logger.debug(
-                        f"OK {response.status} after attempt {attempt + 1}", indent=3
-                    )
+                if status == 429:
+                    wait = 5 + attempt * 3
+                    self.logger.warning(f"Rate-limited (HTTP 429) — waiting {wait}s before retry", indent=2)
+                    await asyncio.sleep(wait)
+                    continue
+
+                if status >= 500:
+                    self.logger.warning(f"Server error (HTTP {status}) — retrying in {2 + attempt}s", indent=2)
+                    await asyncio.sleep(2 + attempt)
+                    continue
+
+                if status < 400:
+                    # Navigation committed — now wait for actual DOM content
+                    # WITHOUT relying on load/domcontentloaded events
+                    await self._wait_for_dom(page)
+                    self.logger.debug(f"Page ready after attempt {attempt + 1}", indent=2)
                     return True
 
-                if response.status in (429, 503):
-                    wait = 3 + attempt * 2
-                    self.logger.warning(
-                        f"Rate-limited ({response.status}), waiting {wait}s", indent=3
-                    )
-                    await asyncio.sleep(wait)
+                # 4xx (not 429) — not retriable
+                self.logger.error(f"Non-retriable HTTP {status} for {url[:60]}", indent=2)
+                return False
 
             except PlaywrightError as e:
                 err = str(e)
-                is_timeout = "Timeout" in err or "timeout" in err
-                is_net_err = "net::ERR_" in err
-
+                # Trim the verbose Playwright call-log from the message
+                short_err = err.split("\n")[0][:120]
                 self.logger.warning(
-                    f"Attempt {attempt + 1} failed: {err[:80]}", indent=3
+                    f"Attempt {attempt + 1}/{max_retries} failed — {short_err}", indent=2
                 )
 
-                if is_timeout or is_net_err:
-                    if attempt < max_retries - 1:
-                        backoff = self._jitter(1.5, 3.0) * (attempt + 1)
-                        self.logger.debug(f"Backing off {backoff:.1f}s …", indent=3)
-                        await asyncio.sleep(backoff)
-                        continue
-                # Non-retriable error
+                is_timeout = "Timeout" in err or "timeout" in err
+                is_net     = "net::ERR_" in err
+
+                if (is_timeout or is_net) and attempt < max_retries - 1:
+                    backoff = 2.0 * (attempt + 1) + random.uniform(0, 1)
+                    self.logger.debug(f"Back-off {backoff:.1f}s before retry …", indent=2)
+                    await asyncio.sleep(backoff)
+                    continue
+
+                # Non-retriable Playwright error — bubble up
                 raise
 
-        self.logger.error(f"All {max_retries} goto attempts failed for {url[:60]}", indent=2)
+        self.logger.error(
+            f"Navigation failed — all {max_retries} attempts exhausted for {url[:70]}",
+            indent=1,
+        )
         return False
 
-    # ------------------------------------------------------------------
-    #  Lazy-load / hydration waiter
-    # ------------------------------------------------------------------
-
-    async def wait_for_content(self, page: Page, url: str):
+    async def _wait_for_dom(self, page: Page, timeout: float = 12.0):
         """
-        After navigation, wait for Instagram's SPA to hydrate the feed.
-        Uses a combination of:
-          - Explicit selector polling (post article or caption area)
-          - Scroll jitter to trigger lazy-loaded images
-          - Fallback sleep if nothing visible within budget
+        Poll for DOM readiness after a "commit" navigation.
+        Tries progressively weaker signals so we always proceed eventually.
         """
-        selectors_to_await = [
-            "article",
-            "div[role='main']",
-            "main",
-            "section",
-        ]
+        deadline = asyncio.get_event_loop().time() + timeout
 
-        budget_ms = 8_000 if self._is_slow_url(url) else 5_000
-
-        for sel in selectors_to_await:
+        # Signal 1: wait for a meaningful selector
+        meaningful_selectors = ["article", "main", "section", "body > div"]
+        for sel in meaningful_selectors:
+            remaining = (deadline - asyncio.get_event_loop().time()) * 1000
+            if remaining <= 0:
+                break
             try:
-                await page.wait_for_selector(sel, timeout=budget_ms, state="attached")
-                # Small jitter scroll to trigger lazy loaders
-                await page.evaluate("window.scrollBy(0, 120)")
-                await asyncio.sleep(0.25)
-                await page.evaluate("window.scrollBy(0, -120)")
+                await page.wait_for_selector(
+                    sel,
+                    state="attached",
+                    timeout=min(remaining, 5_000),
+                )
+                self.logger.debug(f"DOM ready — matched selector '{sel}'", indent=2)
+                # Light scroll-jitter to trigger lazy loaders
+                await page.evaluate(
+                    "window.scrollBy(0, 100); window.scrollBy(0, -100)"
+                )
                 return
             except Exception:
-                pass  # try next selector
+                pass
 
-        # Last resort — just sleep and hope for the best
+        # Signal 2: wait for any network quiet (best-effort, short budget)
+        remaining = (deadline - asyncio.get_event_loop().time()) * 1000
+        if remaining > 1000:
+            try:
+                await page.wait_for_load_state(
+                    "domcontentloaded", timeout=min(remaining, 4_000)
+                )
+                self.logger.debug("DOM ready — domcontentloaded fired", indent=2)
+                return
+            except Exception:
+                pass
+
+        # Signal 3: unconditional sleep as absolute last resort
+        self.logger.debug("DOM ready signal not received — falling back to sleep", indent=2)
         await asyncio.sleep(1.5)
 
     # ------------------------------------------------------------------
@@ -496,6 +626,10 @@ class InstagramScraper:
     # ------------------------------------------------------------------
 
     async def extract_caption_from_post(self, page: Page, shortcode: str = "") -> str:
+        """
+        Master caption orchestrator — tries four strategies in priority order,
+        logging which one succeeds or why each one failed.
+        """
         strategies = [
             ("GraphQL XHR",   lambda: self.extract_caption_graphql(page, shortcode) if shortcode else asyncio.coroutine(lambda: None)()),
             ("Window data",   lambda: self.extract_caption_from_window_data(page)),
@@ -506,10 +640,16 @@ class InstagramScraper:
             try:
                 result = await fn()
                 if result:
-                    self.logger.debug(f"Caption via {name} ({len(result)} chars)", indent=3)
+                    self.logger.debug(
+                        f"Caption via [{name}]  {len(result)} chars", indent=2
+                    )
                     return result
+                else:
+                    self.logger.debug(f"[{name}] returned empty — trying next", indent=2)
             except Exception as e:
-                self.logger.debug(f"{name} failed: {str(e)[:50]}", indent=3)
+                self.logger.debug(f"[{name}] raised {type(e).__name__}: {str(e)[:60]}", indent=2)
+
+        self.logger.warning("All caption strategies exhausted — no caption found", indent=2)
         return ""
 
     # ------------------------------------------------------------------
@@ -578,33 +718,48 @@ class InstagramScraper:
         post_index: int,
     ) -> ScrapingResult:
         page = None
+        t0 = time.monotonic()
+        post_type = "REEL" if any(p in post_url for p in SLOW_PATH_PATTERNS) else "POST"
+
+        self.logger.info(
+            f"[{post_index:>2}] {post_type}  {shortcode}",
+            indent=1,
+        )
+
         try:
-            self.logger.info(f"[{post_index}] {shortcode}", indent=1)
             page = await context.new_page()
             page.set_default_navigation_timeout(40_000)
             page.set_default_timeout(15_000)
-
-            # Smart resource blocking
             await page.route("**/*", smart_route_handler)
 
-            # Navigate with full resilient retry stack
+            # ── Navigate ──────────────────────────────────────────────
+            self.logger.debug(f"[{post_index}] navigating …", indent=2)
             if not await self.safe_goto(page, post_url, max_retries=3):
                 return ScrapingResult(success=False, error="Navigation failed after all retries")
 
             if "accounts/login" in page.url:
+                self.logger.error(f"[{post_index}] redirected to login — session expired", indent=2)
                 return ScrapingResult(success=False, error="Redirected to login")
 
             await self.dismiss_popups(page)
-            await self.wait_for_content(page, post_url)
+            await self._wait_for_dom(page)
 
-            caption   = await self.extract_caption_from_post(page, shortcode)
+            # ── Extract ───────────────────────────────────────────────
+            self.logger.debug(f"[{post_index}] extracting caption …", indent=2)
+            caption = await self.extract_caption_from_post(page, shortcode)
+
+            self.logger.debug(f"[{post_index}] extracting media URL …", indent=2)
             media_url, is_video = await self.extract_media_from_post(page, post_url)
 
+            elapsed = time.monotonic() - t0
+
             if media_url and not media_url.startswith("blob"):
+                kind = "VIDEO" if is_video else "IMAGE"
+                cap_info = f"{len(caption)} chars" if caption else "no caption"
                 self.logger.success(
-                    f"{'🎥 VIDEO' if is_video else '📸 IMAGE'} | "
-                    f"Caption: {len(caption)} chars",
-                    indent=2,
+                    f"[{post_index:>2}] ✓ {kind:<5}  {shortcode:<20}  "
+                    f"caption: {cap_info:<18}  {elapsed:.1f}s",
+                    indent=1,
                 )
                 return ScrapingResult(
                     success=True,
@@ -616,10 +771,20 @@ class InstagramScraper:
                         "is_video":  is_video,
                     },
                 )
+
+            self.logger.warning(
+                f"[{post_index:>2}] no media URL found  shortcode={shortcode}  {elapsed:.1f}s",
+                indent=1,
+            )
             return ScrapingResult(success=False, error="No media URL found")
 
         except Exception as e:
-            self.logger.error(f"Post error: {str(e)[:80]}", indent=2)
+            elapsed = time.monotonic() - t0
+            self.logger.error(
+                f"[{post_index:>2}] {type(e).__name__}: {str(e).split(chr(10))[0][:80]}  "
+                f"{elapsed:.1f}s",
+                indent=1,
+            )
             return ScrapingResult(success=False, error=str(e)[:80])
         finally:
             if page:
@@ -658,9 +823,24 @@ class InstagramScraper:
             links: List[str] = await page.evaluate(js_collect)
             new = [u for u in links if u not in post_urls]
             post_urls.extend(new)
-            self.logger.debug(f"Scroll {i+1}: {len(post_urls)} posts collected", indent=2)
 
-            if len(post_urls) >= post_limit:
+            newly = len(new)
+            total = len(post_urls)
+            if newly:
+                self.logger.info(
+                    f"Scroll {i+1:>2}/{MAX_SCROLLS}  "
+                    f"+{newly} new  →  {total} total",
+                    indent=2,
+                )
+            else:
+                self.logger.debug(
+                    f"Scroll {i+1:>2}/{MAX_SCROLLS}  no new posts  "
+                    f"(stale {stale_rounds + 1}/{MAX_STALE})",
+                    indent=2,
+                )
+
+            if total >= post_limit:
+                self.logger.info(f"Post limit ({post_limit}) reached — stopping scroll", indent=2)
                 break
 
             # Scroll to bottom
@@ -678,7 +858,10 @@ class InstagramScraper:
                 stale_rounds += 1
 
             if stale_rounds >= MAX_STALE:
-                self.logger.debug("Grid end reached (no more height change)", indent=2)
+                self.logger.info(
+                    f"Page end reached — no new content after {MAX_STALE} consecutive scrolls",
+                    indent=2,
+                )
                 break
 
         return post_urls[:post_limit]
@@ -690,12 +873,18 @@ class InstagramScraper:
     async def scrape_profile(
         self, username: str, post_limit: int = 10
     ) -> List[Dict]:
-        self.logger.step(
-            "Initialize Scraper",
-            f"Target: @{username} | Limit: {post_limit} | Workers: {self.max_concurrent}",
+        t_total = time.monotonic()
+
+        self.logger.phase(
+            "Instagram Scraper",
+            f"@{username}  ·  limit {post_limit} posts  ·  {self.max_concurrent} workers",
         )
 
         async with async_playwright() as p:
+
+            # ── Browser startup ───────────────────────────────────────
+            self.logger.section("Browser")
+            self.logger.info("Launching Chromium (headless) …", indent=2)
             browser = await p.chromium.launch(
                 headless=True,
                 args=[
@@ -707,61 +896,76 @@ class InstagramScraper:
                     "--window-size=1920,1080",
                     "--disable-setuid-sandbox",
                     "--ignore-certificate-errors",
-                    # Increase network timeouts at the Chrome level
                     "--dns-prefetch-disable",
                 ],
             )
-            self.logger.success("Browser launched", indent=1)
+            self.logger.success("Browser ready", indent=2)
+            self.logger.section_end()
 
-            # ── Profile context ──────────────────────────────────────
+            # ── Profile context ───────────────────────────────────────
             main_ctx = await browser.new_context(
                 user_agent=random.choice(self.user_agents),
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
                 timezone_id="America/New_York",
                 java_script_enabled=True,
-                ignore_https_errors=True,          # tolerate CDN cert issues
+                ignore_https_errors=True,
             )
             await main_ctx.add_cookies(self.cookies)
+            self.logger.debug(f"Session loaded with {len(self.cookies)} cookies", indent=2)
 
             try:
-                # ── Phase 1: Load profile ────────────────────────────
-                self.logger.step("Load Profile", f"@{username}")
+                # ── Phase: Load profile ───────────────────────────────
+                self.logger.phase("Load Profile", f"https://www.instagram.com/{username}/")
+                self.logger.section("Navigation")
                 profile_page = await main_ctx.new_page()
                 await profile_page.route("**/*", smart_route_handler)
 
                 profile_url = f"https://www.instagram.com/{username}/"
                 if not await self.safe_goto(profile_page, profile_url, max_retries=3):
-                    self.logger.error("Could not load profile page")
+                    self.logger.error("Could not load profile — aborting", indent=1)
                     return []
 
                 if "accounts/login" in profile_page.url:
-                    self.logger.error("Redirected to login — cookies may be expired")
+                    self.logger.error(
+                        "Redirected to login page — cookies are expired or invalid", indent=1
+                    )
                     await profile_page.close()
                     return []
 
-                await self.dismiss_popups(profile_page)
-                await self.wait_for_content(profile_page, profile_url)
+                self.logger.success(f"Profile page loaded: {profile_page.url[:70]}", indent=2)
+                self.logger.section_end()
 
-                # ── Phase 2: Discover posts ──────────────────────────
-                self.logger.step("Discover Posts")
+                await self.dismiss_popups(profile_page)
+                await self._wait_for_dom(profile_page)
+
+                # ── Phase: Discover posts ─────────────────────────────
+                self.logger.phase("Discover Posts", f"Scrolling grid — target: {post_limit} posts")
+                self.logger.section("Grid scroll")
                 post_urls = await self._collect_post_urls(profile_page, post_limit)
                 await profile_page.close()
+                self.logger.section_end(f"{len(post_urls)} unique post URLs collected")
 
-                self.logger.success(f"Found {len(post_urls)} post URLs", indent=1)
                 if not post_urls:
+                    self.logger.error("No post URLs found — profile may be private or empty", indent=1)
                     return []
 
-                # ── Phase 3: Concurrent scraping ─────────────────────
-                self.logger.step(
+                self.logger.separator()
+                for i, u in enumerate(post_urls, 1):
+                    sc = u.split("/p/")[-1].split("/reel/")[-1].split("/tv/")[-1].split("/")[0]
+                    self.logger.debug(f"  {i:>2}.  {sc:<20}  {u}", indent=1)
+                self.logger.separator()
+
+                # ── Phase: Scrape posts ───────────────────────────────
+                self.logger.phase(
                     "Scrape Posts",
-                    f"{len(post_urls)} posts across {self.max_concurrent} workers",
+                    f"{len(post_urls)} posts  ·  {self.max_concurrent} concurrent workers",
                 )
 
-                # One isolated BrowserContext per worker prevents cross-task
-                # "execution context destroyed" errors
+                # One isolated context per worker
+                self.logger.section("Worker contexts")
                 worker_contexts: List[BrowserContext] = []
-                for _ in range(self.max_concurrent):
+                for w in range(self.max_concurrent):
                     wctx = await browser.new_context(
                         user_agent=random.choice(self.user_agents),
                         viewport={"width": 1920, "height": 1080},
@@ -770,13 +974,17 @@ class InstagramScraper:
                     )
                     await wctx.add_cookies(self.cookies)
                     worker_contexts.append(wctx)
+                self.logger.success(
+                    f"{self.max_concurrent} worker contexts ready", indent=2
+                )
+                self.logger.section_end()
 
                 semaphore = asyncio.Semaphore(self.max_concurrent)
 
                 def _shortcode(url: str, idx: int) -> str:
-                    for segment in ("/p/", "/reel/", "/tv/"):
-                        if segment in url:
-                            return url.split(segment)[-1].split("/")[0]
+                    for seg in ("/p/", "/reel/", "/tv/"):
+                        if seg in url:
+                            return url.split(seg)[-1].split("/")[0]
                     return f"post_{idx}"
 
                 async def _worker(idx: int, url: str) -> ScrapingResult:
@@ -785,15 +993,22 @@ class InstagramScraper:
                         sc  = _shortcode(url, idx)
                         return await self.scrape_single_post(ctx, url, sc, idx + 1)
 
+                self.logger.section("Post scraping")
                 tasks   = [_worker(i, u) for i, u in enumerate(post_urls)]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+                self.logger.section_end()
 
-                posts: List[Dict] = []
+                # ── Tally results ─────────────────────────────────────
+                posts:    List[Dict] = []
+                failures: List[str]  = []
+
                 for i, res in enumerate(results):
                     if isinstance(res, ScrapingResult) and res.success:
                         posts.append(res.data)
+                    elif isinstance(res, ScrapingResult):
+                        failures.append(f"  post {i+1}: {res.error}")
                     elif isinstance(res, Exception):
-                        self.logger.error(f"Worker {i+1}: {str(res)[:60]}", indent=2)
+                        failures.append(f"  post {i+1}: {type(res).__name__}: {str(res)[:60]}")
 
                 for wctx in worker_contexts:
                     try:
@@ -801,27 +1016,52 @@ class InstagramScraper:
                     except Exception:
                         pass
 
-                self.logger.step(
-                    "Complete",
-                    f"✅ {len(posts)}/{len(post_urls)} posts scraped successfully",
+                # ── Final summary ─────────────────────────────────────
+                elapsed_total = time.monotonic() - t_total
+                self.logger.phase(
+                    "Summary",
+                    f"Total time: {elapsed_total:.1f}s",
                 )
+                self.logger.separator()
+                self.logger.success(
+                    f"Scraped:  {len(posts)}/{len(post_urls)} posts", indent=1
+                )
+                if failures:
+                    self.logger.warning(
+                        f"Failed:   {len(failures)}/{len(post_urls)} posts", indent=1
+                    )
+                    for f in failures:
+                        self.logger.debug(f, indent=2)
+
+                videos = sum(1 for p in posts if p.get("is_video"))
+                images = len(posts) - videos
+                captioned = sum(1 for p in posts if p.get("caption"))
+                self.logger.info(f"Images:   {images}", indent=1)
+                self.logger.info(f"Videos:   {videos}", indent=1)
+                self.logger.info(f"With caption: {captioned}/{len(posts)}", indent=1)
+                self.logger.separator()
+
+                self.logger.progress(len(posts), len(post_urls), "posts scraped")
+
                 return posts
 
             except Exception as e:
                 import traceback
-                self.logger.error(f"Fatal: {str(e)[:80]}", indent=1)
-                self.logger.debug(traceback.format_exc(), indent=2)
+                self.logger.error(f"Fatal error: {type(e).__name__}: {str(e)[:80]}", indent=1)
+                self.logger.debug(traceback.format_exc(), indent=1)
                 return []
             finally:
+                self.logger.section("Cleanup")
                 try:
                     await main_ctx.close()
                 except Exception:
                     pass
                 try:
                     await browser.close()
+                    self.logger.success("Browser closed", indent=2)
                 except Exception:
                     pass
-                self.logger.success("Browser closed", indent=1)
+                self.logger.section_end()
 
 
 # ══════════════════════════════════════════════
@@ -840,22 +1080,34 @@ async def fetch_ig_urls(
         List of dicts with keys: url, shortcode, caption, media_url, is_video
     """
     account = account.lstrip("@")
-    logger.step("Configuration", f"Account: @{account} | Workers: {max_concurrent}")
+
+    logger.phase("fetch_ig_urls", f"account=@{account}  workers={max_concurrent}")
+    logger.section("Cookie setup")
 
     if cookies is None:
+        logger.info("No cookies passed — reading IG_COOKIES env var", indent=2)
         raw = os.getenv("IG_COOKIES", "")
         if not raw:
-            logger.error("No IG_COOKIES environment variable set")
+            logger.error("IG_COOKIES is not set — cannot authenticate", indent=2)
             return []
         try:
             cookies = json.loads(raw)
-            logger.success(f"Loaded {len(cookies)} cookies from env", indent=1)
+            logger.success(f"Loaded {len(cookies)} cookies from environment", indent=2)
         except json.JSONDecodeError as e:
-            logger.error(f"Invalid IG_COOKIES JSON: {e}")
+            logger.error(f"IG_COOKIES is not valid JSON: {e}", indent=2)
             return []
+    else:
+        logger.success(f"Using {len(cookies)} caller-supplied cookies", indent=2)
 
-    if not any(c.get("name") == "csrftoken" for c in cookies):
-        logger.warning("No csrftoken in cookies — GraphQL strategy may degrade")
+    csrf_ok = any(c.get("name") == "csrftoken" for c in cookies)
+    session_ok = any(c.get("name") == "sessionid" for c in cookies)
+    logger.info(f"csrftoken present: {csrf_ok}  |  sessionid present: {session_ok}", indent=2)
+    if not csrf_ok:
+        logger.warning("csrftoken missing — GraphQL caption strategy will likely fail", indent=2)
+    if not session_ok:
+        logger.warning("sessionid missing — profile may not load as authenticated", indent=2)
+
+    logger.section_end()
 
     scraper = InstagramScraper(cookies=cookies, logger=logger, max_concurrent=max_concurrent)
     return await scraper.scrape_profile(
