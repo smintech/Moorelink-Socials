@@ -206,8 +206,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
                 "post_id": pid,
                 "post_url": p['url'],
                 "caption": p.get("caption", ""),
-                "media_url": p.get("media_url"),
-                "is_video": p.get("is_video", False)
+                "media_url": p.get("url"),
             })
     elif platform == "fb":
         raw_fb = fetch_fb_urls(account)
