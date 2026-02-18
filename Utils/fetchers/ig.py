@@ -815,7 +815,7 @@ class InstagramCaptionScraper:
                 self.logger.section_end()
 
                 await self.dismiss_popups(profile_page)
-                await self._quick_dom_check(profile_page)
+                await self._wait_for_page(1.0)
 
                 # Discover posts
                 self.logger.phase("Discover Posts", f"Target: {post_limit}")
