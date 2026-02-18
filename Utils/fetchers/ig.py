@@ -27,19 +27,23 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════
-#  CAPTION-FOCUSED CONFIGURATION
+#  OPTIMIZED CONFIGURATION
 # ══════════════════════════════════════════════
 
-GOTO_TIMEOUT_MS = 60_000  # 60 seconds
-GOTO_WAIT_UNTIL = "commit"
+GOTO_TIMEOUT_MS = 45_000  # 45 seconds
+# Mixed strategy: try fast first, fall back to reliable
+GOTO_WAIT_FAST = "domcontentloaded"  # Fast: DOM ready (try first)
+GOTO_WAIT_RELIABLE = "commit"  # Reliable: navigation commit (fallback)
 
-# Shorter timeouts since we're only extracting captions
-SAFE_EVALUATE_TIMEOUT = 30.0  # 30 seconds (was 40s)
+# Much shorter timeouts for faster processing
+SAFE_EVALUATE_TIMEOUT = 10.0  # 10 seconds (was 30s)
+DOM_WAIT_TIMEOUT = 3.0  # 3 seconds (was 10s)
+HTML_CAPTURE_TIMEOUT = 8.0  # 8 seconds for page.content()
 
 CDN_ALLOWLIST = ("cdninstagram", "fbcdn")
 SLOW_PATH_PATTERNS = ("/reel/", "/tv/")
 
-_BLOCK_TYPES = frozenset({"font", "stylesheet"})
+_BLOCK_TYPES = frozenset({"font", "stylesheet", "image"})  # Block images too for speed
 _BLOCK_DOMAINS = (
     "google-analytics", "doubleclick", "facebook.net/en_US/fbevents",
     "scorecardresearch", "omtrdc.net",
@@ -342,15 +346,19 @@ class InstagramCaptionParser:
 
 
 # ══════════════════════════════════════════════
-#  CAPTION-FOCUSED Scraper
+#  OPTIMIZED CAPTION SCRAPER
 # ══════════════════════════════════════════════
 
 class InstagramCaptionScraper:
     """
-    Caption-focused scraper optimized for Render free tier.
+    OPTIMIZED caption-focused scraper.
     
-    Returns only URL and caption (no media_url, no is_video).
-    Much lighter and faster than full scraper.
+    Key optimizations:
+    1. Reliable navigation (commit wait)
+    2. Reliable HTML capture using page.content() instead of response handler
+    3. Shorter timeouts (3s DOM wait, 10s evaluates)
+    4. No unnecessary delays
+    5. Quick fallbacks
     """
 
     def __init__(
@@ -368,8 +376,8 @@ class InstagramCaptionScraper:
             (c["value"] for c in cookies if c.get("name") == "csrftoken"), None
         )
 
-    async def _human_delay(self, min_ms: int = 800, max_ms: int = 2000):
-        """Conservative delays."""
+    async def _human_delay(self, min_ms: int = 400, max_ms: int = 1000):
+        """Faster delays for quicker processing."""
         await asyncio.sleep(random.uniform(min_ms, max_ms) / 1000)
 
     async def _safe_evaluate(
@@ -379,134 +387,148 @@ class InstagramCaptionScraper:
         timeout: float = SAFE_EVALUATE_TIMEOUT,
         label: str = "evaluate",
     ) -> Any:
-        """Ultra-safe evaluate with error handling."""
+        """Ultra-safe evaluate with short timeout."""
         try:
             return await asyncio.wait_for(page.evaluate(script), timeout=timeout)
         except asyncio.TimeoutError:
-            self.logger.warning(
-                f"[{label}] page.evaluate timed out after {timeout:.0f}s — skipping",
+            self.logger.debug(
+                f"[{label}] timeout after {timeout:.0f}s",
                 indent=3,
             )
             return None
         except PlaywrightError as e:
             if "destroyed" not in str(e).lower():
                 self.logger.debug(
-                    f"[{label}] error: {type(e).__name__}: {str(e)[:80]}",
+                    f"[{label}] error: {type(e).__name__}",
                     indent=3,
                 )
             return None
-        except Exception as e:
-            self.logger.debug(
-                f"[{label}] unexpected error: {type(e).__name__}: {str(e)[:80]}",
-                indent=3,
-            )
+        except Exception:
             return None
 
-    async def safe_goto(self, page: Page, url: str, max_retries: int = 3) -> bool:
-        """Navigation with challenge detection."""
+    async def safe_goto(self, page: Page, url: str, max_retries: int = 2) -> bool:
+        """
+        Mixed-strategy navigation: fast first, reliable fallback.
+        
+        - First attempt: domcontentloaded (fast)
+        - If timeout: retry with commit (reliable)
+        - Best of both: speed + reliability
+        """
         for attempt in range(max_retries):
+            # Choose wait strategy: fast first, then reliable
+            if attempt == 0:
+                wait_until = GOTO_WAIT_FAST
+                timeout = GOTO_TIMEOUT_MS
+                strategy = "fast"
+            else:
+                wait_until = GOTO_WAIT_RELIABLE
+                timeout = GOTO_TIMEOUT_MS + 10_000  # Extra time for reliable
+                strategy = "reliable"
+            
             self.logger.debug(
-                f"goto attempt {attempt + 1}/{max_retries}  url={url[:80]}", indent=2
+                f"goto {attempt + 1}/{max_retries} ({strategy})", indent=2
             )
             try:
                 response = await page.goto(
-                    url, wait_until=GOTO_WAIT_UNTIL, timeout=GOTO_TIMEOUT_MS
+                    url, wait_until=wait_until, timeout=timeout
                 )
                 if response is None:
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(1.0)
                     continue
 
                 status = response.status
-                self.logger.debug(f"HTTP {status} received", indent=2)
+                self.logger.debug(f"HTTP {status}", indent=2)
 
                 if status == 429:
-                    wait = 10 + attempt * 5
-                    self.logger.warning(f"Rate-limited — waiting {wait}s", indent=2)
+                    wait = 8 + attempt * 4
+                    self.logger.warning(f"Rate-limited — wait {wait}s", indent=2)
                     await asyncio.sleep(wait)
                     continue
                 if status >= 500:
-                    await asyncio.sleep(3 + attempt * 2)
+                    await asyncio.sleep(2 + attempt)
                     continue
                 if status < 400:
                     # Check for challenge/checkpoint
                     current_url = page.url
                     if "challenge" in current_url or "checkpoint" in current_url:
                         self.logger.error(
-                            f"Challenge/checkpoint page: {current_url[:70]}",
+                            f"Challenge page",
                             indent=2
                         )
                         return False
                     
-                    await self._wait_for_dom(page)
-                    self.logger.debug(f"Page ready after attempt {attempt + 1}", indent=2)
+                    # Simple timeout wait
+                    await self._wait_for_page(1.0)
+                    self.logger.debug(f"Ready ({strategy})", indent=2)
                     return True
 
-                self.logger.error(f"Non-retriable HTTP {status}", indent=2)
+                self.logger.error(f"HTTP {status} fail", indent=2)
                 return False
 
             except PlaywrightError as e:
-                short_err = str(e).split("\n")[0][:120]
-                self.logger.warning(f"Attempt {attempt + 1} failed — {short_err}", indent=2)
                 is_timeout = "Timeout" in str(e) or "timeout" in str(e)
                 is_net = "net::ERR_" in str(e)
+                
+                if is_timeout:
+                    self.logger.warning(f"{strategy} timeout", indent=2)
+                    # Timeout on fast strategy → try reliable next
+                    if attempt == 0 and wait_until == GOTO_WAIT_FAST:
+                        self.logger.debug("Will retry with reliable strategy", indent=2)
+                        continue
+                
                 if (is_timeout or is_net) and attempt < max_retries - 1:
-                    await asyncio.sleep(3.0 * (attempt + 1) + random.uniform(0, 2))
+                    await asyncio.sleep(2.0 * (attempt + 1))
+                    continue
+                self.logger.warning(f"Nav error: {type(e).__name__}", indent=2)
+                if attempt < max_retries - 1:
                     continue
                 raise
 
-        self.logger.error(
-            f"Navigation failed after {max_retries} attempts for {url[:70]}", indent=1
-        )
+        self.logger.error(f"Nav failed after {max_retries} attempts", indent=1)
         return False
 
-    async def _wait_for_dom(self, page: Page, timeout: float = 10.0):
-        """Longer DOM wait for slow servers."""
-        deadline = asyncio.get_event_loop().time() + timeout
-        for sel in ["article", "video", "main", "section", "div[role='main']", "body > div"]:
-            remaining_ms = (deadline - asyncio.get_event_loop().time()) * 1000
-            if remaining_ms <= 300:
-                break
-            try:
-                await page.wait_for_selector(
-                    sel, state="attached", timeout=min(remaining_ms, 4_000)
-                )
-                self.logger.debug(f"DOM ready — matched '{sel}'", indent=2)
-                return
-            except Exception:
-                pass
-
-        elapsed = timeout - (deadline - asyncio.get_event_loop().time())
-        self.logger.debug(
-            f"DOM selectors did not match in {elapsed:.1f}s — proceeding anyway", indent=2
-        )
-        await asyncio.sleep(0.5)
+    async def _wait_for_page(self, timeout: float = 1.5):
+        """Simple timeout wait - no DOM selectors."""
+        await asyncio.sleep(timeout)
 
     async def dismiss_popups(self, page: Page):
-        """Dismiss popups with longer delays."""
+        """Quick popup dismissal."""
         for sel in [
             'button:has-text("Not now")',
             'button:has-text("Allow all cookies")',
-            'button:has-text("Accept")',
             '[role="dialog"] button',
         ]:
             try:
                 el = page.locator(sel).first
-                if await el.is_visible(timeout=1000):
-                    await el.click(timeout=1000)
-                    await self._human_delay(200, 500)
+                if await el.is_visible(timeout=500):
+                    await el.click(timeout=500)
+                    await asyncio.sleep(0.2)
             except Exception:
                 pass
 
-    async def _js_extract_caption_fallback(
-        self,
-        page: Page,
-        shortcode: str,
-    ) -> Optional[str]:
+    async def _capture_html_reliable(self, page: Page) -> Optional[bytes]:
         """
-        Minimal JS fallback for caption extraction.
-        Only used if HTML parsing fails completely.
+        RELIABLE HTML capture using page.content().
+        Much more reliable than response handler.
         """
-        # Try window globals (fastest)
+        try:
+            html_str = await asyncio.wait_for(
+                page.content(),
+                timeout=HTML_CAPTURE_TIMEOUT
+            )
+            html_bytes = html_str.encode('utf-8')
+            return html_bytes
+        except asyncio.TimeoutError:
+            self.logger.debug("page.content() timeout", indent=2)
+            return None
+        except Exception as e:
+            self.logger.debug(f"page.content() error: {type(e).__name__}", indent=2)
+            return None
+
+    async def _js_extract_caption_fast(self, page: Page) -> Optional[str]:
+        """
+        FAST JS fallback - only window globals, short timeout.
+        """
         window_script = r"""
             () => {
                 try {
@@ -534,14 +556,6 @@ class InstagramCaptionScraper:
                             if (e.length) return e[0].node.text;
                         }
                     }
-                    
-                    // _sharedData (very old)
-                    const m = window._sharedData?.entry_data?.PostPage?.[0]
-                                ?.graphql?.shortcode_media;
-                    if (m) {
-                        const e = m.edge_media_to_caption?.edges || [];
-                        if (e.length) return e[0].node.text;
-                    }
                 } catch (_) {}
                 return null;
             }
@@ -549,43 +563,12 @@ class InstagramCaptionScraper:
         
         cap = await self._safe_evaluate(
             page, window_script, 
-            timeout=15.0,  # Shorter timeout
-            label="window-globals-caption"
+            timeout=5.0,  # Very short timeout
+            label="js-fast"
         )
         if cap:
-            self.logger.debug(f"Caption via [JS fallback]  {len(cap)} chars", indent=2)
+            self.logger.debug(f"Caption via JS: {len(cap)} chars", indent=2)
             return cap
-
-        # Try DOM selectors (slower but sometimes works)
-        dom_script = r"""
-            () => {
-                const selectors = [
-                    'div._aacl._a9zr._a9zo._a9z9',
-                    'div._aacl._a9zr',
-                    'div[data-testid="post-caption"]',
-                    'h1 + div span',
-                    'span._aacl',
-                    'article span[dir="auto"]',
-                ];
-                
-                for (const s of selectors) {
-                    const el = document.querySelector(s);
-                    const t = el?.innerText?.trim();
-                    if (t && t.length > 5) return t;
-                }
-                return null;
-            }
-        """
-        
-        cap = await self._safe_evaluate(
-            page, dom_script, 
-            timeout=15.0,
-            label="dom-caption"
-        )
-        if cap:
-            self.logger.debug(f"Caption via [DOM fallback]  {len(cap)} chars", indent=2)
-            return cap
-
         return None
 
     async def scrape_single_post(
@@ -596,42 +579,24 @@ class InstagramCaptionScraper:
         post_index: int,
     ) -> ScrapingResult:
         """
-        Caption-focused scraping with fallback.
+        FAST caption scraping.
         
         Strategy:
-        1. HTML parse (primary - most reliable)
-        2. JS fallback (if HTML fails)
+        1. Navigate reliably (commit wait)
+        2. Capture HTML using page.content() (reliable!)
+        3. Parse HTML (fast)
+        4. Quick JS fallback if needed
         
-        Returns: url, shortcode, caption
+        Target: <15 seconds per post
         """
         t0 = time.monotonic()
         post_type = "REEL" if any(p in post_url for p in SLOW_PATH_PATTERNS) else "POST"
 
-        html_body_ref: list = [None]
-
-        self.logger.info(f"[{post_index:>2}] {post_type}  {shortcode}", indent=1)
-
-        # Response listener
-        async def on_response(response):
-            if html_body_ref[0] is not None:
-                return
-            if response.request.resource_type != "document":
-                return
-            try:
-                if response.status == 200:
-                    body = await asyncio.wait_for(response.body(), timeout=15.0)
-                    html_body_ref[0] = body
-                    self.logger.debug(
-                        f"[{post_index}] HTML captured  {len(body):,} bytes", indent=2
-                    )
-            except Exception:
-                pass
+        self.logger.info(f"[{post_index:>2}] {post_type} {shortcode}", indent=1)
 
         try:
-            page.on("response", on_response)
-
             # Navigate
-            self.logger.debug(f"[{post_index}] navigating …", indent=2)
+            self.logger.debug(f"nav →", indent=2)
             if not await self.safe_goto(page, post_url, max_retries=2):
                 return ScrapingResult(success=False, error="Navigation failed")
 
@@ -639,38 +604,33 @@ class InstagramCaptionScraper:
             if "challenge" in page.url or "checkpoint" in page.url:
                 return ScrapingResult(success=False, error="Challenge page")
             if "accounts/login" in page.url:
-                return ScrapingResult(success=False, error="Redirected to login")
+                return ScrapingResult(success=False, error="Login redirect")
 
             await self.dismiss_popups(page)
 
-            # Wait for HTML to be captured
-            await asyncio.sleep(2.0)
+            # Small delay for JavaScript to execute
+            await asyncio.sleep(0.5)
 
             caption: Optional[str] = None
 
-            # ── Primary: HTML parse ───────────────────────────────────
-            if html_body_ref[0]:
-                self.logger.debug(
-                    f"[{post_index}] HTML parse ({len(html_body_ref[0]):,} bytes) …",
-                    indent=2,
-                )
-                caption = InstagramCaptionParser.parse(html_body_ref[0], shortcode)
+            # ── Primary: HTML capture + parse ────────────────────────
+            self.logger.debug(f"capture HTML →", indent=2)
+            html_bytes = await self._capture_html_reliable(page)
+            
+            if html_bytes:
+                size_kb = len(html_bytes) / 1024
+                self.logger.debug(f"HTML: {size_kb:.1f} KB", indent=2)
+                caption = InstagramCaptionParser.parse(html_bytes, shortcode)
                 
                 if caption:
-                    self.logger.debug(
-                        f"[{post_index}] HTML parse ✓  {len(caption)} chars", 
-                        indent=2
-                    )
+                    self.logger.debug(f"HTML parse ✓ {len(caption)} chars", indent=2)
             else:
-                self.logger.warning(f"[{post_index}] No HTML captured", indent=2)
+                self.logger.debug("No HTML captured", indent=2)
 
-            # ── Fallback: JS extraction ──────────────────────────────
+            # ── Fallback: Quick JS ───────────────────────────────────
             if not caption:
-                self.logger.warning(
-                    f"[{post_index}] HTML parse empty — trying JS fallback",
-                    indent=2,
-                )
-                caption = await self._js_extract_caption_fallback(page, shortcode)
+                self.logger.debug("JS fallback →", indent=2)
+                caption = await self._js_extract_caption_fast(page)
 
             # ── Result ────────────────────────────────────────────────
             elapsed = time.monotonic() - t0
@@ -678,8 +638,7 @@ class InstagramCaptionScraper:
             if caption:
                 cap_len = len(caption)
                 self.logger.success(
-                    f"[{post_index:>2}] ✓ {post_type:<5}  {shortcode:<20}  "
-                    f"caption: {cap_len} chars  {elapsed:.1f}s",
+                    f"[{post_index:>2}] ✓ {shortcode:<15} {cap_len:>3} chars {elapsed:>4.1f}s",
                     indent=1,
                 )
                 return ScrapingResult(
@@ -692,8 +651,7 @@ class InstagramCaptionScraper:
                 )
 
             self.logger.warning(
-                f"[{post_index:>2}] no caption found  "
-                f"shortcode={shortcode}  {elapsed:.1f}s",
+                f"[{post_index:>2}] no caption {shortcode} {elapsed:.1f}s",
                 indent=1,
             )
             return ScrapingResult(
@@ -708,25 +666,18 @@ class InstagramCaptionScraper:
         except Exception as e:
             elapsed = time.monotonic() - t0
             self.logger.error(
-                f"[{post_index:>2}] {type(e).__name__}: "
-                f"{str(e)[:80]}  {elapsed:.1f}s",
+                f"[{post_index:>2}] {type(e).__name__} {elapsed:.1f}s",
                 indent=1,
             )
             return ScrapingResult(success=False, error=str(e)[:80])
 
-        finally:
-            try:
-                page.remove_listener("response", on_response)
-            except Exception:
-                pass
-
     async def _collect_post_urls(self, page: Page, post_limit: int) -> List[str]:
-        """Collect post URLs with conservative scrolling."""
+        """Fast post URL collection."""
         post_urls: List[str] = []
         last_height: int = 0
         stale_rounds: int = 0
         MAX_STALE = 3
-        MAX_SCROLLS = 12
+        MAX_SCROLLS = 10
 
         js_collect = r"""
             () => {
@@ -739,7 +690,7 @@ class InstagramCaptionScraper:
 
         for i in range(MAX_SCROLLS):
             links = (
-                await self._safe_evaluate(page, js_collect, timeout=8.0, label="collect-links")
+                await self._safe_evaluate(page, js_collect, timeout=5.0, label="collect")
                 or []
             )
             new = [u for u in links if u not in post_urls]
@@ -747,37 +698,35 @@ class InstagramCaptionScraper:
 
             if new:
                 self.logger.info(
-                    f"Scroll {i+1:>2}/{MAX_SCROLLS}  "
-                    f"+{len(new)} new  →  {len(post_urls)} total",
+                    f"Scroll {i+1:>2}  +{len(new)} → {len(post_urls)} total",
                     indent=2,
                 )
             else:
                 self.logger.debug(
-                    f"Scroll {i+1:>2}/{MAX_SCROLLS}  no new  "
-                    f"(stale {stale_rounds + 1}/{MAX_STALE})",
+                    f"Scroll {i+1:>2}  no new (stale {stale_rounds + 1})",
                     indent=2,
                 )
 
             if len(post_urls) >= post_limit:
                 self.logger.info(
-                    f"Post limit ({post_limit}) reached — stopping scroll", indent=2
+                    f"Limit ({post_limit}) reached", indent=2
                 )
                 break
 
             await self._safe_evaluate(
                 page,
                 "window.scrollTo(0, document.body.scrollHeight - 100);",
-                timeout=5.0,
+                timeout=3.0,
                 label="scroll",
             )
 
-            # Check for height change
-            for _ in range(4):
-                await self._human_delay(600, 1000)
+            # Quick height check
+            for _ in range(3):
+                await self._human_delay(400, 700)
                 new_height = (
                     await self._safe_evaluate(
                         page, "document.body.scrollHeight",
-                        timeout=5.0, label="scroll-height",
+                        timeout=3.0, label="height",
                     )
                     or last_height
                 )
@@ -789,31 +738,28 @@ class InstagramCaptionScraper:
                 stale_rounds += 1
 
             if stale_rounds >= MAX_STALE:
-                self.logger.info(
-                    f"Page end — no new content after {MAX_STALE} consecutive scrolls",
-                    indent=2,
-                )
+                self.logger.info(f"Page end", indent=2)
                 break
 
         return post_urls[:post_limit]
 
     async def scrape_profile(self, username: str, post_limit: int = 10) -> List[Dict]:
         """
-        Caption-focused sequential scraping.
-        Returns list of {url, shortcode, caption} dicts.
+        OPTIMIZED caption scraping.
+        Target: <15 seconds per post (was 30-130s).
         """
         t_total = time.monotonic()
 
         self.logger.phase(
-            "Instagram Caption Scraper",
-            f"@{username}  ·  limit {post_limit} posts  ·  CAPTIONS ONLY",
+            "Instagram Caption Scraper OPTIMIZED",
+            f"@{username}  ·  limit {post_limit}  ·  FAST MODE",
         )
 
         async with async_playwright() as p:
 
             # Browser startup
             self.logger.section("Browser")
-            self.logger.info("Launching Chromium (headless) …", indent=2)
+            self.logger.info("Launch Chromium …", indent=2)
             browser = await p.chromium.launch(
                 headless=True,
                 args=[
@@ -841,77 +787,58 @@ class InstagramCaptionScraper:
                 ignore_https_errors=True,
             )
             await main_ctx.add_cookies(self.cookies)
-            self.logger.debug(f"Session loaded with {len(self.cookies)} cookies", indent=2)
+            self.logger.debug(f"Cookies: {len(self.cookies)}", indent=2)
 
             try:
                 # Load profile
-                self.logger.phase("Load Profile", f"https://www.instagram.com/{username}/")
+                self.logger.phase("Load Profile", f"@{username}")
                 self.logger.section("Navigation")
                 profile_page = await main_ctx.new_page()
                 await profile_page.route("**/*", smart_route_handler)
 
                 profile_url = f"https://www.instagram.com/{username}/"
-                if not await self.safe_goto(profile_page, profile_url, max_retries=3):
-                    self.logger.error("Could not load profile — aborting", indent=1)
+                if not await self.safe_goto(profile_page, profile_url, max_retries=2):
+                    self.logger.error("Profile load failed", indent=1)
                     return []
 
                 # Check for challenge/login
                 if "challenge" in profile_page.url or "checkpoint" in profile_page.url:
-                    self.logger.error(
-                        "Profile redirected to challenge — cookies expired", indent=1
-                    )
+                    self.logger.error("Challenge page — cookies expired", indent=1)
                     await profile_page.close()
                     return []
                 if "accounts/login" in profile_page.url:
-                    self.logger.error(
-                        "Redirected to login — cookies invalid", indent=1
-                    )
+                    self.logger.error("Login redirect — cookies invalid", indent=1)
                     await profile_page.close()
                     return []
 
-                self.logger.success(f"Profile loaded: {profile_page.url[:70]}", indent=2)
+                self.logger.success(f"Profile loaded", indent=2)
                 self.logger.section_end()
 
                 await self.dismiss_popups(profile_page)
-                await self._wait_for_dom(profile_page)
+                await self._quick_dom_check(profile_page)
 
                 # Discover posts
-                self.logger.phase(
-                    "Discover Posts", f"Scrolling grid — target: {post_limit} posts"
-                )
+                self.logger.phase("Discover Posts", f"Target: {post_limit}")
                 self.logger.section("Grid scroll")
                 post_urls = await self._collect_post_urls(profile_page, post_limit)
                 await profile_page.close()
-                self.logger.section_end(f"{len(post_urls)} unique post URLs collected")
+                self.logger.section_end(f"{len(post_urls)} URLs")
 
                 if not post_urls:
-                    self.logger.error(
-                        "No post URLs found — profile may be private or empty", indent=1
-                    )
+                    self.logger.error("No posts found", indent=1)
                     return []
-
-                self.logger.separator()
-                for i, u in enumerate(post_urls, 1):
-                    sc = (
-                        u.split("/p/")[-1]
-                        .split("/reel/")[-1]
-                        .split("/tv/")[-1]
-                        .split("/")[0]
-                    )
-                    self.logger.debug(f"  {i:>2}.  {sc:<20}  {u}", indent=1)
-                self.logger.separator()
 
                 # Scrape captions SEQUENTIALLY
                 self.logger.phase(
                     "Scrape Captions",
-                    f"{len(post_urls)} posts  ·  SEQUENTIAL (captions only)",
+                    f"{len(post_urls)} posts  ·  SEQUENTIAL",
                 )
 
                 self.logger.section("Sequential scraping")
                 posts: List[Dict] = []
                 failures: List[str] = []
 
-                # Reuse same page for all posts
+                # Reuse same page
                 scrape_page = await main_ctx.new_page()
                 await scrape_page.route("**/*", smart_route_handler)
 
@@ -928,13 +855,13 @@ class InstagramCaptionScraper:
                     if result.success:
                         posts.append(result.data)
                     else:
-                        failures.append(f"  post {i}: {result.error}")
+                        failures.append(f"post {i}: {result.error}")
 
-                    # Human-like delay between posts
+                    # Quick delay between posts
                     if i < len(post_urls):
-                        await self._human_delay(1500, 3000)
+                        await self._human_delay(800, 1500)
 
-                    self.logger.progress(i, len(post_urls), f"{len(posts)} successful")
+                    self.logger.progress(i, len(post_urls), f"{len(posts)} ok")
 
                 # Close scrape page
                 try:
@@ -946,32 +873,33 @@ class InstagramCaptionScraper:
 
                 # Final summary
                 elapsed_total = time.monotonic() - t_total
-                self.logger.phase("Summary", f"Total time: {elapsed_total:.1f}s")
+                self.logger.phase("Summary", f"Total: {elapsed_total:.1f}s")
                 self.logger.separator()
                 self.logger.success(
-                    f"Scraped:  {len(posts)}/{len(post_urls)} posts", indent=1
+                    f"Scraped:  {len(posts)}/{len(post_urls)}", indent=1
                 )
                 if failures:
                     self.logger.warning(
-                        f"Failed:   {len(failures)}/{len(post_urls)} posts", indent=1
+                        f"Failed:   {len(failures)}/{len(post_urls)}", indent=1
                     )
-                    for f in failures[:5]:
-                        self.logger.debug(f, indent=2)
-                    if len(failures) > 5:
-                        self.logger.debug(f"  ... and {len(failures) - 5} more", indent=2)
 
                 captioned = sum(1 for p in posts if p.get("caption"))
                 empty = len(posts) - captioned
-                self.logger.info(f"With caption: {captioned}/{len(posts)}", indent=1)
-                self.logger.info(f"Empty:        {empty}/{len(posts)}", indent=1)
+                self.logger.info(f"Captions: {captioned}/{len(posts)}", indent=1)
+                self.logger.info(f"Empty:    {empty}/{len(posts)}", indent=1)
                 
                 # Caption stats
                 if captioned > 0:
                     caption_lengths = [len(p["caption"]) for p in posts if p.get("caption")]
                     avg_len = sum(caption_lengths) // len(caption_lengths)
                     max_len = max(caption_lengths)
-                    self.logger.info(f"Avg caption:  {avg_len} chars", indent=1)
-                    self.logger.info(f"Max caption:  {max_len} chars", indent=1)
+                    self.logger.info(f"Avg:      {avg_len} chars", indent=1)
+                    self.logger.info(f"Max:      {max_len} chars", indent=1)
+                
+                # Speed stats
+                if len(posts) > 0:
+                    avg_time = elapsed_total / len(post_urls)
+                    self.logger.info(f"Speed:    {avg_time:.1f}s/post", indent=1)
                 
                 self.logger.separator()
 
@@ -980,7 +908,7 @@ class InstagramCaptionScraper:
             except Exception as e:
                 import traceback
                 self.logger.error(
-                    f"Fatal error: {type(e).__name__}: {str(e)[:80]}", indent=1
+                    f"Fatal: {type(e).__name__}: {str(e)[:80]}", indent=1
                 )
                 self.logger.debug(traceback.format_exc(), indent=1)
                 return []
@@ -1008,50 +936,42 @@ async def fetch_ig_urls(
     cookies: List[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Caption-focused Instagram scraper.
+    OPTIMIZED caption scraper.
     
-    Returns list of dicts with:
-    - url: Post URL
-    - shortcode: Post shortcode
-    - caption: Caption text (or empty string if none)
+    Returns: [{url, shortcode, caption}, ...]
     
-    Does NOT return: media_url, is_video
-    
-    Much lighter and faster than full scraper.
-    Perfect for caption monitoring/analysis.
+    Target performance: <15 seconds per post (was 30-130s)
     """
     account = account.lstrip("@")
 
     logger.phase(
-        "fetch_ig_urls",
-        f"account=@{account}  mode=CAPTIONS-ONLY (ultra-light)"
+        "fetch_ig_urls OPTIMIZED",
+        f"@{account}  ·  FAST MODE"
     )
     logger.section("Cookie setup")
 
     if cookies is None:
-        logger.info("No cookies passed — reading IG_COOKIES env var", indent=2)
+        logger.info("Reading IG_COOKIES env var", indent=2)
         raw = os.getenv("IG_COOKIES", "")
         if not raw:
-            logger.error("IG_COOKIES is not set — cannot authenticate", indent=2)
+            logger.error("IG_COOKIES not set", indent=2)
             return []
         try:
             cookies = json.loads(raw)
-            logger.success(f"Loaded {len(cookies)} cookies from environment", indent=2)
+            logger.success(f"Loaded {len(cookies)} cookies", indent=2)
         except json.JSONDecodeError as e:
-            logger.error(f"IG_COOKIES is not valid JSON: {e}", indent=2)
+            logger.error(f"IG_COOKIES invalid JSON: {e}", indent=2)
             return []
     else:
-        logger.success(f"Using {len(cookies)} caller-supplied cookies", indent=2)
+        logger.success(f"Using {len(cookies)} cookies", indent=2)
 
     csrf_ok = any(c.get("name") == "csrftoken" for c in cookies)
     session_ok = any(c.get("name") == "sessionid" for c in cookies)
     logger.info(
-        f"csrftoken present: {csrf_ok}  |  sessionid present: {session_ok}", indent=2
+        f"csrf: {csrf_ok}  |  session: {session_ok}", indent=2
     )
     if not session_ok:
-        logger.error(
-            "sessionid missing — scraping will fail!", indent=2
-        )
+        logger.error("sessionid missing!", indent=2)
 
     logger.section_end()
 
