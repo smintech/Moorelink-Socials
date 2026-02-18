@@ -31,7 +31,7 @@ except ImportError:
 # ══════════════════════════════════════════════
 
 GOTO_WAIT_UNTIL = "commit"
-GOTO_TIMEOUT_MS = 30_000
+GOTO_TIMEOUT_MS = 45_000  # ← INCREASED from 30s to 45s
 
 CDN_ALLOWLIST      = ("cdninstagram", "fbcdn")
 SLOW_PATH_PATTERNS = ("/reel/", "/tv/")
@@ -364,7 +364,134 @@ class InstagramHtmlParser:
 
 
 # ══════════════════════════════════════════════
-#  Core Scraper
+#  NEW: oEmbed Fetcher (Layer 0)
+# ══════════════════════════════════════════════
+
+class InstagramOEmbed:
+    """
+    Instagram oEmbed endpoint fetcher.
+    
+    Layer 0 — fastest, most reliable method for public posts.
+    No scraping needed, just a simple HTTP request.
+    
+    Endpoint: https://www.instagram.com/p/{shortcode}/embed/captioned/
+    or        https://graph.facebook.com/v8.0/instagram_oembed?url=...
+    
+    Returns structured JSON with thumbnail_url and caption (if public).
+    """
+    
+    @staticmethod
+    async def fetch(page: Page, post_url: str, shortcode: str) -> Optional[Dict]:
+        """
+        Try oEmbed endpoint via page context (uses cookies/session).
+        Returns dict with {caption, media_url, is_video} or None.
+        """
+        try:
+            # Instagram's own oEmbed endpoint
+            oembed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+            
+            logger.debug(f"[oEmbed] trying {oembed_url}", indent=2)
+            
+            # Use page.goto to leverage existing cookies/session
+            response = await page.goto(
+                oembed_url, 
+                wait_until="commit",
+                timeout=10_000
+            )
+            
+            if not response or response.status != 200:
+                logger.debug(f"[oEmbed] HTTP {response.status if response else 'None'}", indent=3)
+                return None
+            
+            # Check if it's HTML (embed page) or redirected to login
+            content_type = response.headers.get("content-type", "")
+            if "text/html" in content_type:
+                # Parse embed HTML for og: tags
+                html = await response.body()
+                text = html.decode("utf-8", errors="ignore")
+                
+                # Extract from og: meta tags in embed page
+                og_video = re.search(r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']', text, re.I)
+                og_image = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', text, re.I)
+                og_desc = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']', text, re.I)
+                
+                media_url = None
+                is_video = False
+                
+                if og_video:
+                    media_url = og_video.group(1)
+                    is_video = True
+                elif og_image and any(cdn in og_image.group(1) for cdn in CDN_ALLOWLIST):
+                    media_url = og_image.group(1)
+                
+                caption = og_desc.group(1) if og_desc else None
+                
+                if media_url:
+                    logger.success(f"[oEmbed] ✓ extracted from embed page", indent=2)
+                    return {
+                        "caption": caption,
+                        "media_url": media_url,
+                        "is_video": is_video
+                    }
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"[oEmbed] {type(e).__name__}: {str(e)[:60]}", indent=3)
+            return None
+
+
+# ══════════════════════════════════════════════
+#  NEW: Dynamic doc_id Detector
+# ══════════════════════════════════════════════
+
+class DocIdDetector:
+    """
+    Attempts to extract current GraphQL doc_id from Instagram's page source.
+    Instagram periodically rotates these IDs, so hardcoding breaks.
+    """
+    
+    # Known doc_ids as fallback (update periodically)
+    KNOWN_DOC_IDS = [
+        "8845758582119845",  # Current as of early 2024
+        "9496392850430714",  # Older version
+        "10166767163705416", # Another known version
+    ]
+    
+    @classmethod
+    async def detect(cls, page: Page) -> List[str]:
+        """
+        Extract doc_id from page source.
+        Returns list of candidate IDs (detected + known fallbacks).
+        """
+        try:
+            # Extract from HTML
+            html = await page.content()
+            
+            # Pattern 1: e.exports="8845758582119845"
+            pattern1 = re.findall(r'exports="(\d{16})"', html)
+            
+            # Pattern 2: "doc_id":"8845758582119845"
+            pattern2 = re.findall(r'"doc_id":"(\d{16})"', html)
+            
+            # Pattern 3: queryId:"8845758582119845"
+            pattern3 = re.findall(r'queryId:"(\d{16})"', html)
+            
+            detected = list(set(pattern1 + pattern2 + pattern3))
+            
+            if detected:
+                logger.debug(f"[doc_id] detected: {detected}", indent=2)
+            
+            # Return detected + known fallbacks
+            return detected + cls.KNOWN_DOC_IDS
+            
+        except Exception as e:
+            logger.debug(f"[doc_id] detection failed: {e}", indent=3)
+            return cls.KNOWN_DOC_IDS
+
+
+# ══════════════════════════════════════════════
+#  Core Scraper (Enhanced)
 # ══════════════════════════════════════════════
 
 class InstagramScraper:
@@ -374,11 +501,15 @@ class InstagramScraper:
         cookies:        List[Dict],
         logger:         DetailedLogger,
         max_concurrent: int = 2,
+        use_mobile:     bool = False,  # ← NEW: mobile user-agent option
     ):
         self.cookies        = cookies
         self.logger         = logger
         self.max_concurrent = max_concurrent
-        self.user_agents    = [
+        self.use_mobile     = use_mobile
+        
+        # Desktop user-agents
+        self.user_agents_desktop = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -386,8 +517,21 @@ class InstagramScraper:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         ]
+        
+        # ← NEW: Mobile user-agents (can access i.instagram.com endpoints)
+        self.user_agents_mobile = [
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 "
+            "(KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (iPad; CPU OS 16_6 like Mac OS X) AppleWebKit/605.1.15 "
+            "(KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        ]
+        
+        self.user_agents = self.user_agents_mobile if use_mobile else self.user_agents_desktop
+        
         self.ig_app_id   = "936619743392459"
-        self.post_doc_id = "8845758582119845"
+        self.post_doc_ids = DocIdDetector.KNOWN_DOC_IDS  # ← Will be updated dynamically
         self.csrf_token  = next(
             (c["value"] for c in cookies if c.get("name") == "csrftoken"), None
         )
@@ -400,7 +544,7 @@ class InstagramScraper:
         self,
         page:    Page,
         script:  str,
-        timeout: float = 10.0,
+        timeout: float = 20.0,  # ← INCREASED from 10s to 20s
         label:   str   = "evaluate",
     ) -> Any:
         """page.evaluate() with an asyncio hard timeout (Playwright has none)."""
@@ -418,6 +562,11 @@ class InstagramScraper:
                 indent=3,
             )
             return None
+
+    # ← NEW: Human-like jitter
+    async def _human_delay(self, min_ms: int = 500, max_ms: int = 1500):
+        """Add random delay to mimic human behavior."""
+        await asyncio.sleep(random.uniform(min_ms, max_ms) / 1000)
 
     # ------------------------------------------------------------------
     #  Navigation
@@ -470,7 +619,7 @@ class InstagramScraper:
         )
         return False
 
-    async def _wait_for_dom(self, page: Page, timeout: float = 6.0):
+    async def _wait_for_dom(self, page: Page, timeout: float = 8.0):  # ← INCREASED from 6s to 8s
         deadline = asyncio.get_event_loop().time() + timeout
         for sel in ["article", "video", "main", "section", "div[role='main']", "body > div > div"]:
             remaining_ms = (deadline - asyncio.get_event_loop().time()) * 1000
@@ -478,12 +627,16 @@ class InstagramScraper:
                 break
             try:
                 await page.wait_for_selector(
-                    sel, state="attached", timeout=min(remaining_ms, 2_000)
+                    sel, state="attached", timeout=min(remaining_ms, 3_000)  # ← INCREASED from 2s to 3s
                 )
                 self.logger.debug(f"DOM ready — matched '{sel}'", indent=2)
+                
+                # ← NEW: More human-like scroll jitter
                 await self._safe_evaluate(
-                    page, "window.scrollBy(0,80); window.scrollBy(0,-80)",
-                    timeout=2.0, label="scroll-jitter",
+                    page, 
+                    "window.scrollBy(0,80); window.scrollBy(0,-80); window.scrollBy(0,40);",
+                    timeout=3.0, 
+                    label="scroll-jitter",
                 )
                 return
             except Exception:
@@ -511,77 +664,189 @@ class InstagramScraper:
                 el = page.locator(sel).first
                 if await el.is_visible(timeout=800):
                     await el.click(timeout=800)
-                    await asyncio.sleep(0.15)
+                    await self._human_delay(100, 300)  # ← NEW: Human-like delay
             except Exception:
                 pass
 
     # ------------------------------------------------------------------
-    #  JS-based caption / media fallbacks
+    #  NEW: ?__a=1 JSON variant attempt
+    # ------------------------------------------------------------------
+    
+    async def _try_json_variant(self, page: Page, post_url: str, shortcode: str) -> Optional[Dict]:
+        """
+        Try Instagram's ?__a=1 or ?__a=1&__d=dis JSON endpoint.
+        Sometimes returns full JSON without needing JS execution.
+        """
+        variants = [
+            f"{post_url}?__a=1&__d=dis",
+            f"{post_url}?__a=1",
+        ]
+        
+        for variant in variants:
+            try:
+                self.logger.debug(f"[JSON variant] trying {variant}", indent=2)
+                
+                response = await page.goto(
+                    variant,
+                    wait_until="commit",
+                    timeout=12_000
+                )
+                
+                if not response or response.status != 200:
+                    continue
+                
+                content_type = response.headers.get("content-type", "")
+                if "json" not in content_type.lower():
+                    continue
+                
+                data = await response.json()
+                
+                # Parse the JSON structure
+                media = None
+                if "graphql" in data:
+                    media = data.get("graphql", {}).get("shortcode_media")
+                elif "items" in data:
+                    items = data.get("items", [])
+                    if items:
+                        item = items[0]
+                        # Mobile API format
+                        cap = item.get("caption") or {}
+                        caption = cap.get("text") if isinstance(cap, dict) else None
+                        
+                        media_url = None
+                        is_video = False
+                        
+                        if item.get("video_versions"):
+                            is_video = True
+                            media_url = item["video_versions"][0].get("url")
+                        elif item.get("image_versions2"):
+                            cands = item["image_versions2"].get("candidates", [])
+                            media_url = cands[0].get("url") if cands else None
+                        
+                        if media_url:
+                            self.logger.success(f"[JSON variant] ✓ mobile API format", indent=2)
+                            return {
+                                "caption": caption,
+                                "media_url": media_url,
+                                "is_video": is_video
+                            }
+                
+                if media:
+                    edges = media.get("edge_media_to_caption", {}).get("edges", [])
+                    caption = edges[0]["node"]["text"] if edges else None
+                    
+                    media_url = None
+                    is_video = False
+                    
+                    if media.get("video_url"):
+                        is_video = True
+                        media_url = media["video_url"]
+                    elif media.get("display_url"):
+                        media_url = media["display_url"]
+                    
+                    if media_url:
+                        self.logger.success(f"[JSON variant] ✓ graphql format", indent=2)
+                        return {
+                            "caption": caption,
+                            "media_url": media_url,
+                            "is_video": is_video
+                        }
+                
+            except Exception as e:
+                self.logger.debug(
+                    f"[JSON variant] {type(e).__name__}: {str(e)[:60]}", 
+                    indent=3
+                )
+                continue
+        
+        return None
+
+    # ------------------------------------------------------------------
+    #  JS-based caption / media fallbacks (ENHANCED)
     # ------------------------------------------------------------------
 
-    async def _js_extract_caption(self, page: Page, shortcode: str) -> Optional[str]:
+    async def _js_extract_caption(
+        self, 
+        page: Page, 
+        shortcode: str,
+        doc_ids: List[str]  # ← NEW: Try multiple doc_ids
+    ) -> Optional[str]:
         """
-        JS fallback strategies — only used when HTML body parse yields nothing.
-
-        Key differences from the original version:
-        ─────────────────────────────────────────
-        1. GraphQL uses fetch() with credentials:'include' instead of XHR
-           with manually-set headers.  credentials:'include' auto-attaches
-           ALL browser cookies (including httpOnly ones JS can't read),
-           making the request indistinguishable from the browser's own calls.
-
-        2. Window globals checks __additionalDataLoaded (correct name) and
-           __additionalData (legacy fallback), plus _sharedData for old posts.
+        JS fallback strategies with RETRY logic and multiple doc_ids.
+        
+        Key improvements:
+        1. Try multiple doc_ids (detected + known)
+        2. Retry with exponential backoff on timeout
+        3. Better error handling and fallback chain
         """
-        # ── Strategy 1: GraphQL via fetch with credentials:include ────
-        # Use JSON.stringify to safely embed variables — avoids shell-escaping
-        # issues that plagued the old body.replace("'", "\\'") approach.
-        gql_script = f"""
-            async () => {{
-                try {{
-                    const vars = {{
-                        shortcode: {json.dumps(shortcode)},
-                        fetch_tagged_user_count: null,
-                        hoisted_comment_id: null,
-                        hoisted_reply_id: null
-                    }};
-                    const body = 'variables=' + encodeURIComponent(JSON.stringify(vars))
-                               + '&doc_id={self.post_doc_id}';
+        
+        # ── Strategy 1: GraphQL via fetch with multiple doc_ids ────
+        for doc_id in doc_ids[:3]:  # Try first 3 doc_ids
+            gql_script = f"""
+                async () => {{
+                    try {{
+                        const vars = {{
+                            shortcode: {json.dumps(shortcode)},
+                            fetch_tagged_user_count: null,
+                            hoisted_comment_id: null,
+                            hoisted_reply_id: null
+                        }};
+                        const body = 'variables=' + encodeURIComponent(JSON.stringify(vars))
+                                   + '&doc_id={doc_id}';
 
-                    const resp = await fetch('https://www.instagram.com/graphql/query', {{
-                        method: 'POST',
-                        headers: {{
-                            'content-type': 'application/x-www-form-urlencoded',
-                            'x-csrftoken': {json.dumps(self.csrf_token or '')},
-                            'x-ig-app-id': '{self.ig_app_id}',
-                            'x-requested-with': 'XMLHttpRequest'
-                        }},
-                        credentials: 'include',
-                        body: body
-                    }});
+                        const resp = await fetch('https://www.instagram.com/graphql/query', {{
+                            method: 'POST',
+                            headers: {{
+                                'content-type': 'application/x-www-form-urlencoded',
+                                'x-csrftoken': {json.dumps(self.csrf_token or '')},
+                                'x-ig-app-id': '{self.ig_app_id}',
+                                'x-requested-with': 'XMLHttpRequest'
+                            }},
+                            credentials: 'include',
+                            body: body
+                        }});
 
-                    if (!resp.ok) return {{_err: 'http:' + resp.status}};
-                    return await resp.json();
-                }} catch (e) {{
-                    return {{_err: e.message}};
+                        if (!resp.ok) return {{_err: 'http:' + resp.status}};
+                        return await resp.json();
+                    }} catch (e) {{
+                        return {{_err: e.message}};
+                    }}
                 }}
-            }}
-        """
-        result = await self._safe_evaluate(page, gql_script, timeout=12.0, label="graphql-fetch")
-        if result and not result.get("_err"):
-            media = result.get("data", {}).get("xdt_shortcode_media", {})
-            if media:
-                edges = media.get("edge_media_to_caption", {}).get("edges", [])
-                cap = edges[0]["node"].get("text") if edges else media.get("accessibility_caption")
-                if cap:
-                    self.logger.debug(f"Caption via [GraphQL fetch]  {len(cap)} chars", indent=2)
-                    return cap
-        elif result and result.get("_err"):
-            self.logger.debug(f"GraphQL fetch: {result['_err']}", indent=3)
+            """
+            
+            # ← NEW: Retry logic with timeout
+            for retry in range(2):
+                timeout = 15.0 + (retry * 5.0)  # 15s, then 20s
+                result = await self._safe_evaluate(
+                    page, gql_script, 
+                    timeout=timeout, 
+                    label=f"graphql-fetch-docid-{doc_id[:6]}-retry{retry}"
+                )
+                
+                if result and not result.get("_err"):
+                    media = result.get("data", {}).get("xdt_shortcode_media", {})
+                    if media:
+                        edges = media.get("edge_media_to_caption", {}).get("edges", [])
+                        cap = edges[0]["node"].get("text") if edges else media.get("accessibility_caption")
+                        if cap:
+                            self.logger.debug(
+                                f"Caption via [GraphQL fetch doc_id={doc_id[:6]}]  {len(cap)} chars", 
+                                indent=2
+                            )
+                            return cap
+                elif result and result.get("_err") and "http:429" in result["_err"]:
+                    # Rate limited - wait before retry
+                    await asyncio.sleep(3 + retry * 2)
+                    continue
+                
+                # If timeout, try one more time
+                if result is None and retry == 0:
+                    await asyncio.sleep(2)
+                    continue
+                
+                break  # Move to next doc_id
 
-        # ── Strategy 2: Window globals ────────────────────────────────
-        # Checks __additionalDataLoaded (current), __additionalData (legacy),
-        # and _sharedData (very old posts).
+        # ── Strategy 2: Window globals (ENHANCED) ────────────────────
         window_script = r"""
             () => {
                 // __additionalDataLoaded — current Instagram global (2024+)
@@ -625,12 +890,22 @@ class InstagramScraper:
                 return null;
             }
         """
-        cap = await self._safe_evaluate(page, window_script, timeout=4.0, label="window-globals")
-        if cap:
-            self.logger.debug(f"Caption via [window globals]  {len(cap)} chars", indent=2)
-            return cap
+        
+        # ← NEW: Retry window globals with increased timeout
+        for retry in range(2):
+            timeout = 6.0 + (retry * 4.0)  # 6s, then 10s
+            cap = await self._safe_evaluate(
+                page, window_script, 
+                timeout=timeout, 
+                label=f"window-globals-retry{retry}"
+            )
+            if cap:
+                self.logger.debug(f"Caption via [window globals]  {len(cap)} chars", indent=2)
+                return cap
+            if retry == 0:
+                await asyncio.sleep(1)  # Brief wait before retry
 
-        # ── Strategy 3: DOM selectors ─────────────────────────────────
+        # ── Strategy 3: DOM selectors (ENHANCED) ─────────────────────
         dom_script = r"""
             () => {
                 for (const s of [
@@ -638,7 +913,9 @@ class InstagramScraper:
                     'div._aacl._a9zr',
                     'div[data-testid="post-caption"]',
                     'h1 + div span',
-                    'span._aacl'
+                    'span._aacl',
+                    'article span[dir="auto"]',  // ← NEW: Additional selector
+                    'div[role="button"] + div span',  // ← NEW
                 ]) {
                     const el = document.querySelector(s);
                     const t  = el?.innerText?.trim();
@@ -647,15 +924,27 @@ class InstagramScraper:
                 return null;
             }
         """
-        cap = await self._safe_evaluate(page, dom_script, timeout=4.0, label="dom-caption")
-        if cap:
-            self.logger.debug(f"Caption via [DOM selectors]  {len(cap)} chars", indent=2)
-            return cap
+        
+        # ← NEW: Retry DOM with increased timeout
+        for retry in range(2):
+            timeout = 5.0 + (retry * 3.0)  # 5s, then 8s
+            cap = await self._safe_evaluate(
+                page, dom_script, 
+                timeout=timeout, 
+                label=f"dom-caption-retry{retry}"
+            )
+            if cap:
+                self.logger.debug(f"Caption via [DOM selectors]  {len(cap)} chars", indent=2)
+                return cap
+            if retry == 0:
+                await asyncio.sleep(1)
 
         return None
 
     async def _js_extract_media(self, page: Page, post_url: str) -> Tuple[str, bool]:
+        """ENHANCED media extraction with retry logic."""
         is_video = any(p in post_url for p in ("/reel/", "/tv/"))
+        
         if is_video:
             script = r"""
                 () => {
@@ -696,11 +985,24 @@ class InstagramScraper:
                     return cands[0]?.src || '';
                 }
             """
-        url = await self._safe_evaluate(page, script, timeout=6.0, label="media-url")
-        return (url if url and not url.startswith("blob") else ""), is_video
+        
+        # ← NEW: Retry with increased timeout
+        for retry in range(2):
+            timeout = 8.0 + (retry * 4.0)  # 8s, then 12s
+            url = await self._safe_evaluate(
+                page, script, 
+                timeout=timeout, 
+                label=f"media-url-retry{retry}"
+            )
+            if url and not url.startswith("blob"):
+                return url, is_video
+            if retry == 0:
+                await asyncio.sleep(1.5)
+        
+        return "", is_video
 
     # ------------------------------------------------------------------
-    #  Single post scraper — three-layer strategy
+    #  Single post scraper — ENHANCED four-layer strategy
     # ------------------------------------------------------------------
 
     async def scrape_single_post(
@@ -711,35 +1013,28 @@ class InstagramScraper:
         post_index: int,
     ) -> ScrapingResult:
         """
-        Three-layer data extraction strategy, in priority order:
+        ENHANCED four-layer data extraction strategy:
 
-        LAYER 1 — Network-layer capture + Python parse (primary)
+        LAYER 0 — oEmbed endpoint (NEW - fastest for public posts)
+        ──────────────────────────────────────────────────────────
+        Direct HTTP request to Instagram's oEmbed/embed endpoint.
+        No scraping, just structured JSON.
+
+        LAYER 1 — Network-layer capture + Python parse
         ─────────────────────────────────────────────────────────
-        A response listener is registered before navigation.  It captures:
+        (a) Raw HTML bytes → InstagramHtmlParser
+        (b) JSON API responses (graphql / v1 media)
 
-          (a) The raw HTML bytes of the main document response
-              → parsed by InstagramHtmlParser in pure Python
-              → covers pages where data is embedded inline in <script> tags
-                (dominant pattern for Instagram reels / older posts)
+        LAYER 1.5 — ?__a=1 JSON variant (NEW)
+        ───────────────────────────────────────
+        Try Instagram's JSON endpoint variant before JS fallback.
 
-          (b) Any JSON API responses (graphql / v1 media endpoints)
-              → parsed directly as dicts in Python
-              → covers pages that fetch data via XHR after initial load
-
-        Neither (a) nor (b) touches the Chromium JS runtime — both work
-        correctly even when the JS thread is saturated.
-
-        LAYER 2 — JS evaluate fallback
-        ────────────────────────────────
-        Only reached when Layer 1 yields no media_url.
-
-          • GraphQL via fetch() with credentials:'include'
-            (auto-sends all cookies including httpOnly — more reliable
-            than manually setting headers)
-          • window.__additionalDataLoaded  (correct 2024+ global)
-          • window.__additionalData        (legacy 2022-2023 global)
-          • window._sharedData             (very old posts)
-          • DOM selector scan
+        LAYER 2 — JS evaluate fallback (ENHANCED)
+        ────────────────────────────────────────
+        • GraphQL fetch with multiple doc_ids (detected + known)
+        • Retry logic with exponential backoff
+        • Window globals with retries
+        • DOM selectors with retries
 
         LAYER 3 — Failure
         ──────────────────
@@ -749,8 +1044,8 @@ class InstagramScraper:
         t0        = time.monotonic()
         post_type = "REEL" if any(p in post_url for p in SLOW_PATH_PATTERNS) else "POST"
 
-        html_body_ref: list = [None]   # bytes — main page HTML
-        api_data_ref:  list = [None]   # dict  — first matching JSON API response
+        html_body_ref: list = [None]
+        api_data_ref:  list = [None]
         api_ready           = asyncio.Event()
 
         is_video_default = any(p in post_url for p in SLOW_PATH_PATTERNS)
@@ -765,7 +1060,7 @@ class InstagramScraper:
             if html_body_ref[0] is None and response.request.resource_type == "document":
                 try:
                     if response.status == 200:
-                        body = await asyncio.wait_for(response.body(), timeout=8.0)
+                        body = await asyncio.wait_for(response.body(), timeout=10.0)  # ← INCREASED from 8s
                         html_body_ref[0] = body
                         self.logger.debug(
                             f"[{post_index}] HTML captured  {len(body):,} bytes", indent=2
@@ -784,7 +1079,7 @@ class InstagramScraper:
                     return
                 if "json" not in response.headers.get("content-type", ""):
                     return
-                data = await asyncio.wait_for(response.json(), timeout=3.0)
+                data = await asyncio.wait_for(response.json(), timeout=5.0)  # ← INCREASED from 3s
                 api_data_ref[0] = data
                 api_ready.set()
             except Exception:
@@ -793,14 +1088,40 @@ class InstagramScraper:
         # ── Page setup ────────────────────────────────────────────────
         try:
             page = await context.new_page()
-            page.set_default_navigation_timeout(40_000)
-            page.set_default_timeout(15_000)
+            page.set_default_navigation_timeout(50_000)  # ← INCREASED from 40s
+            page.set_default_timeout(20_000)              # ← INCREASED from 15s
             await page.route("**/*", smart_route_handler)
 
             page.on("response", on_response)
 
-            # ── Navigate ──────────────────────────────────────────────
-            self.logger.debug(f"[{post_index}] navigating …", indent=2)
+            # ── LAYER 0: oEmbed (NEW) ─────────────────────────────────
+            self.logger.debug(f"[{post_index}] Layer 0 — oEmbed attempt …", indent=2)
+            oembed_result = await InstagramOEmbed.fetch(page, post_url, shortcode)
+            
+            if oembed_result and oembed_result.get("media_url"):
+                elapsed = time.monotonic() - t0
+                kind = "VIDEO" if oembed_result.get("is_video") else "IMAGE"
+                cap_info = f"{len(oembed_result.get('caption', ''))} chars" if oembed_result.get("caption") else "no caption"
+                
+                self.logger.success(
+                    f"[{post_index:>2}] ✓ {kind:<5}  {shortcode:<20}  "
+                    f"caption: {cap_info:<18}  {elapsed:.1f}s  [oEmbed]",
+                    indent=1,
+                )
+                
+                return ScrapingResult(
+                    success=True,
+                    data={
+                        "url":       post_url,
+                        "shortcode": shortcode,
+                        "caption":   oembed_result.get("caption", ""),
+                        "media_url": oembed_result["media_url"],
+                        "is_video":  oembed_result.get("is_video", False),
+                    },
+                )
+
+            # ── Navigate to main page ─────────────────────────────────
+            self.logger.debug(f"[{post_index}] navigating to main page …", indent=2)
             if not await self.safe_goto(page, post_url, max_retries=3):
                 return ScrapingResult(success=False, error="Navigation failed after all retries")
 
@@ -812,13 +1133,18 @@ class InstagramScraper:
 
             await self.dismiss_popups(page)
 
-            # Brief window for any post-load API XHRs
+            # ← NEW: Detect doc_ids from page
+            detected_doc_ids = await DocIdDetector.detect(page)
+            if detected_doc_ids != DocIdDetector.KNOWN_DOC_IDS:
+                self.post_doc_ids = detected_doc_ids
+
+            # ← INCREASED: Wait longer for API JSON (5s → 12s)
             try:
-                await asyncio.wait_for(api_ready.wait(), timeout=5.0)
+                await asyncio.wait_for(api_ready.wait(), timeout=12.0)
                 self.logger.debug(f"[{post_index}] API JSON intercepted", indent=2)
             except asyncio.TimeoutError:
                 self.logger.debug(
-                    f"[{post_index}] no API JSON in 5s — relying on HTML parse", indent=2
+                    f"[{post_index}] no API JSON in 12s — continuing with other layers", indent=2
                 )
 
             # ── LAYER 1 ───────────────────────────────────────────────
@@ -880,14 +1206,32 @@ class InstagramScraper:
                 if not caption and h_cap:
                     caption = h_cap
 
-            # ── LAYER 2: JS evaluate fallback ─────────────────────────
+            # ── LAYER 1.5: JSON variant (NEW) ─────────────────────────
+            if not media_url:
+                self.logger.debug(
+                    f"[{post_index}] Layer 1.5 — trying ?__a=1 JSON variant …",
+                    indent=2,
+                )
+                json_result = await self._try_json_variant(page, post_url, shortcode)
+                if json_result:
+                    caption = json_result.get("caption") or caption
+                    media_url = json_result.get("media_url")
+                    is_video = json_result.get("is_video", is_video)
+                    if media_url:
+                        self.logger.debug(
+                            f"[{post_index}] Layer 1.5 (JSON variant) ✓", indent=2
+                        )
+
+            # ── LAYER 2: JS evaluate fallback (ENHANCED) ──────────────
             if not media_url:
                 self.logger.warning(
-                    f"[{post_index}] Layers 1a+1b empty — trying JS fallback",
+                    f"[{post_index}] Layers 0-1.5 empty — trying enhanced JS fallback",
                     indent=2,
                 )
                 if not caption:
-                    caption = await self._js_extract_caption(page, shortcode) or ""
+                    caption = await self._js_extract_caption(
+                        page, shortcode, self.post_doc_ids
+                    ) or ""
                 media_url, is_video = await self._js_extract_media(page, post_url)
 
             # ── Result ────────────────────────────────────────────────
@@ -961,7 +1305,7 @@ class InstagramScraper:
 
         for i in range(MAX_SCROLLS):
             links = (
-                await self._safe_evaluate(page, js_collect, timeout=5.0, label="collect-links")
+                await self._safe_evaluate(page, js_collect, timeout=6.0, label="collect-links")  # ← INCREASED
                 or []
             )
             new = [u for u in links if u not in post_urls]
@@ -986,16 +1330,22 @@ class InstagramScraper:
                 )
                 break
 
+            # ← NEW: More human-like scrolling
             await self._safe_evaluate(
-                page, "window.scrollTo(0, document.body.scrollHeight)",
-                timeout=3.0, label="scroll",
+                page, 
+                "window.scrollTo(0, document.body.scrollHeight - 100); "
+                "window.scrollBy(0, 50);",  # Scroll near bottom, then nudge
+                timeout=4.0, 
+                label="scroll",
             )
-            for _ in range(4):
-                await asyncio.sleep(0.5)
+            
+            # ← NEW: Add human-like jitter between scroll checks
+            for _ in range(5):  # Check 5 times instead of 4
+                await self._human_delay(400, 800)  # Random 400-800ms delay
                 new_height = (
                     await self._safe_evaluate(
                         page, "document.body.scrollHeight",
-                        timeout=3.0, label="scroll-height",
+                        timeout=4.0, label="scroll-height",
                     )
                     or last_height
                 )
@@ -1016,15 +1366,16 @@ class InstagramScraper:
         return post_urls[:post_limit]
 
     # ------------------------------------------------------------------
-    #  Main entry point
+    #  Main entry point (ENHANCED with jitter)
     # ------------------------------------------------------------------
 
     async def scrape_profile(self, username: str, post_limit: int = 10) -> List[Dict]:
         t_total = time.monotonic()
 
         self.logger.phase(
-            "Instagram Scraper",
-            f"@{username}  ·  limit {post_limit} posts  ·  {self.max_concurrent} workers",
+            "Instagram Scraper (Enhanced)",
+            f"@{username}  ·  limit {post_limit} posts  ·  {self.max_concurrent} workers  ·  "
+            f"{'mobile' if self.use_mobile else 'desktop'} UA",
         )
 
         async with async_playwright() as p:
@@ -1040,7 +1391,7 @@ class InstagramScraper:
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
-                    "--window-size=1920,1080",
+                    "--window-size=1920,1080" if not self.use_mobile else "--window-size=390,844",
                     "--disable-setuid-sandbox",
                     "--ignore-certificate-errors",
                     "--dns-prefetch-disable",
@@ -1049,13 +1400,22 @@ class InstagramScraper:
             self.logger.success("Browser ready", indent=2)
             self.logger.section_end()
 
+            viewport = (
+                {"width": 390, "height": 844} if self.use_mobile 
+                else {"width": 1920, "height": 1080}
+            )
+
             main_ctx = await browser.new_context(
                 user_agent=random.choice(self.user_agents),
-                viewport={"width": 1920, "height": 1080},
+                viewport=viewport,
                 locale="en-US",
                 timezone_id="America/New_York",
                 java_script_enabled=True,
                 ignore_https_errors=True,
+                # ← NEW: More realistic browser fingerprint
+                device_scale_factor=2 if self.use_mobile else 1,
+                has_touch=self.use_mobile,
+                is_mobile=self.use_mobile,
             )
             await main_ctx.add_cookies(self.cookies)
             self.logger.debug(f"Session loaded with {len(self.cookies)} cookies", indent=2)
@@ -1111,10 +1471,10 @@ class InstagramScraper:
                     self.logger.debug(f"  {i:>2}.  {sc:<20}  {u}", indent=1)
                 self.logger.separator()
 
-                # ── Phase: Scrape posts ───────────────────────────────
+                # ── Phase: Scrape posts (with JITTER) ─────────────────
                 self.logger.phase(
                     "Scrape Posts",
-                    f"{len(post_urls)} posts  ·  {self.max_concurrent} concurrent workers",
+                    f"{len(post_urls)} posts  ·  {self.max_concurrent} concurrent workers  ·  with jitter",
                 )
 
                 self.logger.section("Worker contexts")
@@ -1122,9 +1482,12 @@ class InstagramScraper:
                 for _ in range(self.max_concurrent):
                     wctx = await browser.new_context(
                         user_agent=random.choice(self.user_agents),
-                        viewport={"width": 1920, "height": 1080},
+                        viewport=viewport,
                         locale="en-US",
                         ignore_https_errors=True,
+                        device_scale_factor=2 if self.use_mobile else 1,
+                        has_touch=self.use_mobile,
+                        is_mobile=self.use_mobile,
                     )
                     await wctx.add_cookies(self.cookies)
                     worker_contexts.append(wctx)
@@ -1139,11 +1502,21 @@ class InstagramScraper:
                             return url.split(seg)[-1].split("/")[0]
                     return f"post_{idx}"
 
+                # ← NEW: Worker with jitter
                 async def _worker(idx: int, url: str) -> ScrapingResult:
+                    # Add staggered start delay
+                    initial_delay = (idx % self.max_concurrent) * random.uniform(0.5, 1.5)
+                    await asyncio.sleep(initial_delay)
+                    
                     async with semaphore:
                         ctx = worker_contexts[idx % self.max_concurrent]
                         sc  = _shortcode(url, idx)
-                        return await self.scrape_single_post(ctx, url, sc, idx + 1)
+                        result = await self.scrape_single_post(ctx, url, sc, idx + 1)
+                        
+                        # ← NEW: Add jitter between requests
+                        await self._human_delay(800, 2000)
+                        
+                        return result
 
                 self.logger.section("Post scraping")
                 tasks   = [_worker(i, u) for i, u in enumerate(post_urls)]
@@ -1218,13 +1591,14 @@ class InstagramScraper:
 
 
 # ══════════════════════════════════════════════
-#  Public API
+#  Public API (ENHANCED)
 # ══════════════════════════════════════════════
 
 async def fetch_ig_urls(
     account:        str,
     cookies:        List[Dict[str, Any]] = None,
     max_concurrent: int = 2,
+    use_mobile:     bool = False,  # ← NEW: mobile UA option
 ) -> List[Dict[str, Any]]:
     """
     Scrape an Instagram profile and return post data.
@@ -1232,12 +1606,31 @@ async def fetch_ig_urls(
     Returns:
         List of dicts: url, shortcode, caption, media_url, is_video
 
+    Args:
+        account: Instagram username (with or without @)
+        cookies: List of cookie dicts (or None to read from IG_COOKIES env)
+        max_concurrent: Number of concurrent workers (default 2 for safety)
+        use_mobile: Use mobile user-agent and endpoints (can be more reliable)
+
     max_concurrent=2 is the safe default for Render's free tier.
     Drop to 1 if you still see JS timeouts in the fallback path.
+    
+    NEW FEATURES:
+    - Layer 0: oEmbed endpoint (fastest for public posts)
+    - Layer 1.5: ?__a=1 JSON variant
+    - Dynamic doc_id detection
+    - Retry logic with exponential backoff
+    - Human-like jitter between requests
+    - Mobile user-agent option
+    - Increased timeouts throughout
     """
     account = account.lstrip("@")
 
-    logger.phase("fetch_ig_urls", f"account=@{account}  workers={max_concurrent}")
+    logger.phase(
+        "fetch_ig_urls", 
+        f"account=@{account}  workers={max_concurrent}  "
+        f"mode={'mobile' if use_mobile else 'desktop'}"
+    )
     logger.section("Cookie setup")
 
     if cookies is None:
@@ -1270,7 +1663,10 @@ async def fetch_ig_urls(
     logger.section_end()
 
     scraper = InstagramScraper(
-        cookies=cookies, logger=logger, max_concurrent=max_concurrent
+        cookies=cookies, 
+        logger=logger, 
+        max_concurrent=max_concurrent,
+        use_mobile=use_mobile,
     )
     return await scraper.scrape_profile(
         username=account,
