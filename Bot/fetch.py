@@ -197,8 +197,24 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
     if platform == "x":
         raw_posts = fetch_latest_urls("x", account)
         post_list = [{"post_id": extract_post_id("x", url), "post_url": url, "caption": ""} for url in raw_posts]
+
     elif platform == "ig":
-        raw_ig = await fetch_ig_urls(account)
+        # Send temporary fetching message
+        temp_msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="🔄 Fetching Instagram posts please wait or comeback in few minutes... ⏳"
+        )
+
+        try:
+            raw_ig = await fetch_ig_urls(account)
+        except Exception as e:
+            await temp_msg.delete()
+            await message.reply_text(f"❌ Failed to fetch Instagram posts: {e}")
+            return
+
+        # Delete temp message now that we have data
+        await temp_msg.delete()
+
         post_list = []
         for p in raw_ig:
             pid = extract_post_id("ig", p['url'])
@@ -208,6 +224,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
                 "caption": p.get("caption", ""),
                 "media_url": p.get("url"),
             })
+
     elif platform == "fb":
         raw_fb = fetch_fb_urls(account)
         post_list = []
@@ -220,6 +237,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
                 "media_url": p.get("media_url"),
                 "is_video": p.get("is_video", False)
             })
+
     elif platform == "yt":
         raw_yt = fetch_yt_videos(channel_handle=account)
         post_list = []
@@ -231,6 +249,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
                 "media_url": v["media_url"],
                 "is_video": True
             })
+
     else:
         await message.reply_text("Unsupported platform.")
         return
@@ -247,7 +266,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
         await message.reply_text(f"No new posts from @{clean_account} since your last check.")
         return
     else:
-        mark_posts_seen(uid, platform, clean_account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
+        mark_posts_seen(uid, platform, clean_account, [{"post_id": p['post_id'], "post_url': p['post_url']} for p in new_posts])
 
     context.user_data[f"pending_posts_{platform}_{clean_account}"] = {
         "posts": new_posts,
