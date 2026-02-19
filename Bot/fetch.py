@@ -266,7 +266,7 @@ async def handle_fetch_and_ai(update, context, platform, account, query=None, fo
         await message.reply_text(f"No new posts from @{clean_account} since your last check.")
         return
     else:
-        mark_posts_seen(uid, platform, clean_account, [{"post_id": p['post_id'], "post_url': p['post_url']} for p in new_posts])
+        mark_posts_seen(uid, platform, clean_account, [{"post_id": p['post_id'], "post_url": p['post_url']} for p in new_posts])
 
     context.user_data[f"pending_posts_{platform}_{clean_account}"] = {
         "posts": new_posts,
