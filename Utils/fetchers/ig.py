@@ -235,7 +235,7 @@ async def post_route_handler(route):
 
 
 # ══════════════════════════════════════════════
-#  CAPTION PARSER (unchanged)
+#  CAPTION PARSER
 # ══════════════════════════════════════════════
 
 class InstagramCaptionParser:
@@ -270,7 +270,7 @@ class InstagramCaptionParser:
         except Exception:
             return None
         
-        # JSON-LD (most reliable)
+        # JSON-LD
         jsonld_pattern = re.compile(
             r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
             re.DOTALL | re.I,
@@ -295,7 +295,7 @@ class InstagramCaptionParser:
             except Exception:
                 pass
         
-        # OG Description (works for Reels)
+        # OG Description
         og_desc_pattern = re.compile(
             r'<meta[^>]+(?:property=["\']og:description["\']|name=["\']description["\'])'
             r'[^>]+content=["\']([^"\']{10,})["\']',
@@ -329,7 +329,7 @@ class InstagramCaptionParser:
 
 
 # ══════════════════════════════════════════════
-#  SAFE PAGE CONTEXT MANAGER (FIXED)
+#  SAFE PAGE CONTEXT MANAGER 
 # ══════════════════════════════════════════════
 
 @asynccontextmanager
@@ -353,7 +353,6 @@ async def managed_page(context: BrowserContext, post_type: str = "POST"):
     finally:
         if page:
             try:
-                # Standard close - no arguments in Playwright Python
                 # Use asyncio.wait_for to prevent hanging
                 await asyncio.wait_for(page.close(), timeout=5.0)
                 logger.debug(f"Page closed ({post_type})", indent=2)
@@ -879,7 +878,7 @@ async def fetch_ig_urls(
 ) -> List[Dict[str, Any]]:
     account = account.lstrip("@")
     
-    logger.phase("fetch_ig_urls 2026", f"@{account}")
+    logger.phase("fetch_ig_urls", f"@{account}")
     logger.section("Cookies")
     
     if cookies is None:
