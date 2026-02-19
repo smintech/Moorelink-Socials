@@ -4,7 +4,7 @@ import random
 import re
 import time
 import signal
-from typing import Any, Dict, List, Optional
+from typing import Dict, Optional, Any, Tuple, Callable, List
 from urllib.parse import quote, urlencode
 import os
 from dataclasses import dataclass
