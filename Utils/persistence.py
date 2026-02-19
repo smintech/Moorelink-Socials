@@ -3,7 +3,7 @@ import hashlib
 import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
-
+import re
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -604,8 +604,28 @@ def reset_cooldown(telegram_id: int) -> None:
 def extract_post_id(platform: str, url: str) -> str:
     if platform == "x":
         return url.split("/")[-1].split("?")[0]
+    
     elif platform == "ig":
-        return url.split("/p/")[1].split("/")[0]
+        # Remove query params and trailing slash
+        clean_url = url.split("?")[0].rstrip("/")
+        
+        # Handle /reel/ URLs
+        if "/reel/" in clean_url:
+            return clean_url.split("/reel/")[1].split("/")[0]
+        
+        # Handle /tv/ URLs  
+        elif "/tv/" in clean_url:
+            return clean_url.split("/tv/")[1].split("/")[0]
+        
+        # Handle /p/ URLs (standard posts)
+        elif "/p/" in clean_url:
+            return clean_url.split("/p/")[1].split("/")[0]
+        
+        # Fallback: last path segment
+        else:
+            parts = [p for p in clean_url.split("/") if p]
+            return parts[-1] if parts else ""
+    
     return ""
 
 def is_post_new(owner_id: int, platform: str, account: str, post_id: str) -> bool:
