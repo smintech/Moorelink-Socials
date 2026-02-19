@@ -83,7 +83,7 @@ USER_INFO_DOC_ID = "2398832706970914"
 PROFILE_EXTRAS_QUERY_ID = "9957820854288654" 
 
 # ══════════════════════════════════════════════
-#  DETAILED LOGGER (unchanged)
+#  DETAILED LOGGER
 # ══════════════════════════════════════════════
 
 class DetailedLogger:
@@ -238,33 +238,118 @@ async def post_route_handler(route):
 
 
 # ══════════════════════════════════════════════
-#  CAPTION PARSER
+#  ENHANCED CAPTION PARSER
 # ══════════════════════════════════════════════
 
 class InstagramCaptionParser:
     @classmethod
     def _unescape(cls, s: str) -> str:
+        """Unescape JSON and HTML entities"""
         try:
             return json.loads(f'"{s}"')
         except Exception:
-            return s.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
+            # Fallback manual unescape
+            s = s.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
+            s = s.replace("&quot;", '"').replace("&apos;", "'")
+            s = s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+            return s
     
     @classmethod
-    def _clean_og_description(cls, raw: str) -> str:
+    def _extract_from_meta_description(cls, content: str) -> Optional[str]:
+        """
+        Extract caption from meta description format:
+        '21K likes, 1,053 comments - eko.savage on February 19, 2026: "We love you VINI..say no to racism✊🏽#voiceover". '
+        """
+        if not content or len(content) < 10:
+            return None
+        
+        # Pattern 1: Extract text within quotes after colon and date
+        # Matches: on <date>: "<caption>"
+        pattern1 = re.compile(
+            r'on\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}:\s*["\'](.+?)["\']',
+            re.DOTALL | re.IGNORECASE
+        )
+        match = pattern1.search(content)
+        if match:
+            caption = match.group(1).strip()
+            if len(caption) > 5:
+                return cls._unescape(caption)
+        
+        # Pattern 2: Extract everything after username and "on date:"
+        # Matches: - <username> on <date>: <caption>
+        pattern2 = re.compile(
+            r'-\s*[\w.]+\s+on\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}:\s*["\']?(.+?)["\']?\s*\.?\s*$',
+            re.DOTALL | re.IGNORECASE
+        )
+        match = pattern2.search(content)
+        if match:
+            caption = match.group(1).strip()
+            # Remove trailing quotes and periods
+            caption = caption.strip('."\'')
+            if len(caption) > 5:
+                return cls._unescape(caption)
+        
+        # Pattern 3: Simple colon extraction (fallback)
+        if ':"' in content or ': "' in content:
+            parts = re.split(r':\s*["\']', content, maxsplit=1)
+            if len(parts) == 2:
+                caption = parts[1].strip('."\'').strip()
+                if len(caption) > 5:
+                    return cls._unescape(caption)
+        
+        return None
+    
+    @classmethod
+    def _extract_from_twitter_title(cls, content: str) -> Optional[str]:
+        """
+        Extract caption from twitter:title format:
+        'Eko Savage | We love you VINI..say no to racism✊🏽#voiceover | Instagram'
+        """
+        if not content or len(content) < 10:
+            return None
+        
+        # Split by pipes and get middle section
+        parts = content.split('|')
+        if len(parts) >= 2:
+            # Get the middle part (between first and last pipe)
+            caption = parts[1].strip()
+            # Remove "Instagram" if it's in the caption
+            caption = re.sub(r'\s*Instagram\s*$', '', caption, flags=re.I)
+            if len(caption) > 5:
+                return cls._unescape(caption)
+        
+        return None
+    
+    @classmethod
+    def _clean_generic_description(cls, raw: str) -> str:
+        """Clean generic OG description text"""
         text = cls._unescape(raw).strip()
+        
+        # Remove common Instagram suffixes
         text = re.sub(r'\s*on Instagram.*$', '', text, flags=re.I)
         text = re.sub(r'\s*\(.*?\)\s*on Instagram.*$', '', text, flags=re.I)
         text = re.sub(r'\s*View all \d+ comments?.*$', '', text, flags=re.I)
         text = re.sub(r'\s*·\s*View all.*$', '', text, flags=re.I)
         text = re.sub(r'\s*•\s*.*$', '', text, flags=re.I)
-        text = re.sub(r'\s*\d{1,3}(,\d{3})*(\.\d+)?\s*(likes?|views?|comments?).*$', '', text, flags=re.I)
+        
+        # Remove stats at the end
+        text = re.sub(
+            r'\s*\d{1,3}(,\d{3})*(\.\d+)?\s*(likes?|views?|comments?).*$',
+            '', text, flags=re.I
+        )
+        
+        # If there's a colon in the first 100 chars, take everything after it
         if ':' in text[:100]:
             text = text.split(':', 1)[1].strip()
-        text = re.sub(r'^@?[\w._]+\s*', '', text, flags=re.I)
+        
+        # Remove leading username
+        text = re.sub(r'^@?[\w._]+\s*[-:|]\s*', '', text, flags=re.I)
+        
         return text.strip()
     
     @classmethod
     def parse(cls, html: bytes, shortcode: str) -> Optional[str]:
+        """Parse caption from HTML with enhanced meta tag extraction"""
         if not html or len(html) < 1000:
             return None
         
@@ -273,7 +358,58 @@ class InstagramCaptionParser:
         except Exception:
             return None
         
-        # JSON-LD
+        # ═══════════════════════════════════════════════════════════
+        # PRIORITY 1: META TAGS (Most Reliable for 2026)
+        # ═══════════════════════════════════════════════════════════
+        
+        # Try meta name="description" first (most common format)
+        desc_pattern = re.compile(
+            r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']+)["\']',
+            re.I | re.DOTALL
+        )
+        match = desc_pattern.search(text)
+        if match:
+            caption = cls._extract_from_meta_description(match.group(1))
+            if caption and len(caption) > 5:
+                return caption.strip()
+        
+        # Try meta property="og:description"
+        og_desc_pattern = re.compile(
+            r'<meta\s+property=["\']og:description["\']\s+content=["\']([^"\']+)["\']',
+            re.I | re.DOTALL
+        )
+        match = og_desc_pattern.search(text)
+        if match:
+            caption = cls._extract_from_meta_description(match.group(1))
+            if caption and len(caption) > 5:
+                return caption.strip()
+        
+        # Try twitter:description
+        twitter_desc_pattern = re.compile(
+            r'<meta\s+name=["\']twitter:description["\']\s+content=["\']([^"\']+)["\']',
+            re.I | re.DOTALL
+        )
+        match = twitter_desc_pattern.search(text)
+        if match:
+            caption = cls._extract_from_meta_description(match.group(1))
+            if caption and len(caption) > 5:
+                return caption.strip()
+        
+        # Try twitter:title (alternative format)
+        twitter_title_pattern = re.compile(
+            r'<meta\s+name=["\']twitter:title["\']\s+content=["\']([^"\']+)["\']',
+            re.I | re.DOTALL
+        )
+        match = twitter_title_pattern.search(text)
+        if match:
+            caption = cls._extract_from_twitter_title(match.group(1))
+            if caption and len(caption) > 5:
+                return caption.strip()
+        
+        # ═══════════════════════════════════════════════════════════
+        # PRIORITY 2: JSON-LD STRUCTURED DATA
+        # ═══════════════════════════════════════════════════════════
+        
         jsonld_pattern = re.compile(
             r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
             re.DOTALL | re.I,
@@ -298,23 +434,15 @@ class InstagramCaptionParser:
             except Exception:
                 pass
         
-        # OG Description
-        og_desc_pattern = re.compile(
-            r'<meta[^>]+(?:property=["\']og:description["\']|name=["\']description["\'])'
-            r'[^>]+content=["\']([^"\']{10,})["\']',
-            re.I
-        )
+        # ═══════════════════════════════════════════════════════════
+        # PRIORITY 3: INLINE JSON (GraphQL/React state)
+        # ═══════════════════════════════════════════════════════════
         
-        match = og_desc_pattern.search(text)
-        if match:
-            cleaned = cls._clean_og_description(match.group(1))
-            if len(cleaned) > 10:
-                return cleaned
-        
-        # Fallback patterns
         patterns = [
+            # GraphQL edge_media_to_caption format
             r'"edge_media_to_caption"\s*:\s*\{[^}]*"edges"\s*:\s*\[\s*\{[^}]*"node"\s*:\s*'
             r'\{[^}]*"text"\s*:\s*"((?:[^"\\]|\\.)+)"',
+            # Direct caption fields
             r'"caption"\s*:\s*"((?:[^"\\]|\\.){10,})"',
             r'"caption_text"\s*:\s*"((?:[^"\\]|\\.){10,})"',
             r'\{"text"\s*:\s*"((?:[^"\\]|\\.){10,})"\}',
@@ -325,8 +453,26 @@ class InstagramCaptionParser:
             matches = re.finditer(pattern, text)
             for match in matches:
                 caption = cls._unescape(match.group(1))
+                # Validate it's not just a username or single word
                 if len(caption) > 10 and not re.match(r'^[\w_]+$', caption):
                     return caption.strip()
+        
+        # ═══════════════════════════════════════════════════════════
+        # PRIORITY 4: Fallback to cleaned generic description
+        # ═══════════════════════════════════════════════════════════
+        
+        # Try any meta description as last resort
+        generic_meta_pattern = re.compile(
+            r'<meta[^>]+content=["\']([^"\']{20,})["\']',
+            re.I
+        )
+        
+        for match in generic_meta_pattern.finditer(text):
+            content = match.group(1)
+            if 'likes' in content or 'comments' in content:
+                cleaned = cls._clean_generic_description(content)
+                if len(cleaned) > 10:
+                    return cleaned
         
         return None
 
@@ -371,9 +517,9 @@ async def managed_page(context: BrowserContext, post_type: str = "POST"):
 # ══════════════════════════════════════════════
 
 class InstagramCaptionScraper2026:
-    def __init__(self, cookies: List[Dict], logger: DetailedLogger):
+    def __init__(self, cookies: List[Dict], logger_instance: DetailedLogger):
         self.cookies = cookies
-        self.logger = logger
+        self.logger = logger_instance
         self.user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
         ]
@@ -529,7 +675,7 @@ class InstagramCaptionScraper2026:
         async def scrape_with_semaphore(url: str, index: int) -> Optional[Dict]:
             async with semaphore:
                 post_type = detect_post_type(url)
-                shortcode = url.split('/')[-2]
+                shortcode = url.split('/')[-2] if '/' in url else "unknown"
                 
                 # Type-specific timeout
                 timeout = REEL_NAV_TIMEOUT/1000 + 8 if post_type == "REEL" else POST_NAV_TIMEOUT/1000 + 15
@@ -814,7 +960,7 @@ class InstagramCaptionScraper2026:
                 "include_suggested_users": "false",
                 "include_logged_out_extras": "false",
                 "include_live_status": "false",
-                "include_highlight_reels": "true"
+                "include_highlight_reels": "false"
             }
             
             self.logger.debug(f"GraphQL query_id={PROFILE_EXTRAS_QUERY_ID}", indent=2)
@@ -970,11 +1116,11 @@ class InstagramCaptionScraper2026:
         
         browser = None
         context = None
-        shutdown_requested = False
+        shutdown_requested_flag = False
         
         def handle_sigterm():
-            nonlocal shutdown_requested
-            shutdown_requested = True
+            nonlocal shutdown_requested_flag
+            shutdown_requested_flag = True
             self.logger.info("SIGTERM received - finishing current operations")
         
         loop = asyncio.get_running_loop()
@@ -1028,10 +1174,10 @@ class InstagramCaptionScraper2026:
                     
                     # Collect URLs
                     post_urls = await self._collect_post_urls(
-                        context, username, post_limit, lambda: shutdown_requested
+                        context, username, post_limit, lambda: shutdown_requested_flag
                     )
                     
-                    if post_urls and not shutdown_requested:
+                    if post_urls and not shutdown_requested_flag:
                         # Scrape parallel
                         self.logger.section("Scrape posts")
                         posts = await self.scrape_posts_parallel(
@@ -1131,7 +1277,7 @@ async def fetch_ig_urls(
     
     logger.section_end()
     
-    scraper = InstagramCaptionScraper2026(cookies=cookies, logger=logger)
+    scraper = InstagramCaptionScraper2026(cookies=cookies, logger_instance=logger)
     return await scraper.scrape_profile(
         username=account,
         post_limit=getattr(config, "POST_LIMIT", 10),
