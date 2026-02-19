@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 import os
 from dataclasses import dataclass
-
+import asyncio
 from playwright.async_api import (
     async_playwright,
     BrowserContext,
