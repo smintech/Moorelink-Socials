@@ -8,6 +8,7 @@ from typing import Dict, Optional, Any, Tuple, Callable, List
 from urllib.parse import quote, urlencode
 import os
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
 
 from playwright.async_api import (
     async_playwright,
@@ -30,22 +31,38 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════
-#  2026 CONFIGURATION
+#  2026 SPEED-OPTIMIZED CONFIGURATION
 # ══════════════════════════════════════════════
 
-NAVIGATION_TIMEOUT = 45_000  # Increased for grace
-GRAPHQL_TIMEOUT = 20.0  # Softer
-HTML_CAPTURE_TIMEOUT = 20.0  # Softer
+NAVIGATION_TIMEOUT = 20_000      # 20s max for navigation
+REEL_NAV_TIMEOUT = 12_000        # Reels: fast, don't wait for video
+POST_NAV_TIMEOUT = 25_000        # Posts: reliable loading
 
-WAIT_STRATEGY = "commit"
+DOM_WAIT_REEL = 3_000            # Reels: minimal DOM wait
+DOM_WAIT_POST = 8_000            # Posts: full structure wait
+HTML_CAPTURE_TIMEOUT = 8.0       # Fast capture
+PER_POST_TIMEOUT = 35.0          # Hard ceiling per post
+
+WAIT_STRATEGY_REEL = "domcontentloaded"   # Fast for reels
+WAIT_STRATEGY_POST = "commit"             # Reliable for posts
 
 CDN_ALLOWLIST = ("cdninstagram", "fbcdn")
 SLOW_PATH_PATTERNS = ("/reel/", "/tv/")
 
 _BLOCK_TYPES = frozenset({"font", "stylesheet", "image", "media"})
-_BLOCK_DOMAINS = (
+
+# Reels: Block everything including CDN media
+REEL_BLOCK_DOMAINS = (
+    "google-analytics", "doubleclick", "facebook.net", "fbcdn.net",
+    "cdninstagram.com", "blob:", "video", "mp4", "webm", 
+    "instagram.com/api/", "scorecardresearch", "omtrdc.net",
+    "googletagmanager"
+)
+
+# Posts: Allow CDN for OG image tags
+POST_BLOCK_DOMAINS = (
     "google-analytics", "doubleclick", "facebook.net/en_US/fbevents",
-    "scorecardresearch", "omtrdc.net", "googletagmanager",
+    "scorecardresearch", "omtrdc.net", "googletagmanager"
 )
 
 INSTAGRAM_HEADERS = {
@@ -58,11 +75,14 @@ INSTAGRAM_HEADERS = {
     "accept-language": "en-US,en;q=0.9",
 }
 
-# GraphQL doc_ids
 PROFILE_POSTS_DOC_ID = "9310670392322965"
 USER_INFO_DOC_ID = "2398832706970914"
 
-# Logging unchanged
+
+# ══════════════════════════════════════════════
+#  DETAILED LOGGER (unchanged)
+# ══════════════════════════════════════════════
+
 class DetailedLogger:
     _ICONS = {
         "info": "·",
@@ -149,7 +169,10 @@ class DetailedLogger:
 logger = DetailedLogger("Instagram Scraper")
 
 
-# Result dataclass unchanged
+# ══════════════════════════════════════════════
+#  RESULT DATACLASS
+# ══════════════════════════════════════════════
+
 @dataclass
 class ScrapingResult:
     success: bool
@@ -157,19 +180,53 @@ class ScrapingResult:
     error: Optional[str] = None
 
 
-# Route Interceptor unchanged
-async def smart_route_handler(route):
+# ══════════════════════════════════════════════
+#  POST TYPE DETECTION
+# ══════════════════════════════════════════════
+
+def detect_post_type(url: str) -> str:
+    """Detect if URL is Reel, TV, or standard Post"""
+    url_lower = url.lower()
+    if "/reel/" in url_lower:
+        return "REEL"
+    elif "/tv/" in url_lower:
+        return "TV"
+    elif "/p/" in url_lower:
+        return "POST"
+    else:
+        return "UNKNOWN"
+
+
+# ══════════════════════════════════════════════
+#  STRATEGIC ROUTE HANDLERS
+# ══════════════════════════════════════════════
+
+async def reel_route_handler(route):
+    """Aggressive blocking for Reels - block all media/CDN"""
     try:
         url = route.request.url
         rtype = route.request.resource_type
         
-        if any(cdn in url for cdn in CDN_ALLOWLIST):
-            await route.continue_()
-            return
         if rtype in _BLOCK_TYPES:
             await route.abort()
             return
-        if any(d in url for d in _BLOCK_DOMAINS):
+        if any(d in url for d in REEL_BLOCK_DOMAINS):
+            await route.abort()
+            return
+        await route.continue_()
+    except Exception:
+        await route.abort()
+
+async def post_route_handler(route):
+    """Standard blocking for Posts - allow CDN images"""
+    try:
+        url = route.request.url
+        rtype = route.request.resource_type
+        
+        if rtype in _BLOCK_TYPES:
+            await route.abort()
+            return
+        if any(d in url for d in POST_BLOCK_DOMAINS):
             await route.abort()
             return
         await route.continue_()
@@ -177,7 +234,10 @@ async def smart_route_handler(route):
         await route.abort()
 
 
-# Caption Parser unchanged
+# ══════════════════════════════════════════════
+#  CAPTION PARSER (unchanged)
+# ══════════════════════════════════════════════
+
 class InstagramCaptionParser:
     @classmethod
     def _unescape(cls, s: str) -> str:
@@ -210,6 +270,7 @@ class InstagramCaptionParser:
         except Exception:
             return None
         
+        # JSON-LD (most reliable)
         jsonld_pattern = re.compile(
             r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
             re.DOTALL | re.I,
@@ -234,6 +295,7 @@ class InstagramCaptionParser:
             except Exception:
                 pass
         
+        # OG Description (works for Reels)
         og_desc_pattern = re.compile(
             r'<meta[^>]+(?:property=["\']og:description["\']|name=["\']description["\'])'
             r'[^>]+content=["\']([^"\']{10,})["\']',
@@ -246,6 +308,7 @@ class InstagramCaptionParser:
             if len(cleaned) > 10:
                 return cleaned
         
+        # Fallback patterns
         patterns = [
             r'"edge_media_to_caption"\s*:\s*\{[^}]*"edges"\s*:\s*\[\s*\{[^}]*"node"\s*:\s*'
             r'\{[^}]*"text"\s*:\s*"((?:[^"\\]|\\.)+)"',
@@ -265,7 +328,41 @@ class InstagramCaptionParser:
         return None
 
 
-# Scraper with improvements
+# ══════════════════════════════════════════════
+#  PAGE CONTEXT MANAGER (GUARANTEED CLEANUP)
+# ══════════════════════════════════════════════
+
+@asynccontextmanager
+async def managed_page(context: BrowserContext, post_type: str = "POST"):
+    """
+    Guaranteed page cleanup - closes even if exceptions occur
+    """
+    page = None
+    try:
+        page = await context.new_page()
+        
+        # Apply appropriate route handler
+        if post_type == "REEL":
+            await page.route("**/*", reel_route_handler)
+        else:
+            await page.route("**/*", post_route_handler)
+        
+        yield page
+        
+    finally:
+        if page:
+            try:
+                # Force close - don't wait for cleanup
+                await page.close(run_before_unload_if_hung=False)
+                logger.debug(f"Page closed ({post_type})", indent=2)
+            except Exception as e:
+                logger.debug(f"Page close error: {e}", indent=2)
+
+
+# ══════════════════════════════════════════════
+#  MAIN SCRAPER CLASS
+# ══════════════════════════════════════════════
+
 class InstagramCaptionScraper2026:
     def __init__(self, cookies: List[Dict], logger: DetailedLogger):
         self.cookies = cookies
@@ -291,203 +388,248 @@ class InstagramCaptionScraper2026:
         for sel in selectors:
             try:
                 locator = page.locator(sel).first
-                if await locator.is_visible(timeout=800):
-                    await locator.click(force=True, timeout=1500)
-                    await asyncio.sleep(0.3)
+                if await locator.is_visible(timeout=500):
+                    await locator.click(force=True, timeout=1000)
+                    await asyncio.sleep(0.2)
             except:
                 pass
     
-    async def _capture_html(self, page: Page) -> bytes:
-        max_attempts = 3  # Reduced for speed
-        for attempt in range(1, max_attempts + 1):
-            try:
-                # Soft check for ready
-                try:
-                    await page.wait_for_function("() => document.readyState === 'complete'", timeout=5000)
-                except PlaywrightTimeoutError:
-                    self.logger.debug("readyState not complete - proceeding", indent=2)
-                
-                html = await asyncio.wait_for(
-                    page.content(),
-                    timeout=HTML_CAPTURE_TIMEOUT
-                )
-                if len(html) > 5000:
-                    self.logger.debug(f"HTML captured ({len(html)/1024:.1f} KB, attempt {attempt})", indent=2)
-                    return html.encode('utf-8')
-                self.logger.debug(f"HTML small, retry {attempt}", indent=2)
-            except Exception as e:
-                self.logger.debug(f"content() failed attempt {attempt}: {type(e).__name__}", indent=2)
-            await asyncio.sleep(random.uniform(1.5, 3.0))
+    async def _capture_html_fast(self, page: Page) -> bytes:
+        """Fast HTML capture - no waiting"""
+        try:
+            html = await asyncio.wait_for(
+                page.content(),
+                timeout=HTML_CAPTURE_TIMEOUT
+            )
+            if len(html) > 2000:
+                return html.encode('utf-8')
+        except Exception:
+            pass
         
         # Fallback
         try:
             html = await page.evaluate("document.documentElement.outerHTML")
-            self.logger.debug("Fallback evaluate OK", indent=2)
             return html.encode('utf-8')
-        except Exception as e:
-            self.logger.debug(f"HTML capture failed: {type(e).__name__}", indent=2)
+        except Exception:
             return b""
     
-    async def _wait_for_content(self, page: Page):
-        selectors = ['article', 'header', 'main', 'h1', 'h2', 'img', 'video']
-        for sel in selectors:
-            try:
-                await page.wait_for_selector(sel, timeout=5000)  # Softer
-                return
-            except:
-                continue
-        await asyncio.sleep(1.5)
-    
-    async def safe_goto(self, page: Page, url: str) -> bool:
+    async def strategic_goto(self, page: Page, url: str, post_type: str) -> Tuple[bool, Optional[Response]]:
+        """Navigate with post-type specific strategy"""
         try:
-            response = await asyncio.wait_for(
-                page.goto(url, wait_until=WAIT_STRATEGY, timeout=NAVIGATION_TIMEOUT),
-                timeout=(NAVIGATION_TIMEOUT / 1000) + 5
-            )
+            if post_type == "REEL":
+                # REEL: domcontentloaded - fast, ignore video assets
+                response = await page.goto(
+                    url, 
+                    wait_until=WAIT_STRATEGY_REEL,
+                    timeout=REEL_NAV_TIMEOUT
+                )
+            else:
+                # POST: commit - reliable, then we control DOM
+                response = await page.goto(
+                    url,
+                    wait_until=WAIT_STRATEGY_POST,
+                    timeout=POST_NAV_TIMEOUT
+                )
             
-            if response is None or response.status >= 400:
-                return False
+            if not response or response.status >= 400:
+                return False, response
             
             current_url = page.url
             if any(x in current_url for x in ["challenge", "checkpoint", "accounts/login"]):
-                return False
+                return False, response
+                
+            return True, response
             
-            try:
-                load_state = "networkidle" if any(p in url for p in ("/p/", "/reel/", "/tv/")) else "domcontentloaded"
-                await page.wait_for_load_state(load_state, timeout=30000)  # Longer, softer
-            except PlaywrightTimeoutError:
-                self.logger.debug("Load state timeout - proceeding", indent=2)
-            
-            return True
         except Exception as e:
-            self.logger.debug(f"Nav error: {type(e).__name__}", indent=2)
-            return False
+            self.logger.debug(f"Nav error ({post_type}): {type(e).__name__}", indent=2)
+            return False, None
     
-    async def scrape_single_post_html(self, page: Page, post_url: str, shortcode: str, post_index: int) -> ScrapingResult:
-        try:
-            t0 = time.monotonic()
-            post_type = "REEL" if any(p in post_url for p in SLOW_PATH_PATTERNS) else "POST"
-            self.logger.info(f"[{post_index:>2}] {post_type} {shortcode} (HTML)", indent=1)
+    async def strategic_content_wait(self, page: Page, post_type: str):
+        """Wait for content based on post type"""
+        if post_type == "REEL":
+            # Reels: Meta tags in initial HTML, minimal wait
+            try:
+                await page.wait_for_selector("body", timeout=DOM_WAIT_REEL)
+            except:
+                pass
+            await asyncio.sleep(0.3)  # Tiny buffer for JS
             
-            if not await self.safe_goto(page, post_url):
+        else:
+            # Posts: Wait for article structure
+            selectors = ['article', 'main', 'header']
+            for sel in selectors:
+                try:
+                    await page.wait_for_selector(sel, timeout=DOM_WAIT_POST // len(selectors))
+                    return
+                except:
+                    continue
+            await asyncio.sleep(0.5)
+    
+    async def scrape_single_post(self, url: str, shortcode: str, index: int, context: BrowserContext) -> ScrapingResult:
+        """
+        Scrape single post with guaranteed page cleanup
+        """
+        t0 = time.monotonic()
+        post_type = detect_post_type(url)
+        
+        self.logger.info(f"[{index:>2}] {post_type} {shortcode}", indent=1)
+        
+        # Use context manager for guaranteed cleanup
+        async with managed_page(context, post_type) as page:
+            # Navigate
+            success, _ = await self.strategic_goto(page, url, post_type)
+            if not success:
                 return ScrapingResult(success=False, error="Nav failed")
             
+            # Dismiss popups
             await self.dismiss_popups(page)
-            await self._wait_for_content(page)
-            if post_type == "REEL":
-                await asyncio.sleep(random.uniform(2.0, 4.0))  # Softer for reels
             
-            html_bytes = await self._capture_html(page)
+            # Wait for content
+            await self.strategic_content_wait(page, post_type)
             
-            caption = None
-            if len(html_bytes) > 1000:
-                caption = InstagramCaptionParser.parse(html_bytes, shortcode)
+            # Capture HTML
+            html_bytes = await self._capture_html_fast(page)
+            
+            # Parse
+            caption = InstagramCaptionParser.parse(html_bytes, shortcode) if len(html_bytes) > 1000 else None
             
             elapsed = time.monotonic() - t0
             
             if caption:
                 self.logger.success(f"✓ {shortcode} {len(caption)} chars {elapsed:.1f}s", indent=1)
-                return ScrapingResult(success=True, data={"url": post_url, "shortcode": shortcode, "caption": caption.strip()})
+                return ScrapingResult(success=True, data={
+                    "url": url, 
+                    "shortcode": shortcode, 
+                    "caption": caption.strip(),
+                    "type": post_type
+                })
             else:
-                self.logger.warning(f"No caption {shortcode} {elapsed:.1f}s", indent=1)
-                return ScrapingResult(success=True, data={"url": post_url, "shortcode": shortcode, "caption": ""})
-            
-        except Exception as e:
-            self.logger.error(f"HTML post error: {str(e)[:50]}", indent=1)
-            return ScrapingResult(success=False, error=str(e))
+                self.logger.warning(f"✗ {shortcode} no caption {elapsed:.1f}s", indent=1)
+                return ScrapingResult(success=True, data={
+                    "url": url, 
+                    "shortcode": shortcode, 
+                    "caption": "",
+                    "type": post_type
+                })
     
-    async def _collect_post_urls_html(self, page: Page, post_limit: int, shutdown_requested: bool) -> List[str]:
-        post_urls: List[str] = []
-        last_height = 0
-        stale_rounds = 0
-        MAX_STALE = 3
-        MAX_SCROLLS = 20
-        
-        js_collect = """
-        () => {
-            const links = Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"], a[href*="/tv/"]'));
-            return [...new Set(links.map(a => a.href.split('?')[0]))];
-        }
+    async def scrape_posts_parallel(self, context: BrowserContext, post_urls: List[str], max_concurrent: int = 2) -> List[Dict]:
         """
+        Parallel scraping with semaphore and guaranteed cleanup per task
+        """
+        posts: List[Dict] = []
+        semaphore = asyncio.Semaphore(max_concurrent)
         
-        for i in range(MAX_SCROLLS):
-            if shutdown_requested:
-                self.logger.warning("Shutdown requested during scroll, stopping", indent=1)
-                break
+        async def scrape_with_semaphore(url: str, index: int) -> Optional[Dict]:
+            async with semaphore:
+                post_type = detect_post_type(url)
+                shortcode = url.split('/')[-2]
+                
+                # Type-specific timeout
+                timeout = REEL_NAV_TIMEOUT/1000 + 8 if post_type == "REEL" else POST_NAV_TIMEOUT/1000 + 15
+                
+                try:
+                    result = await asyncio.wait_for(
+                        self.scrape_single_post(url, shortcode, index, context),
+                        timeout=timeout
+                    )
+                    return result.data if result.success else None
+                except asyncio.TimeoutError:
+                    self.logger.error(f"✗ {shortcode} HARD TIMEOUT", indent=1)
+                    return None
+        
+        # Create tasks
+        tasks = [scrape_with_semaphore(url, i+1) for i, url in enumerate(post_urls)]
+        
+        # Process with progress
+        completed = 0
+        for coro in asyncio.as_completed(tasks):
+            completed += 1
+            result = await coro
+            if result:
+                posts.append(result)
+            self.logger.progress(len(posts), len(post_urls), f"#{completed}")
+        
+        return posts
+    
+    async def _collect_post_urls(self, context: BrowserContext, username: str, post_limit: int, shutdown_requested: Callable[[], bool]) -> List[str]:
+        """Collect post URLs from profile with managed page"""
+        profile_url = f"https://www.instagram.com/{username}/"
+        post_urls: List[str] = []
+        
+        # Use POST strategy for profile (more reliable)
+        async with managed_page(context, "POST") as page:
+            # Navigate to profile
+            try:
+                response = await page.goto(
+                    profile_url,
+                    wait_until="domcontentloaded",
+                    timeout=NAVIGATION_TIMEOUT
+                )
+                
+                if not response or response.status >= 400:
+                    self.logger.error("Profile nav failed", indent=1)
+                    return []
+                
+                if any(x in page.url for x in ["challenge", "checkpoint", "login"]):
+                    self.logger.error("Access blocked", indent=1)
+                    return []
+                
+            except Exception as e:
+                self.logger.error(f"Profile nav error: {e}", indent=1)
+                return []
             
-            links = await page.evaluate(js_collect) or []
-            new = [u for u in links if u not in post_urls]
-            post_urls.extend(new)
+            await self.dismiss_popups(page)
+            await asyncio.sleep(1.0)
             
-            if new:
-                self.logger.info(f"Scroll {i+1} +{len(new)} → {len(post_urls)}", indent=2)
-                stale_rounds = 0
-            else:
-                stale_rounds += 1
+            # Scroll to collect URLs
+            self.logger.section("Collect URLs")
             
-            if len(post_urls) >= post_limit or stale_rounds >= MAX_STALE:
-                break
+            last_height = 0
+            stale_rounds = 0
+            MAX_STALE = 3
+            MAX_SCROLLS = 15
             
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(random.uniform(1.0, 2.5))
+            js_collect = """
+            () => {
+                const links = Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"], a[href*="/tv/"]'));
+                return [...new Set(links.map(a => a.href.split('?')[0]))];
+            }
+            """
             
-            new_height = await page.evaluate("document.body.scrollHeight") or last_height
-            if new_height == last_height:
-                stale_rounds += 1
-            else:
-                last_height = new_height
-                stale_rounds = 0
+            for i in range(MAX_SCROLLS):
+                if shutdown_requested():
+                    self.logger.warning("Shutdown requested, stopping scroll", indent=1)
+                    break
+                
+                links = await page.evaluate(js_collect) or []
+                new = [u for u in links if u not in post_urls]
+                post_urls.extend(new)
+                
+                if new:
+                    self.logger.info(f"Scroll {i+1} +{len(new)} → {len(post_urls)}", indent=2)
+                    stale_rounds = 0
+                else:
+                    stale_rounds += 1
+                
+                if len(post_urls) >= post_limit or stale_rounds >= MAX_STALE:
+                    break
+                
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                
+                new_height = await page.evaluate("document.body.scrollHeight") or last_height
+                if new_height == last_height:
+                    stale_rounds += 1
+                else:
+                    last_height = new_height
+                    stale_rounds = 0
+            
+            self.logger.section_end(f"{len(post_urls)} found")
         
         return post_urls[:post_limit]
     
-    async def scrape_profile_html(self, page: Page, username: str, post_limit: int, shutdown_requested: Callable[[], bool]) -> List[Dict]:
-        profile_url = f"https://www.instagram.com/{username}/"
-        
-        if not await self.safe_goto(page, profile_url):
-            self.logger.error("Profile nav failed", indent=1)
-            return []
-        
-        if any(x in page.url for x in ["challenge", "checkpoint", "login"]):
-            self.logger.error("Access blocked", indent=1)
-            return []
-        
-        await self.dismiss_popups(page)
-        await asyncio.sleep(1.5)
-        
-        self.logger.section("Collect URLs")
-        post_urls = await self._collect_post_urls_html(page, post_limit, shutdown_requested())
-        self.logger.section_end(f"{len(post_urls)} found")
-        
-        if not post_urls:
-            return []
-        
-        self.logger.section("Scrape posts")
-        posts = []
-        for i, url in enumerate(post_urls, 1):
-            if shutdown_requested():
-                self.logger.warning(f"Shutdown requested at post {i}, stopping", indent=1)
-                break
-            
-            shortcode = url.split('/')[-2]
-            
-            try:
-                result = await asyncio.wait_for(
-                    self.scrape_single_post_html(page, url, shortcode, i),
-                    timeout=180.0  # Soft per-post timeout (3 min)
-                )
-            except asyncio.TimeoutError:
-                self.logger.error(f"Soft timeout 180s for post {i} - skipping", indent=1)
-                continue  # Move to next
-            
-            if result.success:
-                posts.append(result.data)
-            
-            await self._human_delay(1200, 3000)
-        
-        self.logger.section_end(f"{len(posts)} ok")
-        return posts
-    
     async def scrape_profile_api(self, context: BrowserContext, username: str, post_limit: int) -> List[Dict]:
+        """API method (unchanged logic, better error handling)"""
         posts: List[Dict] = []
         
         try:
@@ -497,9 +639,13 @@ class InstagramCaptionScraper2026:
             response = await context.request.get(
                 profile_url,
                 headers=INSTAGRAM_HEADERS,
-                timeout=GRAPHQL_TIMEOUT * 1000
+                timeout=15000
             )
             
+            if response.status == 429:
+                self.logger.warning("API 429 - rate limited", indent=2)
+                return []  # Force fallback to HTML
+                
             if not response.ok:
                 self.logger.warning(f"API {response.status}", indent=2)
                 raise ValueError(f"Status {response.status}")
@@ -527,15 +673,19 @@ class InstagramCaptionScraper2026:
                     "doc_id": PROFILE_POSTS_DOC_ID
                 }
                 
-                self.logger.debug(f"Paginate after={page_info['end_cursor']}", indent=2)
+                self.logger.debug(f"Paginate after={page_info['end_cursor'][:20]}...", indent=2)
                 
                 pag_response = await context.request.get(
                     "https://www.instagram.com/graphql/query",
                     params=params,
                     headers=INSTAGRAM_HEADERS,
-                    timeout=GRAPHQL_TIMEOUT * 1000
+                    timeout=15000
                 )
                 
+                if pag_response.status == 429:
+                    self.logger.warning("API 429 on pagination", indent=2)
+                    break
+                    
                 if not pag_response.ok:
                     raise ValueError(f"Pag {pag_response.status}")
                 
@@ -545,7 +695,7 @@ class InstagramCaptionScraper2026:
                 posts.extend(self._extract_posts(pag_timeline["edges"]))
                 page_info = pag_timeline["page_info"]
                 
-                await self._human_delay()
+                await self._human_delay(800, 1500)
             
             return posts[:post_limit]
             
@@ -558,38 +708,53 @@ class InstagramCaptionScraper2026:
         for edge in edges:
             node = edge["node"]
             shortcode = node["shortcode"]
-            url = f"https://www.instagram.com/p/{shortcode}/" if node["__typename"] != "GraphVideo" else f"https://www.instagram.com/reel/{shortcode}/"
+            typename = node.get("__typename", "")
+            
+            # Determine URL type
+            if typename == "GraphVideo" and node.get("is_video"):
+                url = f"https://www.instagram.com/reel/{shortcode}/"
+                post_type = "REEL"
+            else:
+                url = f"https://www.instagram.com/p/{shortcode}/"
+                post_type = "POST"
+                
             caption_edges = node.get("edge_media_to_caption", {}).get("edges", [])
             caption = caption_edges[0]["node"]["text"] if caption_edges else ""
+            
             extracted.append({
                 "url": url,
                 "shortcode": shortcode,
-                "caption": caption.strip()
+                "caption": caption.strip(),
+                "type": post_type
             })
         return extracted
     
     async def scrape_profile(self, username: str, post_limit: int = 10) -> List[Dict]:
+        """Main entry point with full resource management"""
         t_total = time.monotonic()
         
         self.logger.phase("IG Scraper 2026", f"@{username} limit {post_limit} API+HTML")
         
         browser = None
         context = None
-        page = None
-        
         shutdown_requested = False
+        
         def handle_sigterm():
             nonlocal shutdown_requested
             shutdown_requested = True
             self.logger.info("SIGTERM received - finishing current operations")
         
         loop = asyncio.get_running_loop()
-        loop.add_signal_handler(signal.SIGTERM, handle_sigterm)
-        loop.add_signal_handler(signal.SIGINT, handle_sigterm)
+        try:
+            loop.add_signal_handler(signal.SIGTERM, handle_sigterm)
+            loop.add_signal_handler(signal.SIGINT, handle_sigterm)
+        except NotImplementedError:
+            pass  # Windows doesn't support add_signal_handler
         
         try:
             async with async_playwright() as p:
                 self.logger.section("Launch browser")
+                
                 browser = await p.chromium.launch(
                     headless=True,
                     args=[
@@ -598,6 +763,8 @@ class InstagramCaptionScraper2026:
                         "--disable-dev-shm-usage",
                         "--disable-gpu",
                         "--window-size=1280,720",
+                        "--disable-extensions",
+                        "--disable-background-networking",
                     ],
                 )
                 self.logger.success("Ready", indent=2)
@@ -622,21 +789,44 @@ class InstagramCaptionScraper2026:
                     self.logger.info(f"Partial {len(posts)} via API", indent=1)
                 else:
                     self.logger.warning("API failed, fallback HTML", indent=1)
-                    page = await context.new_page()
-                    await page.route("**/*", smart_route_handler)
-                    posts = await self.scrape_profile_html(page, username, post_limit, lambda: shutdown_requested)
+                    
+                    # HTML Fallback
+                    self.logger.phase("HTML Fallback")
+                    
+                    # Collect URLs
+                    post_urls = await self._collect_post_urls(
+                        context, username, post_limit, lambda: shutdown_requested
+                    )
+                    
+                    if post_urls and not shutdown_requested:
+                        # Scrape parallel
+                        self.logger.section("Scrape posts")
+                        posts = await self.scrape_posts_parallel(
+                            context, post_urls[:post_limit]
+                        )
+                        self.logger.section_end(f"{len(posts)} ok")
                 
                 # Summary
                 elapsed_total = time.monotonic() - t_total
                 self.logger.phase("Summary", f"{elapsed_total:.1f}s")
                 self.logger.separator()
                 self.logger.success(f"Scraped {len(posts)}", indent=1)
+                
                 captioned = sum(1 for p in posts if p.get("caption"))
                 self.logger.info(f"Captions {captioned}/{len(posts)}", indent=1)
+                
                 if captioned:
                     lengths = [len(p["caption"]) for p in posts if p.get("caption")]
                     self.logger.info(f"Avg {sum(lengths)//len(lengths)} chars", indent=1)
-                    self.logger.info(f"Speed {elapsed_total/len(posts):.1f}s/post" if posts else "N/A", indent=1)
+                
+                if posts:
+                    self.logger.info(f"Speed {elapsed_total/len(posts):.1f}s/post", indent=1)
+                    
+                    # Breakdown by type
+                    reels = sum(1 for p in posts if p.get("type") == "REEL")
+                    standard = len(posts) - reels
+                    self.logger.info(f"Reels: {reels}, Posts: {standard}", indent=1)
+                
                 self.logger.separator()
                 
                 return posts
@@ -648,17 +838,35 @@ class InstagramCaptionScraper2026:
             return []
             
         finally:
+            # GUARANTEED CLEANUP
             self.logger.section("Cleanup")
-            if page:
-                await page.close()
+            
             if context:
-                await context.close()
+                try:
+                    # Close all pages first
+                    pages = context.pages
+                    for page in pages:
+                        try:
+                            await page.close(run_before_unload_if_hung=False)
+                        except:
+                            pass
+                    await context.close()
+                    self.logger.success("Context closed", indent=2)
+                except Exception as e:
+                    self.logger.debug(f"Context close error: {e}", indent=2)
+            
             if browser:
-                await browser.close()
-                self.logger.success("Closed", indent=2)
+                try:
+                    await browser.close()
+                    self.logger.success("Browser closed", indent=2)
+                except Exception as e:
+                    self.logger.debug(f"Browser close error: {e}", indent=2)
 
 
-# Public API unchanged
+# ══════════════════════════════════════════════
+#  PUBLIC API
+# ══════════════════════════════════════════════
+
 async def fetch_ig_urls(
     account: str,
     cookies: List[Dict[str, Any]] = None,
