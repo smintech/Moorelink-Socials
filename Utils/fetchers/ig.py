@@ -329,13 +329,14 @@ class InstagramCaptionParser:
 
 
 # ══════════════════════════════════════════════
-#  PAGE CONTEXT MANAGER (GUARANTEED CLEANUP)
+#  SAFE PAGE CONTEXT MANAGER (FIXED)
 # ══════════════════════════════════════════════
 
 @asynccontextmanager
 async def managed_page(context: BrowserContext, post_type: str = "POST"):
     """
     Guaranteed page cleanup - closes even if exceptions occur
+    Playwright-compatible close() with no unsupported arguments
     """
     page = None
     try:
@@ -352,11 +353,15 @@ async def managed_page(context: BrowserContext, post_type: str = "POST"):
     finally:
         if page:
             try:
-                # Force close - don't wait for cleanup
-                await page.close(run_before_unload_if_hung=False)
+                # Standard close - no arguments in Playwright Python
+                # Use asyncio.wait_for to prevent hanging
+                await asyncio.wait_for(page.close(), timeout=5.0)
                 logger.debug(f"Page closed ({post_type})", indent=2)
+            except asyncio.TimeoutError:
+                logger.debug(f"Page close timeout ({post_type})", indent=2)
+                # Force context closure will clean up hung pages
             except Exception as e:
-                logger.debug(f"Page close error: {e}", indent=2)
+                logger.debug(f"Page close error ({post_type}): {e}", indent=2)
 
 
 # ══════════════════════════════════════════════
@@ -629,7 +634,7 @@ class InstagramCaptionScraper2026:
         return post_urls[:post_limit]
     
     async def scrape_profile_api(self, context: BrowserContext, username: str, post_limit: int) -> List[Dict]:
-        """API method (unchanged logic, better error handling)"""
+        """API method with better error handling"""
         posts: List[Dict] = []
         
         try:
@@ -838,29 +843,30 @@ class InstagramCaptionScraper2026:
             return []
             
         finally:
-            # GUARANTEED CLEANUP
+            # GUARANTEED CLEANUP - FIXED
             self.logger.section("Cleanup")
             
             if context:
                 try:
-                    # Close all pages first
+                    # Close all pages first with timeout
                     pages = context.pages
                     for page in pages:
                         try:
-                            await page.close(run_before_unload_if_hung=False)
+                            await asyncio.wait_for(page.close(), timeout=3.0)
                         except:
-                            pass
-                    await context.close()
+                            pass  # Ignore individual page close errors
+                    
+                    await asyncio.wait_for(context.close(), timeout=5.0)
                     self.logger.success("Context closed", indent=2)
                 except Exception as e:
-                    self.logger.debug(f"Context close error: {e}", indent=2)
+                    self.logger.debug(f"Context cleanup error: {e}", indent=2)
             
             if browser:
                 try:
-                    await browser.close()
+                    await asyncio.wait_for(browser.close(), timeout=5.0)
                     self.logger.success("Browser closed", indent=2)
                 except Exception as e:
-                    self.logger.debug(f"Browser close error: {e}", indent=2)
+                    self.logger.debug(f"Browser cleanup error: {e}", indent=2)
 
 
 # ══════════════════════════════════════════════
