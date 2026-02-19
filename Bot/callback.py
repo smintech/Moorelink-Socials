@@ -662,7 +662,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = int(parts[1])
         platform = parts[2]
         account = parts[3]
-        posts = fetch_latest_urls(platform, account) if platform == "x" else fetch_ig_urls(account)
+        posts = fetch_latest_urls(platform, account) if platform == "x" else await fetch_ig_urls(account)
         start = page * POSTS_PER_PAGE
         end = start + POSTS_PER_PAGE
         page_posts = posts[start:end]
