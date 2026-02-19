@@ -68,6 +68,8 @@ POST_BLOCK_DOMAINS = (
 INSTAGRAM_HEADERS = {
     "x-ig-app-id": "936619743392459",
     "x-asbd-id": "129477",
+    "x-ig-www-claim": "0",
+    "x-requested-with": "XMLHttpRequest",
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
@@ -75,9 +77,10 @@ INSTAGRAM_HEADERS = {
     "accept-language": "en-US,en;q=0.9",
 }
 
+# Updated for 2026 Instagram structure
 PROFILE_POSTS_DOC_ID = "9310670392322965"
 USER_INFO_DOC_ID = "2398832706970914"
-
+PROFILE_EXTRAS_QUERY_ID = "9957820854288654" 
 
 # ══════════════════════════════════════════════
 #  DETAILED LOGGER (unchanged)
@@ -632,9 +635,234 @@ class InstagramCaptionScraper2026:
         
         return post_urls[:post_limit]
     
-    async def scrape_profile_api(self, context: BrowserContext, username: str, post_limit: int) -> List[Dict]:
-        """API method with better error handling"""
+    async def _fetch_timeline_api(self, context: BrowserContext, username: str, post_limit: int) -> List[Dict]:
+        """
+        NEW: Fetch posts using the 2026 timeline API endpoint
+        /api/v1/feed/user/{username}/username/
+        """
         posts: List[Dict] = []
+        
+        try:
+            timeline_url = f"https://www.instagram.com/api/v1/feed/user/{username}/username/"
+            params = {"count": min(12, post_limit)}
+            
+            self.logger.debug(f"Timeline API: {timeline_url}", indent=2)
+            
+            response = await context.request.get(
+                timeline_url,
+                params=params,
+                headers=INSTAGRAM_HEADERS,
+                timeout=15000
+            )
+            
+            if response.status == 429:
+                self.logger.warning("Timeline API 429 - rate limited", indent=2)
+                return []
+                
+            if not response.ok:
+                self.logger.warning(f"Timeline API {response.status}", indent=2)
+                return []
+            
+            data = await response.json()
+            
+            # Extract items from timeline response
+            items = data.get("items", [])
+            if not items:
+                self.logger.warning("No items in timeline response", indent=2)
+                return []
+            
+            for item in items:
+                # Extract post data from item
+                code = item.get("code")
+                if not code:
+                    continue
+                
+                media_type = item.get("media_type", 1)  # 1=photo, 2=video, 8=carousel
+                product_type = item.get("product_type", "")
+                
+                # Determine URL type based on product_type or media_type
+                if product_type == "clips" or product_type == "igtv":
+                    url = f"https://www.instagram.com/reel/{code}/"
+                    post_type = "REEL"
+                elif media_type == 2 and product_type != "feed":
+                    url = f"https://www.instagram.com/reel/{code}/"
+                    post_type = "REEL"
+                else:
+                    url = f"https://www.instagram.com/p/{code}/"
+                    post_type = "POST"
+                
+                # Extract caption
+                caption_obj = item.get("caption")
+                caption = ""
+                if caption_obj:
+                    caption = caption_obj.get("text", "")
+                
+                posts.append({
+                    "url": url,
+                    "shortcode": code,
+                    "caption": caption.strip(),
+                    "type": post_type
+                })
+                
+                if len(posts) >= post_limit:
+                    break
+            
+            # Check for pagination
+            more_available = data.get("more_available", False)
+            next_max_id = data.get("next_max_id")
+            
+            # Paginate if needed
+            while more_available and next_max_id and len(posts) < post_limit:
+                self.logger.debug(f"Paginate max_id={next_max_id[:20]}...", indent=2)
+                
+                pag_params = {
+                    "count": min(12, post_limit - len(posts)),
+                    "max_id": next_max_id
+                }
+                
+                pag_response = await context.request.get(
+                    timeline_url,
+                    params=pag_params,
+                    headers=INSTAGRAM_HEADERS,
+                    timeout=15000
+                )
+                
+                if pag_response.status == 429:
+                    self.logger.warning("Timeline pagination 429", indent=2)
+                    break
+                    
+                if not pag_response.ok:
+                    break
+                
+                pag_data = await pag_response.json()
+                pag_items = pag_data.get("items", [])
+                
+                for item in pag_items:
+                    code = item.get("code")
+                    if not code:
+                        continue
+                    
+                    media_type = item.get("media_type", 1)
+                    product_type = item.get("product_type", "")
+                    
+                    if product_type == "clips" or product_type == "igtv":
+                        url = f"https://www.instagram.com/reel/{code}/"
+                        post_type = "REEL"
+                    elif media_type == 2 and product_type != "feed":
+                        url = f"https://www.instagram.com/reel/{code}/"
+                        post_type = "REEL"
+                    else:
+                        url = f"https://www.instagram.com/p/{code}/"
+                        post_type = "POST"
+                    
+                    caption_obj = item.get("caption")
+                    caption = caption_obj.get("text", "") if caption_obj else ""
+                    
+                    posts.append({
+                        "url": url,
+                        "shortcode": code,
+                        "caption": caption.strip(),
+                        "type": post_type
+                    })
+                    
+                    if len(posts) >= post_limit:
+                        break
+                
+                more_available = pag_data.get("more_available", False)
+                next_max_id = pag_data.get("next_max_id")
+                
+                await self._human_delay(800, 1500)
+            
+            return posts[:post_limit]
+            
+        except Exception as e:
+            self.logger.error(f"Timeline API error: {str(e)[:80]}", indent=1)
+            return []
+
+    async def _fetch_graphql_fallback(self, context: BrowserContext, username: str, post_limit: int) -> List[Dict]:
+        """
+        Last resort: Use GraphQL query endpoint with profile extras query
+        """
+        try:
+            self.logger.section("GraphQL fallback")
+            
+            # First get user_id from username
+            profile_url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
+            
+            response = await context.request.get(
+                profile_url,
+                headers=INSTAGRAM_HEADERS,
+                timeout=15000
+            )
+            
+            if not response.ok:
+                return []
+            
+            data = await response.json()
+            user = data.get("data", {}).get("user")
+            if not user:
+                return []
+            
+            user_id = user["id"]
+            
+            # Use profile extras query
+            params = {
+                "query_id": PROFILE_EXTRAS_QUERY_ID,
+                "user_id": user_id,
+                "include_chaining": "false",
+                "include_reel": "true",
+                "include_suggested_users": "false",
+                "include_logged_out_extras": "false",
+                "include_live_status": "false",
+                "include_highlight_reels": "true"
+            }
+            
+            self.logger.debug(f"GraphQL query_id={PROFILE_EXTRAS_QUERY_ID}", indent=2)
+            
+            graphql_response = await context.request.get(
+                "https://www.instagram.com/graphql/query/",
+                params=params,
+                headers=INSTAGRAM_HEADERS,
+                timeout=15000
+            )
+            
+            if not graphql_response.ok:
+                self.logger.warning(f"GraphQL {graphql_response.status}", indent=2)
+                return []
+            
+            graphql_data = await graphql_response.json()
+            
+            # Extract posts from GraphQL response
+            # Note: This structure may vary based on what the query returns
+            user_data = graphql_data.get("data", {}).get("user", {})
+            timeline = user_data.get("edge_owner_to_timeline_media", {})
+            
+            if timeline:
+                return self._extract_posts(timeline.get("edges", []))[:post_limit]
+            
+            return []
+            
+        except Exception as e:
+            self.logger.error(f"GraphQL fallback error: {str(e)[:80]}", indent=2)
+            return []
+
+    async def scrape_profile_api(self, context: BrowserContext, username: str, post_limit: int) -> List[Dict]:
+        """
+        UPDATED: Try new timeline API first, fall back to profile API
+        """
+        # Try new timeline endpoint first (2026 structure)
+        self.logger.section("Timeline API (2026)")
+        posts = await self._fetch_timeline_api(context, username, post_limit)
+        
+        if len(posts) >= post_limit:
+            self.logger.success(f"Timeline API: {len(posts)} posts", indent=2)
+            return posts
+        elif posts:
+            self.logger.info(f"Timeline API: {len(posts)} posts (partial)", indent=2)
+            return posts
+        
+        # Fallback to profile web_profile_info endpoint
+        self.logger.section("Profile API (fallback)")
         
         try:
             profile_url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
@@ -648,7 +876,7 @@ class InstagramCaptionScraper2026:
             
             if response.status == 429:
                 self.logger.warning("API 429 - rate limited", indent=2)
-                return []  # Force fallback to HTML
+                return []
                 
             if not response.ok:
                 self.logger.warning(f"API {response.status}", indent=2)
@@ -704,10 +932,11 @@ class InstagramCaptionScraper2026:
             return posts[:post_limit]
             
         except Exception as e:
-            self.logger.error(f"API error: {str(e)[:80]}", indent=1)
-            return []
+            self.logger.error(f"Profile API error: {str(e)[:80]}", indent=1)
+            return await self._fetch_graphql_fallback(context, username, post_limit)
     
     def _extract_posts(self, edges: List[Dict]) -> List[Dict]:
+        """Extract posts from GraphQL edge format"""
         extracted = []
         for edge in edges:
             node = edge["node"]
@@ -783,7 +1012,7 @@ class InstagramCaptionScraper2026:
                 await context.add_cookies(self.cookies)
                 self.logger.debug(f"Cookies {len(self.cookies)}", indent=2)
                 
-                # Try API first
+                # Try API first (now uses timeline endpoint)
                 self.logger.phase("API attempt")
                 posts = await self.scrape_profile_api(context, username, post_limit)
                 
@@ -842,7 +1071,7 @@ class InstagramCaptionScraper2026:
             return []
             
         finally:
-            # GUARANTEED CLEANUP - FIXED
+            # GUARANTEED CLEANUP
             self.logger.section("Cleanup")
             
             if context:
